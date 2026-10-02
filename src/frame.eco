@@ -1,0 +1,151 @@
+/**
+ * Length-prefixed frames: a uint32 big-endian byte count, then that many bytes. The encoding is
+ * pure, and `FrameReader` keeps a partial frame across short reads, so a thread can read with a
+ * small timeout and check a stop flag without losing bytes.
+ */
+
+namespace tcp;
+
+public const usize FRAME_HEADER = 4;
+
+// one read takes at most this much off the socket
+internal const usize FRAME_READ_CHUNK = 65536;
+
+/**
+ * The 4-byte prefix for a body of `$size` bytes.
+ */
+public function frameHeader(usize $size) : string
+{
+    uint32 $n = $size as uint32;
+    string $out = '';
+    $out->reserve(FRAME_HEADER);
+    $out->push(($n >> 24) as uint8);
+    $out->push((($n >> 16) & 0xFF) as uint8);
+    $out->push((($n >> 8) & 0xFF) as uint8);
+    $out->push(($n & 0xFF) as uint8);
+    return $out;
+}
+
+/**
+ * The length a prefix starting at `$at` of `$bytes` announces. `$bytes` holds four bytes there.
+ */
+public function frameLength(const string& $bytes, usize $at = 0) : uint64
+{
+    uint64 $b0 = $bytes->byte($at) as uint64;
+    uint64 $b1 = $bytes->byte($at + 1) as uint64;
+    uint64 $b2 = $bytes->byte($at + 2) as uint64;
+    uint64 $b3 = $bytes->byte($at + 3) as uint64;
+    return ($b0 << 24) | ($b1 << 16) | ($b2 << 8) | $b3;
+}
+
+/**
+ * `$body` with its prefix, ready for one send.
+ */
+public function frame(const string& $body) : string
+{
+    string $out = frameHeader($body->size());
+    $out->append($body);
+    return $out;
+}
+
+/**
+ * Send `$body` as one frame. Each send waits at most `$timeoutMs` for room.
+ */
+public function writeFrame(Stream $stream, const string& $body, int32 $timeoutMs = 5000) : status<Error>
+{
+    string $bytes = frame($body);
+    return $stream->writeAll($bytes, $timeoutMs);
+}
+
+/**
+ * Turns the bytes of one connection back into frames. Bytes past a whole frame wait for the next
+ * `take`; a partial frame waits for more bytes.
+ */
+public class FrameReader
+{
+    public const usize $max;
+    private string $pending;
+
+    /**
+     * `$max` caps the body of one frame; a prefix over it is an error, not an allocation.
+     */
+    public constructor(usize $max)
+    {
+        $this->max = $max;
+        $this->pending = '';
+    }
+
+    /**
+     * Bytes held that are not a whole frame yet.
+     */
+    public const function buffered() : usize
+    {
+        return $this->pending->size();
+    }
+
+    /**
+     * Append raw bytes, as a read gave them.
+     */
+    public function feed(const string& $bytes) : void
+    {
+        $this->pending->append($bytes);
+    }
+
+    /**
+     * The next whole frame's body, or null while it is not all here yet.
+     */
+    public function take() : result<string?, FrameError>
+    {
+        string? $none = null;
+        usize $have = $this->pending->size();
+        if ($have < FRAME_HEADER) {
+            return .ok($none);
+        }
+
+        uint64 $size = frameLength($this->pending);
+        if ($size > ($this->max as uint64)) {
+            return .error(.tooLarge($size));
+        }
+
+        usize $need = FRAME_HEADER + ($size as usize);
+        if ($have < $need) {
+            return .ok($none);
+        }
+
+        string? $body = $this->pending->sub(FRAME_HEADER, $size as usize);
+        $this->pending = $this->pending->sub($need, $have - $need);
+        return .ok($body);
+    }
+
+    /**
+     * The next frame off `$stream`: null when `$timeoutMs` passed first. A partial frame is kept
+     * for the next call.
+     */
+    public function read(Stream $stream, int32 $timeoutMs) : result<string?, FrameError>
+    {
+        string? $ready = guard $this->take() else ($e) {
+            return .error($e);
+        }
+        if ($ready != null) {
+            return .ok($ready);
+        }
+
+        usize $got = guard $stream->append($this->pending, FRAME_READ_CHUNK, $timeoutMs) else ($e) {
+            return match ($e) {
+                Error::timeout => .ok(null),
+                Error::closed => $this->endOfStream(),
+                else => .error(.io($e->message())),
+            };
+        }
+        return $this->take();
+    }
+
+    private const function endOfStream() : result<string?, FrameError>
+    {
+        if ($this->pending->empty()) {
+            return .error(.closed);
+        }
+
+        return .error(.truncated);
+    }
+}

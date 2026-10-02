@@ -1,0 +1,52 @@
+/**
+ * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c). One block: a C symbol
+ * may only appear once per module.
+ */
+
+namespace tcp;
+
+internal extern {
+    function tcp_listen(ptr<const uint8> $host, int32 $port, int32 $backlog) : int64;
+    function tcp_port(int64 $h) : int32;
+    function tcp_accept(int64 $listener, int32 $timeoutMs) : int64;
+    function tcp_connect(ptr<const uint8> $host, int32 $port, int32 $timeoutMs) : int64;
+    function tcp_recv(int64 $h, ptr<uint8> $buf, int64 $len, int32 $timeoutMs) : int64;
+    function tcp_send(int64 $h, ptr<const uint8> $buf, int64 $len, int32 $timeoutMs) : int64;
+    function tcp_shutdown_write(int64 $h) : int32;
+    function tcp_close(int64 $h) : void;
+    function tcp_last_error() : int32;
+    function tcp_error_text(int32 $code, ptr<uint8> $buf, int32 $len) : int32;
+}
+
+internal const int64 TCP_ERR = -1;
+internal const int64 TCP_CLOSED = -2;
+internal const int64 TCP_TIMEOUT = -3;
+
+/**
+ * The OS text of the last failure on this thread.
+ */
+internal function lastError() : string
+{
+    int32 $code = tcp_last_error();
+    string $text = '';
+    $text->reserve(256);
+    int32 $n = tcp_error_text($code, $text->spare(), 256);
+    if ($n <= 0) {
+        return "error {$code}";
+    }
+
+    $text->commit($n as usize);
+    return $text;
+}
+
+/**
+ * A NUL-terminated copy of `$s` for a C call.
+ */
+internal function cstrOf(const string& $s) : string
+{
+    if ($s->terminated()) {
+        return $s;
+    }
+
+    return $s->clone();
+}

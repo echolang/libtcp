@@ -1,0 +1,227 @@
+/**
+ * The platform contract over real loopback sockets. Written against the Echo API only, so the
+ * same tests prove a new backend (c/win32.c) unchanged.
+ */
+
+use std::thread;
+
+internal function listenLocal() : tcp::Listener
+{
+    tcp::Listener $l = guard tcp::Listener::open('127.0.0.1', 0) else ($e) {
+        die("listen: {$e->message()}");
+    }
+    return $l;
+}
+
+test tcp_listen_on_port_zero_picks_a_port
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    assert($port > 0, 'an ephemeral port');
+    $l->close();
+    assert($l->port() == -1, 'closed');
+}
+
+test tcp_bind_to_a_taken_port_fails
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    bool $taken = match (tcp::Listener::open('127.0.0.1', $port)) {
+        .error($e) => match ($e) {
+            tcp::Error::bind($m) => true,
+            else => false,
+        },
+        else => false,
+    };
+    assert($taken, 'a second listener on a bound port is a bind error');
+}
+
+test tcp_idle_accept_times_out
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream? $none = guard $l->accept(20) else ($e) {
+        die($e->message());
+        return;
+    }
+    assert($none == null, 'no client: null, not an error');
+}
+
+test tcp_frames_both_ways
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+            return "connect: {$e->message()}";
+        }
+        guard tcp::writeFrame($s, 'ping') else ($e) {
+            return "write: {$e->message()}";
+        }
+        tcp::FrameReader $r = tcp::FrameReader(1024);
+        int32 $tries = 0;
+        while ($tries < 200) {
+            string? $got = guard $r->read($s, 25) else ($e) {
+                return "read: {$e->message()}";
+            }
+            if ($got != null) {
+                string $body = guard $got;
+                return $body;
+            }
+            $tries = $tries + 1;
+        }
+        return 'no reply';
+    }) else ($e) {
+        assert(false, 'spawn failed');
+        return;
+    }
+
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'the client never connected');
+        return;
+    }
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    string? $ping = null;
+    int32 $tries = 0;
+    while ($ping == null && $tries < 200) {
+        string? $next = guard $reader->read($conn, 25) else ($e) {
+            die($e->message());
+            return;
+        }
+        $ping = $next;
+        $tries = $tries + 1;
+    }
+    string $body = guard $ping else {
+        assert(false, 'no frame from the client');
+        return;
+    }
+    assert($body == 'ping', 'the client frame arrived whole');
+    guard tcp::writeFrame($conn, 'pong') else ($e) {
+        die($e->message());
+        return;
+    }
+    assert($client->wait() == 'pong', 'the reply arrived whole');
+}
+
+test tcp_idle_read_times_out_then_peer_close_is_closed
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'no connection');
+        return;
+    }
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    string? $idle = guard $reader->read($conn, 20) else ($e) {
+        die($e->message());
+        return;
+    }
+    assert($idle == null, 'nothing sent: a timeout, not an error');
+
+    $client->close();
+    bool $closed = false;
+    int32 $tries = 0;
+    while (!$closed && $tries < 200) {
+        $closed = match ($reader->read($conn, 25)) {
+            .error($e) => match ($e) {
+                tcp::FrameError::closed => true,
+                else => false,
+            },
+            else => false,
+        };
+        $tries = $tries + 1;
+    }
+    assert($closed, 'a peer close between frames is closed');
+}
+
+test tcp_close_mid_frame_is_truncated
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'no connection');
+        return;
+    }
+    string $half = tcp::frameHeader(100);
+    $half->append('only part');
+    guard $client->writeAll($half, 1000) else ($e) {
+        die($e->message());
+        return;
+    }
+    $client->close();
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    bool $truncated = false;
+    int32 $tries = 0;
+    while (!$truncated && $tries < 200) {
+        $truncated = match ($reader->read($conn, 25)) {
+            .error($e) => match ($e) {
+                tcp::FrameError::truncated => true,
+                else => false,
+            },
+            else => false,
+        };
+        $tries = $tries + 1;
+    }
+    assert($truncated, 'a close inside a frame is truncated');
+}
+
+test tcp_send_to_a_closed_peer_fails_without_a_signal
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+        return;
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'no connection');
+        return;
+    }
+    $conn->close();
+    string $chunk = '';
+    usize $i = 0;
+    while ($i < 65536) {
+        $chunk->push(120);
+        $i = $i + 1;
+    }
+    bool $failed = false;
+    int32 $tries = 0;
+    // the first sends can land in the buffers; a reset arrives after
+    while (!$failed && $tries < 100) {
+        $failed = !$client->writeAll($chunk, 100)->has_value();
+        $tries = $tries + 1;
+    }
+    assert($failed, 'writing to a closed peer fails, and the process is still here');
+}
+
+test tcp_connect_to_nothing_fails
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    $l->close();
+    bool $failed = !tcp::Stream::connect('127.0.0.1', $port, 1000)->has_value();
+    assert($failed, 'nothing listens there');
+}

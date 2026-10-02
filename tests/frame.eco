@@ -1,0 +1,52 @@
+/**
+ * Frames without a socket: the prefix, and the reader over bytes fed in pieces.
+ */
+
+test tcp_frame_header_is_big_endian
+{
+    string $h = tcp::frameHeader(0x01020304);
+    assert($h->size() == 4, 'four bytes');
+    assert($h->byte(0) == 1 && $h->byte(3) == 4, 'most significant first');
+    assert(tcp::frameLength($h) == 0x01020304, 'round trip');
+}
+
+test tcp_frame_round_trip_in_pieces
+{
+    string $wire = tcp::frame('first');
+    $wire->append(tcp::frame(''));
+    $wire->append(tcp::frame('second'));
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    usize $i = 0;
+    array<string> $got = array<string>();
+    while ($i < $wire->size()) {
+        $reader->feed($wire->sub($i, 1));
+        $i = $i + 1;
+        string? $body = guard $reader->take() else ($e) {
+            die($e->message());
+            return;
+        }
+        if ($body != null) {
+            string $b = guard $body;
+            $got[] = $b;
+        }
+    }
+    assert($got->count() == 3, 'three frames, one byte at a time');
+    assert($got[0] == 'first', 'first body');
+    assert($got[1]->empty(), 'an empty frame');
+    assert($got[2] == 'second', 'third body');
+    assert($reader->buffered() == 0, 'nothing left over');
+}
+
+test tcp_frame_refuses_http_text
+{
+    tcp::FrameReader $reader = tcp::FrameReader(16 * 1024 * 1024);
+    $reader->feed('GET / HTTP/1.1\r\n');
+    bool $refused = match ($reader->take()) {
+        .error($e) => match ($e) {
+            tcp::FrameError::tooLarge($size) => $size > 1000000000,
+            else => false,
+        },
+        else => false,
+    };
+    assert($refused, 'an HTTP request line reads as an oversized frame');
+}

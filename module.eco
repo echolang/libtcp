@@ -1,0 +1,22 @@
+/*
+ * libtcp: TCP sockets and length-prefixed frames for Echo.
+ *
+ * The platform layer is C behind one contract (c/tcp.h): c/posix.c on macOS
+ * and Linux. Frames, read and write loops and everything else are Echo.
+ * Threads come from std::thread. No TLS, no HTTP.
+ */
+
+#[module: "libtcp"]
+#[version: "0.1.0"]
+#[epm::license: "MIT"]
+#[epm::description: "tcp sockets and length-prefixed frames for echolang"]
+
+// the Winsock backend (c/win32.c, linking ws2_32) is not written yet
+#[if: os != windows]
+#[cc: sources "c/posix.c"]
+#[end]
+#[sources: "src/*.eco"]
+
+#[target: test] {
+    #[sources: "tests/*.eco"]
+}

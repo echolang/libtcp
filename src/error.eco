@@ -1,0 +1,71 @@
+/**
+ * Why a socket call did not do what was asked. `timeout` and `closed` are states a caller loops
+ * on or ends with; the others carry the OS sentence.
+ */
+
+namespace tcp;
+
+public enum Error
+{
+    case bind(string $message);
+    case connect(string $message);
+    case accept(string $message);
+    case io(string $message);
+
+    /**
+     * The peer closed the connection, or it was reset.
+     */
+    case closed;
+
+    /**
+     * The timeout passed with no progress. Nothing was lost: call again.
+     */
+    case timeout;
+    case badPort;
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::bind($m) => "bind: {$m}",
+            Error::connect($m) => "connect: {$m}",
+            Error::accept($m) => "accept: {$m}",
+            Error::io($m) => $m,
+            Error::closed => 'connection closed',
+            Error::timeout => 'timed out',
+            Error::badPort => 'port must be 0..65535',
+        };
+    }
+}
+
+/**
+ * Why a frame could not be read.
+ */
+public enum FrameError
+{
+    /**
+     * The peer closed between frames: the clean end of a conversation.
+     */
+    case closed;
+
+    /**
+     * The peer closed partway through a frame.
+     */
+    case truncated;
+
+    /**
+     * The length prefix is over the reader's cap. Text that is not a frame (an HTTP request
+     * line) lands here: `GET ` reads as over a gigabyte.
+     */
+    case tooLarge(uint64 $size);
+    case io(string $message);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            FrameError::closed => 'connection closed',
+            FrameError::truncated => 'connection closed in the middle of a frame',
+            FrameError::tooLarge($size) => "frame of {$size} bytes is over the limit",
+            FrameError::io($m) => $m,
+        };
+    }
+}

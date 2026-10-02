@@ -1,0 +1,154 @@
+/**
+ * One TCP connection. Closes on drop. `#[atomic]` so an accept thread can hand it to the thread
+ * that serves it; use it from one thread at a time.
+ */
+
+namespace tcp;
+
+#[atomic]
+public class Stream
+{
+    private int64 $handle;
+
+    internal constructor(int64 $handle)
+    {
+        $this->handle = $handle;
+    }
+
+    destructor()
+    {
+        $this->close();
+    }
+
+    /**
+     * Connect to `$host:$port` (IPv4), waiting at most `$timeoutMs` (-1 forever).
+     */
+    public static function connect(const string& $host, int32 $port, int32 $timeoutMs = 5000) : result<Stream, Error>
+    {
+        if ($port <= 0 || $port > 65535) {
+            return .error(.badPort);
+        }
+
+        string $name = cstrOf($host);
+        int64 $h = tcp_connect($name->cstr(), $port, $timeoutMs);
+        if ($h == TCP_TIMEOUT) {
+            return .error(.timeout);
+        }
+
+        if ($h < 0) {
+            return .error(.connect(lastError()));
+        }
+
+        return .ok(Stream($h));
+    }
+
+    public const function open() : bool
+    {
+        return $this->handle >= 0;
+    }
+
+    /**
+     * The local port, or -1 once closed.
+     */
+    public const function port() : int32
+    {
+        if ($this->handle < 0) {
+            return -1;
+        }
+
+        return tcp_port($this->handle);
+    }
+
+    /**
+     * Read at most `$n` bytes into `$buf`. At least one byte on success; `.timeout` when nothing
+     * arrived in `$timeoutMs`, `.closed` at the end of the stream.
+     */
+    public function recv(ptr<uint8> $buf, usize $n, int32 $timeoutMs) : result<usize, Error>
+    {
+        if ($this->handle < 0) {
+            return .error(.closed);
+        }
+
+        int64 $got = tcp_recv($this->handle, $buf, $n as int64, $timeoutMs);
+        if ($got > 0) {
+            return .ok($got as usize);
+        }
+
+        return .error(codeError($got));
+    }
+
+    /**
+     * Read whatever arrives within `$timeoutMs` onto the end of `$into`, at most `$most` bytes.
+     */
+    public function append(string& $into, usize $most, int32 $timeoutMs) : result<usize, Error>
+    {
+        if ($into->room() < $most) {
+            $into->reserve($into->size() + $most);
+        }
+
+        usize $got = guard $this->recv($into->spare(), $most, $timeoutMs) else ($e) {
+            return .error($e);
+        }
+        $into->commit($got);
+        return .ok($got);
+    }
+
+    /**
+     * Send every byte of `$bytes`. Each send waits at most `$timeoutMs` for room.
+     */
+    public function writeAll(const string& $bytes, int32 $timeoutMs) : status<Error>
+    {
+        if ($this->handle < 0) {
+            return .error(.closed);
+        }
+
+        usize $off = 0;
+        usize $n = $bytes->size();
+        $p = $bytes->data();
+        while ($off < $n) {
+            int64 $put = tcp_send($this->handle, $p:$ + $off, ($n - $off) as int64, $timeoutMs);
+            if ($put < 0) {
+                return .error(codeError($put));
+            }
+
+            $off = $off + ($put as usize);
+        }
+
+        return .ok;
+    }
+
+    /**
+     * Half-close: the peer reads the end of the stream, and this side can still read.
+     */
+    public function shutdownWrite() : void
+    {
+        if ($this->handle >= 0) {
+            int32 $ignored = tcp_shutdown_write($this->handle);
+        }
+    }
+
+    public function close() : void
+    {
+        if ($this->handle >= 0) {
+            tcp_close($this->handle);
+            $this->handle = -1;
+        }
+    }
+}
+
+/**
+ * A negative return code as an `Error`. Reads the OS text on this thread, so call it right after
+ * the C call that failed.
+ */
+internal function codeError(int64 $code) : Error
+{
+    if ($code == TCP_TIMEOUT) {
+        return .timeout;
+    }
+
+    if ($code == TCP_CLOSED) {
+        return .closed;
+    }
+
+    return .io(lastError());
+}

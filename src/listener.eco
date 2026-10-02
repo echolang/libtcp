@@ -1,0 +1,89 @@
+/**
+ * A listening TCP socket (IPv4). Closes on drop. `#[atomic]` so it can be built on one thread and
+ * served from another; accept from one thread at a time.
+ */
+
+namespace tcp;
+
+#[atomic]
+public class Listener
+{
+    private int64 $handle;
+
+    internal constructor(int64 $handle)
+    {
+        $this->handle = $handle;
+    }
+
+    destructor()
+    {
+        $this->close();
+    }
+
+    /**
+     * Bind and listen on `$host:$port`. An empty host is every interface; port 0 lets the OS
+     * pick one (read it back with `port`).
+     */
+    public static function open(const string& $host, int32 $port, int32 $backlog = 16) : result<Listener, Error>
+    {
+        if ($port < 0 || $port > 65535) {
+            return .error(.badPort);
+        }
+
+        string $name = cstrOf($host);
+        int64 $h = tcp_listen($name->cstr(), $port, $backlog);
+        if ($h < 0) {
+            return .error(.bind(lastError()));
+        }
+
+        return .ok(Listener($h));
+    }
+
+    /**
+     * The bound port, or -1 once closed.
+     */
+    public const function port() : int32
+    {
+        if ($this->handle < 0) {
+            return -1;
+        }
+
+        return tcp_port($this->handle);
+    }
+
+    public const function open() : bool
+    {
+        return $this->handle >= 0;
+    }
+
+    /**
+     * The next connection, or null when none arrived within `$timeoutMs`.
+     */
+    public function accept(int32 $timeoutMs) : result<Stream?, Error>
+    {
+        if ($this->handle < 0) {
+            return .error(.closed);
+        }
+
+        int64 $h = tcp_accept($this->handle, $timeoutMs);
+        if ($h == TCP_TIMEOUT) {
+            Stream? $none = null;
+            return .ok($none);
+        }
+
+        if ($h < 0) {
+            return .error(.accept(lastError()));
+        }
+
+        Stream? $got = Stream($h);
+        return .ok($got);
+    }
+
+    public function close() : void
+    {
+        if ($this->handle >= 0) {
+            tcp_close($this->handle);
+            $this->handle = -1;
+        }
+    }
+}
