@@ -10,11 +10,19 @@ test tcp_frame_header_is_big_endian
     assert(tcp::frameLength($h) == 0x01020304, 'round trip');
 }
 
+internal function framed(const string& $body) : string
+{
+    string $out = guard tcp::frame($body) else ($e) {
+        die($e->message());
+    }
+    return $out;
+}
+
 test tcp_frame_round_trip_in_pieces
 {
-    string $wire = tcp::frame('first');
-    $wire->append(tcp::frame(''));
-    $wire->append(tcp::frame('second'));
+    string $wire = framed('first');
+    $wire->append(framed(''));
+    $wire->append(framed('second'));
     tcp::FrameReader $reader = tcp::FrameReader(1024);
     usize $i = 0;
     array<string> $got = array<string>();
@@ -49,4 +57,12 @@ test tcp_frame_refuses_http_text
         else => false,
     };
     assert($refused, 'an HTTP request line reads as an oversized frame');
+}
+
+test tcp_frame_size_must_fit_the_prefix
+{
+    assert(tcp::frameFits(0), 'empty');
+    assert(tcp::frameFits(4294967295), 'the largest a prefix holds');
+    assert(!tcp::frameFits(4294967296), 'one past it would wrap to an empty frame');
+    assert(!tcp::frameFits(4294967296 + 5), 'or to a short one');
 }

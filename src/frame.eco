@@ -6,17 +6,24 @@
 
 namespace tcp;
 
+use std::time;
+
 public const usize FRAME_HEADER = 4;
+
+/**
+ * The largest body a 4-byte prefix can announce.
+ */
+public const uint64 FRAME_MAX = 4294967295;
 
 // one read takes at most this much off the socket
 internal const usize FRAME_READ_CHUNK = 65536;
 
 /**
- * The 4-byte prefix for a body of `$size` bytes.
+ * The 4-byte prefix for a body of `$size` bytes. A `uint32`, so a larger size has to be checked
+ * (`frameFits`) before it can be written down, never cut short.
  */
-public function frameHeader(usize $size) : string
+public function frameHeader(uint32 $n) : string
 {
-    uint32 $n = $size as uint32;
     string $out = '';
     $out->reserve(FRAME_HEADER);
     $out->push(($n >> 24) as uint8);
@@ -39,21 +46,37 @@ public function frameLength(const string& $bytes, usize $at = 0) : uint64
 }
 
 /**
- * `$body` with its prefix, ready for one send.
+ * True when a body of `$size` bytes fits the prefix. A larger one cut to 32 bits would announce a
+ * shorter frame, and the receiver would read the rest of the body as frames of its own.
  */
-public function frame(const string& $body) : string
+public function frameFits(uint64 $size) : bool
 {
-    string $out = frameHeader($body->size());
-    $out->append($body);
-    return $out;
+    return $size <= FRAME_MAX;
 }
 
 /**
- * Send `$body` as one frame. Each send waits at most `$timeoutMs` for room.
+ * `$body` with its prefix, ready for one send. `.tooLarge` past `FRAME_MAX`.
+ */
+public function frame(const string& $body) : result<string, Error>
+{
+    uint64 $size = $body->size() as uint64;
+    if (!frameFits($size)) {
+        return .error(.tooLarge($size));
+    }
+
+    string $out = frameHeader($size as uint32);
+    $out->append($body);
+    return .ok($out);
+}
+
+/**
+ * Send `$body` as one frame within `$timeoutMs` in all.
  */
 public function writeFrame(Stream $stream, const string& $body, int32 $timeoutMs = 5000) : status<Error>
 {
-    string $bytes = frame($body);
+    string $bytes = guard frame($body) else ($e) {
+        return .error($e);
+    }
     return $stream->writeAll($bytes, $timeoutMs);
 }
 
@@ -64,15 +87,22 @@ public function writeFrame(Stream $stream, const string& $body, int32 $timeoutMs
 public class FrameReader
 {
     public const usize $max;
+    public const int32 $idleMs;
     private string $pending;
+    private time::instant $lastFrame;
 
     /**
      * `$max` caps the body of one frame; a prefix over it is an error, not an allocation.
+     * `$idleMs` (-1 for none) ends a conversation that delivers no whole frame for that long,
+     * counted from construction and from each frame: a server's guard against a peer that
+     * holds a connection open and sends nothing, or a byte at a time.
      */
-    public constructor(usize $max)
+    public constructor(usize $max, int32 $idleMs = -1)
     {
         $this->max = $max;
+        $this->idleMs = $idleMs;
         $this->pending = '';
+        $this->lastFrame = time::instant::now();
     }
 
     /**
@@ -114,12 +144,13 @@ public class FrameReader
 
         string? $body = $this->pending->sub(FRAME_HEADER, $size as usize);
         $this->pending = $this->pending->sub($need, $have - $need);
+        $this->lastFrame = time::instant::now();
         return .ok($body);
     }
 
     /**
-     * The next frame off `$stream`: null when `$timeoutMs` passed first. A partial frame is kept
-     * for the next call.
+     * The next frame off `$stream`: null when `$timeoutMs` passed first, `.idle` once no frame
+     * came within the idle limit. A partial frame is kept for the next call.
      */
     public function read(Stream $stream, int32 $timeoutMs) : result<string?, FrameError>
     {
@@ -132,12 +163,32 @@ public class FrameReader
 
         usize $got = guard $stream->append($this->pending, FRAME_READ_CHUNK, $timeoutMs) else ($e) {
             return match ($e) {
-                Error::timeout => .ok(null),
+                Error::timeout => $this->quiet(),
                 Error::closed => $this->endOfStream(),
                 else => .error(.io($e->message())),
             };
         }
-        return $this->take();
+        string? $next = guard $this->take() else ($e) {
+            return .error($e);
+        }
+        if ($next != null) {
+            return .ok($next);
+        }
+
+        return $this->quiet();
+    }
+
+    /**
+     * No whole frame this call: null, or `.idle` once the limit has passed.
+     */
+    private const function quiet() : result<string?, FrameError>
+    {
+        if ($this->idleMs >= 0 && $this->lastFrame->elapsed()->as_millis() >= ($this->idleMs as int64)) {
+            return .error(.idle);
+        }
+
+        string? $none = null;
+        return .ok($none);
     }
 
     private const function endOfStream() : result<string?, FrameError>

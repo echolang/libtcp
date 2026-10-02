@@ -9,7 +9,16 @@
  * The OS code of a failure is kept in a thread-local at the point of
  * failure, so whatever Echo does between the call and tcp_last_error()
  * cannot clobber it.
+ *
+ * On Linux a socket is born CLOEXEC (SOCK_CLOEXEC, accept4), so a fork and
+ * exec on another thread never inherits it. macOS has no atomic form: the
+ * flag is set right after, and a fork landing in that gap inherits the fd.
  */
+
+#if defined(__linux__)
+/* accept4 and SOCK_CLOEXEC; it also makes strerror_r the GNU one, handled below */
+#define _GNU_SOURCE
+#endif
 
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
@@ -143,6 +152,16 @@ static int prepare(int fd)
     return 0;
 }
 
+/* a socket that is CLOEXEC and non-blocking from its first instant where the OS allows it */
+static int open_socket(int family, int type, int proto)
+{
+#if defined(SOCK_CLOEXEC) && defined(SOCK_NONBLOCK)
+    return socket(family, type | SOCK_CLOEXEC | SOCK_NONBLOCK, proto);
+#else
+    return socket(family, type, proto);
+#endif
+}
+
 /* small request and reply frames: never wait for a delayed ACK */
 static void nodelay(int fd)
 {
@@ -167,10 +186,6 @@ static struct addrinfo *resolve(const char *host, int32_t port, int passive)
 
     snprintf(portstr, sizeof portstr, "%d", (int)port);
 
-    if (host != NULL && host[0] == '\0') {
-        host = NULL;
-    }
-
     if (getaddrinfo(host, portstr, &hints, &res) != 0) {
         return NULL;
     }
@@ -186,7 +201,8 @@ int64_t tcp_listen(const char *host, int32_t port, int32_t backlog)
     int code = EADDRNOTAVAIL;
     int one = 1;
 
-    if (port < 0 || port > 65535) {
+    /* every interface is "0.0.0.0", spelled out: an empty host never widens a bind by accident */
+    if (host == NULL || host[0] == '\0' || port < 0 || port > 65535) {
         return fail(EINVAL);
     }
 
@@ -200,7 +216,7 @@ int64_t tcp_listen(const char *host, int32_t port, int32_t backlog)
     }
 
     for (it = res; it != NULL; it = it->ai_next) {
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        fd = open_socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) {
             code = errno;
             continue;
@@ -257,7 +273,11 @@ int64_t tcp_accept(int64_t listener, int32_t timeout_ms)
             return TCP_TIMEOUT;
         }
 
+#if defined(__linux__)
+        fd = accept4((int)listener, NULL, NULL, SOCK_CLOEXEC | SOCK_NONBLOCK);
+#else
         fd = accept((int)listener, NULL, NULL);
+#endif
         if (fd >= 0) {
             break;
         }
@@ -297,7 +317,7 @@ int64_t tcp_connect(const char *host, int32_t port, int32_t timeout_ms)
     int soerr;
     socklen_t solen;
 
-    if (host == NULL || port <= 0 || port > 65535) {
+    if (host == NULL || host[0] == '\0' || port <= 0 || port > 65535) {
         return fail(EINVAL);
     }
 
@@ -307,7 +327,7 @@ int64_t tcp_connect(const char *host, int32_t port, int32_t timeout_ms)
     }
 
     for (it = res; it != NULL; it = it->ai_next) {
-        fd = socket(it->ai_family, it->ai_socktype, it->ai_protocol);
+        fd = open_socket(it->ai_family, it->ai_socktype, it->ai_protocol);
         if (fd < 0) {
             code = errno;
             continue;
@@ -485,18 +505,27 @@ int32_t tcp_last_error(void)
 
 int32_t tcp_error_text(int32_t code, char *buf, int32_t len)
 {
-    const char *text;
-
     if (buf == NULL || len <= 0) {
         return 0;
     }
 
-    /* strerror is thread-safe for reading on both libcs; strerror_r has two incompatible signatures */
-    text = strerror((int)code);
-    if (text == NULL) {
-        text = "unknown error";
-    }
+    buf[0] = '\0';
 
-    snprintf(buf, (size_t)len, "%s", text);
+    /* strerror shares one buffer for unknown codes; strerror_r writes into the caller's */
+#if defined(__GLIBC__) && defined(_GNU_SOURCE)
+    {
+        /* the GNU form may hand back a static string instead of filling buf */
+        const char *text = strerror_r((int)code, buf, (size_t)len);
+
+        if (text != buf) {
+            snprintf(buf, (size_t)len, "%s", text != NULL ? text : "unknown error");
+        }
+    }
+#else
+    if (strerror_r((int)code, buf, (size_t)len) != 0) {
+        snprintf(buf, (size_t)len, "error %d", (int)code);
+    }
+#endif
+
     return (int32_t)strlen(buf);
 }

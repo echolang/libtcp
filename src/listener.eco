@@ -21,13 +21,18 @@ public class Listener
     }
 
     /**
-     * Bind and listen on `$host:$port`. An empty host is every interface; port 0 lets the OS
-     * pick one (read it back with `port`).
+     * Bind and listen on `$host:$port`. `0.0.0.0` is every interface; an empty host is refused,
+     * so nothing listens wider than it asked. Port 0 lets the OS pick one (read it back with
+     * `port`).
      */
     public static function open(const string& $host, int32 $port, int32 $backlog = 16) : result<Listener, Error>
     {
         if ($port < 0 || $port > 65535) {
             return .error(.badPort);
+        }
+
+        if ($host->empty()) {
+            return .error(.badHost);
         }
 
         string $name = cstrOf($host);

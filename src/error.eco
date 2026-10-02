@@ -23,6 +23,16 @@ public enum Error
     case timeout;
     case badPort;
 
+    /**
+     * Listening needs a host: `0.0.0.0` for every interface, so a bind never widens by accident.
+     */
+    case badHost;
+
+    /**
+     * A frame body over `FRAME_MAX` bytes: its length does not fit the prefix.
+     */
+    case tooLarge(uint64 $size);
+
     public const function message() : string
     {
         return match ($this) {
@@ -33,6 +43,8 @@ public enum Error
             Error::closed => 'connection closed',
             Error::timeout => 'timed out',
             Error::badPort => 'port must be 0..65535',
+            Error::badHost => 'a listener needs a host: 0.0.0.0 for every interface',
+            Error::tooLarge($size) => "a frame body of {$size} bytes does not fit the 4-byte length",
         };
     }
 }
@@ -57,12 +69,19 @@ public enum FrameError
      * line) lands here: `GET ` reads as over a gigabyte.
      */
     case tooLarge(uint64 $size);
+
+    /**
+     * No whole frame arrived within the reader's idle limit. Bytes trickling in do not count,
+     * so a peer that sends one byte a minute is still idle.
+     */
+    case idle;
     case io(string $message);
 
     public const function message() : string
     {
         return match ($this) {
             FrameError::closed => 'connection closed',
+            FrameError::idle => 'no frame arrived within the idle limit',
             FrameError::truncated => 'connection closed in the middle of a frame',
             FrameError::tooLarge($size) => "frame of {$size} bytes is over the limit",
             FrameError::io($m) => $m,

@@ -34,17 +34,18 @@ guard tcp::writeFrame($client, 'ping') else ($e) {
 }
 ```
 
-- `Listener::open(host, port, backlog = 16)`: an empty host is every interface, and port 0 lets the OS pick one. `port()` reads it back. `accept(timeoutMs)` returns null when nobody connected in time.
+- `Listener::open(host, port, backlog = 16)`: `0.0.0.0` is every interface. An empty host is refused (`badHost`), so nothing listens wider than it asked. Port 0 lets the OS pick one; `port()` reads it back. `accept(timeoutMs)` returns null when nobody connected in time.
 - `Stream::connect(host, port, timeoutMs = 5000)`, `recv(buf, n, timeoutMs)`, `append(string&, most, timeoutMs)`, `writeAll(bytes, timeoutMs)`, `shutdownWrite()`, `close()`. A `Stream` closes when it is dropped.
-- `Error` covers `bind`, `connect`, `accept` and `io` (each with the OS text), plus `closed`, `timeout` and `badPort`. A `timeout` loses nothing: call again.
+- `writeAll`'s timeout covers the whole write, not each send, so a peer that reads a byte at a time cannot hold the writer past it. A `timeout` there leaves an unknown part sent; drop the stream.
+- `Error` covers `bind`, `connect`, `accept` and `io` (each with the OS text), plus `closed`, `timeout`, `badPort`, `badHost` and `tooLarge`. A `timeout` on a read or an accept loses nothing: call again.
 
 ## Frames
 
 A frame is a `uint32` big-endian byte count followed by that many bytes.
 
-- `frame(body)` / `frameHeader(size)` / `frameLength(bytes)` are pure.
-- `writeFrame(stream, body)` sends prefix and body in one write.
-- `FrameReader(max)` turns a connection's bytes back into frames. `read(stream, timeoutMs)` returns a body, or null when the timeout passed first. A partial frame is kept for the next call, so short timeouts never drop bytes.
+- `frame(body)`, `frameHeader(uint32)`, `frameLength(bytes)` and `frameFits(size)` are pure. A body over `FRAME_MAX` (4 GiB - 1) is `tooLarge`, never a prefix cut to 32 bits: a wrapped length would make the receiver read the rest of the body as frames of its own.
+- `writeFrame(stream, body, timeoutMs)` sends prefix and body in one write.
+- `FrameReader(max, idleMs = -1)` turns a connection's bytes back into frames. `read(stream, timeoutMs)` returns a body, or null when the timeout passed first. A partial frame is kept for the next call, so short timeouts never drop bytes. With `idleMs`, a reader that gets no whole frame for that long (from construction, or from the last frame) answers `FrameError.idle`. Bytes that trickle in without completing a frame do not reset it.
 
 A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text that is not a frame lands there: an HTTP request line (`GET `) reads as more than a gigabyte. A peer that closes between frames is `closed`; one that closes partway through a frame is `truncated`.
 
@@ -80,6 +81,13 @@ The manifest picks the backend:
 #[cc: sources "c/posix.c"]
 #[end]
 ```
+
+## Limits
+
+- **Name lookup is not bounded.** `connect` resolves a host name with `getaddrinfo` before its timeout starts, and a DNS stall blocks it. Pass an address where that matters.
+- **One thread per `Stream` at a time.** Closing a stream on one thread while another reads it can hit a recycled descriptor. Hand a stream over; do not share it.
+- **CLOEXEC on macOS.** Linux creates every socket `CLOEXEC` atomically (`SOCK_CLOEXEC`, `accept4`). macOS has no such call: the flag is set right after, and a `fork` + `exec` on another thread in that gap inherits the descriptor. Spawn children with `POSIX_SPAWN_CLOEXEC_DEFAULT` where it matters.
+- **Slow peers are the caller's policy.** Use `FrameReader`'s `idleMs` and a `writeAll` deadline, and cap connections; the library does not.
 
 `tests/` is the conformance suite. It is written against the Echo API only, so a backend is done when `echoc test` passes unchanged on its platform.
 

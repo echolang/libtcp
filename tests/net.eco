@@ -225,3 +225,96 @@ test tcp_connect_to_nothing_fails
     bool $failed = !tcp::Stream::connect('127.0.0.1', $port, 1000)->has_value();
     assert($failed, 'nothing listens there');
 }
+
+test tcp_listen_needs_a_host
+{
+    bool $refused = match (tcp::Listener::open('', 0)) {
+        .error($e) => match ($e) {
+            tcp::Error::badHost => true,
+            else => false,
+        },
+        else => false,
+    };
+    assert($refused, 'an empty host is refused, not every interface');
+    tcp::Listener $every = guard tcp::Listener::open('0.0.0.0', 0) else ($e) {
+        die($e->message());
+    }
+    assert($every->port() > 0, '0.0.0.0 spells every interface');
+}
+
+test tcp_idle_reader_ends_a_silent_or_trickling_peer
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $l->port()) else ($e) {
+        die($e->message());
+    }
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'no connection');
+        return;
+    }
+    // a prefix and one byte of body: bytes arrive, no frame completes
+    string $start = tcp::frameHeader(10);
+    $start->push(120);
+    guard $client->writeAll($start, 1000) else ($e) {
+        die($e->message());
+    }
+    tcp::FrameReader $reader = tcp::FrameReader(1024, 80);
+    bool $idle = false;
+    int32 $tries = 0;
+    while (!$idle && $tries < 100) {
+        $idle = match ($reader->read($conn, 20)) {
+            .error($e) => match ($e) {
+                tcp::FrameError::idle => true,
+                else => false,
+            },
+            else => false,
+        };
+        if (!$idle && $tries % 2 == 0) {
+            // keep trickling: bytes are not frames, the limit still runs
+            string $one = '';
+            $one->push(121);
+            guard $client->writeAll($one, 1000) else ($e) {
+                die($e->message());
+            }
+        }
+        $tries = $tries + 1;
+    }
+    assert($idle, 'a trickle that never completes a frame is idle');
+}
+
+test tcp_write_all_has_one_deadline
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $l->port()) else ($e) {
+        die($e->message());
+    }
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die($e->message());
+    }
+    tcp::Stream $conn = guard $maybe else {
+        assert(false, 'no connection');
+        return;
+    }
+    // the peer never reads: once the buffers fill, the write has to give up on time
+    string $big = '';
+    $big->reserve(64 * 1024 * 1024);
+    usize $i = 0;
+    while ($i < 64 * 1024 * 1024) {
+        $big->push(122);
+        $i = $i + 1;
+    }
+    std::time::instant $t = std::time::instant::now();
+    bool $timedOut = match ($client->writeAll($big, 300)) {
+        .error($e) => match ($e) {
+            tcp::Error::timeout => true,
+            else => false,
+        },
+        else => false,
+    };
+    int64 $spent = $t->elapsed()->as_millis();
+    assert($timedOut, 'a peer that stops reading is a timeout');
+    assert($spent < 2000, 'within the deadline, not a deadline per send');
+}

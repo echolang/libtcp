@@ -29,7 +29,7 @@
 /* timeout_ms passed with no progress */
 #define TCP_TIMEOUT (-3)
 
-/* listen on host:port (IPv4). host "" or NULL is every interface; port 0 lets the OS pick */
+/* listen on host:port (IPv4). Every interface is "0.0.0.0"; an empty or NULL host is EINVAL. Port 0 lets the OS pick */
 int64_t tcp_listen(const char *host, int32_t port, int32_t backlog);
 
 /* the bound local port of a listener or a connection */
@@ -38,7 +38,7 @@ int32_t tcp_port(int64_t h);
 /* the next connection, TCP_TIMEOUT when none arrived in time */
 int64_t tcp_accept(int64_t listener, int32_t timeout_ms);
 
-/* connect to host:port (IPv4) */
+/* connect to host:port (IPv4). A name is resolved first, and that lookup is not bounded by timeout_ms */
 int64_t tcp_connect(const char *host, int32_t port, int32_t timeout_ms);
 
 /* > 0 bytes read; never returns 0 (end of stream is TCP_CLOSED) */

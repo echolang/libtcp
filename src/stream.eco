@@ -5,6 +5,8 @@
 
 namespace tcp;
 
+use std::time;
+
 #[atomic]
 public class Stream
 {
@@ -21,7 +23,9 @@ public class Stream
     }
 
     /**
-     * Connect to `$host:$port` (IPv4), waiting at most `$timeoutMs` (-1 forever).
+     * Connect to `$host:$port` (IPv4), waiting at most `$timeoutMs` (-1 forever). A host name is
+     * resolved first, and the lookup is not bounded by the timeout: pass an address where a stall
+     * matters.
      */
     public static function connect(const string& $host, int32 $port, int32 $timeoutMs = 5000) : result<Stream, Error>
     {
@@ -94,7 +98,9 @@ public class Stream
     }
 
     /**
-     * Send every byte of `$bytes`. Each send waits at most `$timeoutMs` for room.
+     * Send every byte of `$bytes` within `$timeoutMs` in all (-1 forever), so a peer that reads
+     * a byte at a time cannot hold the writer past it. `.timeout` leaves an unknown part sent:
+     * the stream is no use after it.
      */
     public function writeAll(const string& $bytes, int32 $timeoutMs) : status<Error>
     {
@@ -102,11 +108,17 @@ public class Stream
             return .error(.closed);
         }
 
+        time::instant $start = time::instant::now();
         usize $off = 0;
         usize $n = $bytes->size();
         $p = $bytes->data();
         while ($off < $n) {
-            int64 $put = tcp_send($this->handle, $p:$ + $off, ($n - $off) as int64, $timeoutMs);
+            int32 $left = remainingMs($start, $timeoutMs);
+            if ($left == 0 && $timeoutMs != 0) {
+                return .error(.timeout);
+            }
+
+            int64 $put = tcp_send($this->handle, $p:$ + $off, ($n - $off) as int64, $left);
             if ($put < 0) {
                 return .error(codeError($put));
             }
@@ -134,6 +146,24 @@ public class Stream
             $this->handle = -1;
         }
     }
+}
+
+/**
+ * What is left of `$timeoutMs` since `$start`: -1 for forever, 0 once it has passed.
+ */
+internal function remainingMs(time::instant $start, int32 $timeoutMs) : int32
+{
+    if ($timeoutMs < 0) {
+        return -1;
+    }
+
+    int64 $spent = $start->elapsed()->as_millis() as int64;
+    int64 $left = ($timeoutMs as int64) - $spent;
+    if ($left <= 0) {
+        return 0;
+    }
+
+    return $left as int32;
 }
 
 /**
