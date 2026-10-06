@@ -44,8 +44,9 @@ guard tcp::writeFrame($client, 'ping') else ($e) {
 A frame is a `uint32` big-endian byte count followed by that many bytes.
 
 - `frame(body)`, `frameHeader(uint32)`, `frameLength(bytes)` and `frameFits(size)` are pure. A body over `FRAME_MAX` (4 GiB - 1) is `tooLarge`, never a prefix cut to 32 bits: a wrapped length would make the receiver read the rest of the body as frames of its own.
-- `writeFrame(stream, body, timeoutMs)` sends prefix and body in one write.
-- `FrameReader(max, idleMs = -1)` turns a connection's bytes back into frames. `read(stream, timeoutMs)` returns a body, or null when the timeout passed first. A partial frame is kept for the next call, so short timeouts never drop bytes. With `idleMs`, a reader that gets no whole frame for that long (from construction, or from the last frame) answers `FrameError.idle`. Bytes that trickle in without completing a frame do not reset it.
+- `writeFrame(stream, body, timeoutMs)` sends prefix and body under one deadline. A body up to 64 KiB is copied behind its prefix and goes out as one write (one packet); a larger one is sent as prefix, then body, never copied.
+- A body `read` hands back shares the reader's buffer when it is most of it, and is copied out when it is small, so a caller that keeps small bodies does not keep 64 KiB read buffers alive.
+- `FrameReader(max, idleMs = -1)` turns a connection's bytes back into frames. `read(stream, timeoutMs)` waits up to the timeout for a whole frame, however many reads that takes, and returns its body; null means the timeout passed first. A partial frame is kept for the next call, so short timeouts never drop bytes. With `idleMs`, a reader that gets no whole frame for that long (from construction, or from the last frame) answers `FrameError.idle`, even partway through a longer or endless `read`. Bytes that trickle in without completing a frame do not reset it.
 
 A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text that is not a frame lands there: an HTTP request line (`GET `) reads as more than a gigabyte. A peer that closes between frames is `closed`; one that closes partway through a frame is `truncated`.
 
@@ -63,7 +64,7 @@ A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text 
 | Init | nothing | `WSAStartup(2.2)` once (`InitOnceExecuteOnce`) in `tcp_listen` / `tcp_connect` |
 | Socket | `socket`, `FD_CLOEXEC`, `O_NONBLOCK` | `WSASocketW(..., WSA_FLAG_NO_HANDLE_INHERIT)`, `ioctlsocket(FIONBIO)`; accepted sockets also `SetHandleInformation` |
 | Rebind | `SO_REUSEADDR` | `SO_EXCLUSIVEADDRUSE` (Windows `SO_REUSEADDR` lets a second socket take a bound port) |
-| Wait | `poll` | `select` with `exceptfds` (`WSAPoll` missed failed connects before Windows 10 2004) |
+| Wait | `poll` | accept and connect: `select` with `exceptfds` (`WSAPoll` missed failed connects before Windows 10 2004); recv and send: overlapped `WSARecv` / `WSASend` on an event of their own, `CancelIoEx` at the deadline (see below) |
 | Connect | non-blocking connect, wait writable, `SO_ERROR` | the same; `WSAEWOULDBLOCK` is in progress, always check `SO_ERROR` |
 | No SIGPIPE | `MSG_NOSIGNAL` / `SO_NOSIGPIPE` | not needed |
 | Closed | `recv` 0, `ECONNRESET`, `EPIPE` | `recv` 0, `WSAECONNRESET`, `WSAECONNABORTED`, `WSAESHUTDOWN` |
@@ -73,7 +74,9 @@ A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text 
 | Last error | `__thread` | `__declspec(thread)` |
 | Errors | `errno`, `strerror_r` | `WSAGetLastError`, `FormatMessageW` as UTF-8 |
 
-A non-blocking Winsock `send` takes the whole call into the kernel whenever the buffer has any room, so one large call to a peer that never reads would return at once. `win32.c` hands it at most 64 KiB per call, so a full buffer pushes back and `writeAll`'s deadline holds.
+A Winsock `send` takes the whole call into the kernel whenever the buffer has any room, so one large call to a peer that never reads would return at once. `win32.c` hands it at most 64 KiB per call, so a full buffer pushes back and `writeAll`'s deadline holds.
+
+Reads and writes on a connection are overlapped, not readiness-based, because readiness fails on Windows when two threads use one socket. While one thread waits in `select` (or `WSAPoll`) to read, another thread's wait to write wakes late or not at all, and a 2 MiB write that takes 16 ms alone times out after seconds. Each overlapped call waits on its own event, so a reader thread and a writer thread never meet.
 
 The manifest picks the backend:
 
@@ -89,7 +92,7 @@ The manifest picks the backend:
 ## Limits
 
 - **Name lookup is not bounded.** `connect` resolves a host name with `getaddrinfo` before its timeout starts, and a DNS stall blocks it. Pass an address where that matters.
-- **One thread per `Stream` at a time.** Closing a stream on one thread while another reads it can hit a recycled descriptor (or `SOCKET`). Hand a stream over; do not share it.
+- **One reader and one writer per `Stream` at a time.** One thread may read while another writes (full duplex). Two readers, or two writers, interleave bytes. Closing a stream on one thread while another is in a call on it can hit a recycled descriptor (or `SOCKET`), so close only once the others are done.
 - **CLOEXEC on macOS.** Linux creates every socket `CLOEXEC` atomically (`SOCK_CLOEXEC`, `accept4`). macOS has no such call: the flag is set right after, and a `fork` + `exec` on another thread in that gap inherits the descriptor. Spawn children with `POSIX_SPAWN_CLOEXEC_DEFAULT` where it matters.
 - **Windows.** A connect to a closed port can come back as `timeout` rather than a connect error: Windows retries a refused SYN for about two seconds. A reset from the peer drops bytes this side has not read yet. A listener's port cannot be bound again while connections it accepted are still open (`SO_EXCLUSIVEADDRUSE`).
 - **Slow peers are the caller's policy.** Use `FrameReader`'s `idleMs` and a `writeAll` deadline, and cap connections; the library does not.

@@ -1,0 +1,117 @@
+/**
+ * Several connections at once, and streams handed from the thread that accepted them to the thread
+ * that serves them.
+ */
+
+use std::thread;
+
+test tcp_many_clients_at_once
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    array<thread::task<string>> $clients = array<thread::task<string>>();
+    int32 $i = 0;
+    while ($i < 8) {
+        int32 $id = $i;
+        thread::task<string> $client = guard thread::spawn(function() : string {
+            tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+                return "connect: {$e->message()}";
+            }
+            guard tcp::writeFrame($c, "client:{$id}") else ($e) {
+                return "write: {$e->message()}";
+            }
+            tcp::FrameReader $r = tcp::FrameReader(1024);
+            string? $got = guard $r->read($c, 5000) else ($e) {
+                return "read: {$e->message()}";
+            }
+            string $reply = guard $got else {
+                return 'no reply';
+            }
+            if ($reply != "ack:client:{$id}") {
+                return "client {$id} got {$reply}";
+            }
+            return 'ok';
+        }) else ($e) {
+            die('spawn failed');
+        }
+        $clients[] = $client;
+        $i = $i + 1;
+    }
+
+    $i = 0;
+    while ($i < 8) {
+        tcp::Stream $s = acceptOne($l);
+        tcp::FrameReader $r = tcp::FrameReader(1024);
+        string $hello = readFrame($s, $r, 5000);
+        guard tcp::writeFrame($s, "ack:{$hello}") else ($e) {
+            die($e->message());
+        }
+        $i = $i + 1;
+    }
+
+    usize $k = 0;
+    while ($k < $clients->count()) {
+        string $result = $clients[$k]->wait();
+        expect($result == 'ok', $result);
+        $k = $k + 1;
+    }
+}
+
+test tcp_an_accept_thread_hands_streams_to_workers
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    // the acceptor owns the listener; every connection goes to a worker of its own
+    thread::task<string> $acceptor = guard thread::spawn(function() : string {
+        array<thread::task<string>> $workers = array<thread::task<string>>();
+        int32 $n = 0;
+        while ($n < 4) {
+            tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+                return "accept: {$e->message()}";
+            }
+            tcp::Stream $s = guard $maybe else {
+                return 'a client never came';
+            }
+            thread::task<string> $worker = guard thread::spawn(function() : string {
+                tcp::FrameReader $r = tcp::FrameReader(1024);
+                string? $got = guard $r->read($s, 5000) else ($e) {
+                    return "worker read: {$e->message()}";
+                }
+                string $body = guard $got else {
+                    return 'worker: no frame';
+                }
+                guard tcp::writeFrame($s, $body) else ($e) {
+                    return "worker write: {$e->message()}";
+                }
+                return 'ok';
+            }) else ($e) {
+                return 'spawn failed';
+            }
+            $workers[] = $worker;
+            $n = $n + 1;
+        }
+        usize $k = 0;
+        while ($k < $workers->count()) {
+            string $w = $workers[$k]->wait();
+            if ($w != 'ok') {
+                return $w;
+            }
+            $k = $k + 1;
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    int32 $i = 0;
+    while ($i < 4) {
+        tcp::Stream $c = connectLocal($port);
+        guard tcp::writeFrame($c, "echo {$i}") else ($e) {
+            die($e->message());
+        }
+        tcp::FrameReader $r = tcp::FrameReader(1024);
+        assert(readFrame($c, $r, 5000) == "echo {$i}", 'the worker echoed it');
+        $i = $i + 1;
+    }
+    assert($acceptor->wait() == 'ok', 'every worker finished');
+}

@@ -1,0 +1,128 @@
+/**
+ * Bytes over a connection: partial reads, bulk transfers both ways, and the half-close.
+ */
+
+use std::thread;
+
+test tcp_recv_takes_what_fits_and_keeps_the_rest
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $s = acceptOne($l);
+    guard $c->writeAll('0123456789', 1000) else ($e) {
+        die($e->message());
+    }
+    string $got = '';
+    int32 $reads = 0;
+    while ($got->size() < 10 && $reads < 100) {
+        usize $before = $got->size();
+        usize $n = guard $s->append($got, 4, 1000) else ($e) {
+            die($e->message());
+        }
+        expect($n >= 1 && $n <= 4, "a read of at most 4 got {$n}");
+        assert($got->size() == $before + $n, 'append adds what it reports');
+        $reads = $reads + 1;
+    }
+    assert($got == '0123456789', 'every byte, in order');
+    assert($reads >= 3, 'at most four bytes a read');
+}
+
+test tcp_write_all_of_nothing_is_done
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->port());
+    guard $c->writeAll('', 0) else ($e) {
+        die("an empty write: {$e->message()}");
+    }
+}
+
+test tcp_bulk_transfer_arrives_whole
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    usize $size = 8 * 1024 * 1024;
+    thread::task<string> $sender = guard thread::spawn(function() : string {
+        tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+            return "connect: {$e->message()}";
+        }
+        guard $c->writeAll(pattern($size), 10000) else ($e) {
+            return "write: {$e->message()}";
+        }
+        $c->close();
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Stream $s = acceptOne($l);
+    string $got = readToEnd($s, 10000);
+    assert($sender->wait() == 'ok', 'the sender finished');
+    expect($got->size() == $size, "{$got->size()} of {$size} bytes");
+    int64 $at = firstDiff($got, pattern($size));
+    expect($at == -1, "the bytes differ at {$at}");
+}
+
+test tcp_both_directions_at_once
+{
+    tcp::Listener $l = listenLocal();
+    int32 $port = $l->port();
+    usize $size = 2 * 1024 * 1024;
+    // each side writes on one thread and reads on another, so neither waits on the other's reads
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+            return "connect: {$e->message()}";
+        }
+        thread::task<string> $writer = guard thread::spawn(function() : string {
+            guard $c->writeAll(pattern($size), 10000) else ($e) {
+                return "client write: {$e->message()}";
+            }
+            $c->shutdownWrite();
+            return 'ok';
+        }) else ($e) {
+            return 'spawn failed';
+        }
+        string $got = readToEnd($c, 10000);
+        string $wrote = $writer->wait();
+        if ($wrote != 'ok') {
+            return $wrote;
+        }
+        if (firstDiff($got, pattern($size)) != -1) {
+            return "the client read {$got->size()} bytes that differ";
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Stream $s = acceptOne($l);
+    thread::task<string> $writer = guard thread::spawn(function() : string {
+        guard $s->writeAll(pattern($size), 10000) else ($e) {
+            return "server write: {$e->message()}";
+        }
+        $s->shutdownWrite();
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+    string $got = readToEnd($s, 10000);
+    assert($writer->wait() == 'ok', 'the server wrote everything');
+    assert($client->wait() == 'ok', 'the client wrote and read everything');
+    assert(firstDiff($got, pattern($size)) == -1, 'the server read every byte in order');
+}
+
+test tcp_half_close_still_reads_the_reply
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $s = acceptOne($l);
+    guard $c->writeAll('request', 1000) else ($e) {
+        die($e->message());
+    }
+    $c->shutdownWrite();
+    assert(readToEnd($s, 5000) == 'request', 'the server reads the request, then the end of it');
+    guard $s->writeAll('reply', 1000) else ($e) {
+        die("the server can still write: {$e->message()}");
+    }
+    $s->close();
+    assert(readToEnd($c, 5000) == 'reply', 'the client can still read');
+}

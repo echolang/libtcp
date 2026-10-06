@@ -1,16 +1,22 @@
 /*
  * libtcp on Windows: the c/tcp.h contract over Winsock 2.
  *
- * Every socket is non-blocking and not inheritable. A call waits with
- * select() up to its timeout, then tries the operation; a wake that finds
- * nothing to do (WSAEWOULDBLOCK) waits again until the deadline. So no call
- * blocks past its timeout, and a thread that loops on short timeouts can
- * check a stop flag.
+ * No socket is inheritable, and no call blocks past its timeout, so a thread
+ * that loops on short timeouts can check a stop flag.
  *
- * select, not WSAPoll: before Windows 10 2004 WSAPoll never reported a
- * failed non-blocking connect, and a refused connect sat out its timeout.
- * select reports it through exceptfds. On Windows an fd_set is a list of
- * sockets, not a bitmap, so there is no FD_SETSIZE ceiling on the value.
+ * Listening and connecting run non-blocking: a call waits with select() up
+ * to its timeout, then tries the operation, and a wake that finds nothing to
+ * do (WSAEWOULDBLOCK) waits again until the deadline. select, not WSAPoll:
+ * before Windows 10 2004 WSAPoll never reported a failed non-blocking
+ * connect, and a refused connect sat out its timeout. select reports it
+ * through exceptfds.
+ *
+ * A connection reads and writes with overlapped I/O instead: each call
+ * starts the operation with its own event, waits on that, and cancels it at
+ * the deadline. Readiness does not work here. Two threads waiting on one
+ * socket, one to read and one to write, starve each other: with a reader
+ * parked in select (or WSAPoll), a writer's wake comes late or not at all,
+ * and a 2 MiB write that takes 16 ms alone times out after seconds.
  *
  * The OS code of a failure is kept in a thread-local at the point of
  * failure, so whatever Echo does between the call and tcp_last_error()
@@ -47,10 +53,48 @@ static __declspec(thread) int32_t g_last;
 static INIT_ONCE g_once = INIT_ONCE_STATIC_INIT;
 static int g_startup;
 
+/* each thread's overlapped event, closed by the fiber-local destructor when the thread ends */
+static DWORD g_event_slot = FLS_OUT_OF_INDEXES;
+
 static int64_t fail(int code)
 {
     g_last = (int32_t)code;
     return TCP_ERR;
+}
+
+static void WINAPI drop_event(PVOID event)
+{
+    if (event != NULL) {
+        CloseHandle((HANDLE)event);
+    }
+}
+
+/* this thread's event, reset and ready for one overlapped call; NULL with GetLastError() on failure */
+static HANDLE thread_event(void)
+{
+    HANDLE event = g_event_slot == FLS_OUT_OF_INDEXES ? NULL : (HANDLE)FlsGetValue(g_event_slot);
+
+    if (event == NULL) {
+        event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (event == NULL) {
+            return NULL;
+        }
+
+        if (g_event_slot == FLS_OUT_OF_INDEXES || !FlsSetValue(g_event_slot, event)) {
+            CloseHandle(event);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return NULL;
+        }
+
+        return event;
+    }
+
+    /* a call that completed at once signals it too, and nothing waited it back down */
+    if (!ResetEvent(event)) {
+        return NULL;
+    }
+
+    return event;
 }
 
 static BOOL CALLBACK startup(PINIT_ONCE once, PVOID param, PVOID *ctx)
@@ -62,6 +106,7 @@ static BOOL CALLBACK startup(PINIT_ONCE once, PVOID param, PVOID *ctx)
     (void)ctx;
 
     g_startup = WSAStartup(MAKEWORD(2, 2), &data);
+    g_event_slot = FlsAlloc(drop_event);
     return TRUE;
 }
 
@@ -175,18 +220,98 @@ static int prepare(SOCKET s)
     return 0;
 }
 
-/* a socket no child process inherits, from its first instant */
+/* a socket no child process inherits from its first instant, able to do overlapped I/O */
 static SOCKET open_socket(int family, int type, int proto)
 {
-    return WSASocketW(family, type, proto, NULL, 0, WSA_FLAG_NO_HANDLE_INHERIT);
+    return WSASocketW(family, type, proto, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
 }
 
-/* small request and reply frames: never wait for a delayed ACK */
-static void nodelay(SOCKET s)
+/*
+ * 0, or the code that failed: a new connection leaves non-blocking mode, since every read and
+ * write on it is overlapped and bounds its own wait. Small request and reply frames never wait
+ * for a delayed ACK.
+ */
+static int connected(SOCKET s)
 {
+    u_long zero = 0;
     BOOL one = TRUE;
 
+    if (ioctlsocket(s, FIONBIO, &zero) != 0) {
+        return WSAGetLastError();
+    }
+
     (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+    return 0;
+}
+
+/*
+ * One overlapped read or write of at most len bytes, waiting up to timeout_ms. On the deadline
+ * the operation is cancelled and its result collected either way, so bytes that landed in the
+ * race are reported, not lost. The count, or TCP_TIMEOUT, TCP_CLOSED, TCP_ERR.
+ */
+static int64_t overlapped(SOCKET s, int sending, uint8_t *buf, int len, int32_t timeout_ms)
+{
+    WSAOVERLAPPED ov;
+    WSABUF wb;
+    DWORD done = 0;
+    DWORD flags = 0;
+    DWORD waited;
+    int rc;
+    int code;
+
+    memset(&ov, 0, sizeof ov);
+    ov.hEvent = thread_event();
+    if (ov.hEvent == NULL) {
+        return fail((int)GetLastError());
+    }
+
+    wb.buf = (char *)buf;
+    wb.len = (ULONG)len;
+
+    if (sending) {
+        rc = WSASend(s, &wb, 1, &done, 0, &ov, NULL);
+    } else {
+        rc = WSARecv(s, &wb, 1, &done, &flags, &ov, NULL);
+    }
+
+    if (rc != 0) {
+        code = WSAGetLastError();
+        if (code != WSA_IO_PENDING) {
+            if (closed_code(code)) {
+                g_last = code;
+                return TCP_CLOSED;
+            }
+
+            return fail(code);
+        }
+
+        waited = WaitForSingleObject(ov.hEvent, timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
+        if (waited != WAIT_OBJECT_0) {
+            (void)CancelIoEx((HANDLE)s, &ov);
+        }
+
+        /* waits for the cancel to land: the buffer is the caller's again only after this */
+        if (!WSAGetOverlappedResult(s, &ov, &done, TRUE, &flags)) {
+            code = WSAGetLastError();
+            if (code == WSA_OPERATION_ABORTED) {
+                return TCP_TIMEOUT;
+            }
+
+            if (closed_code(code)) {
+                g_last = code;
+                return TCP_CLOSED;
+            }
+
+            return fail(code);
+        }
+    }
+
+    /* a read of nothing is the end of the stream */
+    if (done == 0 && !sending) {
+        return TCP_CLOSED;
+    }
+
+    return (int64_t)done;
 }
 
 /* NULL on failure, with the lookup's own code in *code */
@@ -329,12 +454,15 @@ int64_t tcp_accept(int64_t listener, int32_t timeout_ms)
     }
 
     code = prepare(s);
+    if (code == 0) {
+        code = connected(s);
+    }
+
     if (code != 0) {
         closesocket(s);
         return fail(code);
     }
 
-    nodelay(s);
     return (int64_t)s;
 }
 
@@ -421,17 +549,17 @@ int64_t tcp_connect(const char *host, int32_t port, int32_t timeout_ms)
         return fail(code);
     }
 
-    nodelay(s);
+    code = connected(s);
+    if (code != 0) {
+        closesocket(s);
+        return fail(code);
+    }
+
     return (int64_t)s;
 }
 
 int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms)
 {
-    int64_t deadline = deadline_of(timeout_ms);
-    int got;
-    int code;
-    int ready;
-
     if (len <= 0) {
         return fail(WSAEINVAL);
     }
@@ -441,50 +569,11 @@ int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms)
         len = INT_MAX;
     }
 
-    for (;;) {
-        ready = wait_for((SOCKET)h, 0, deadline);
-        if (ready < 0) {
-            return TCP_ERR;
-        }
-
-        if (ready == 0) {
-            return TCP_TIMEOUT;
-        }
-
-        got = recv((SOCKET)h, (char *)buf, (int)len, 0);
-        if (got > 0) {
-            return (int64_t)got;
-        }
-
-        if (got == 0) {
-            return TCP_CLOSED;
-        }
-
-        code = WSAGetLastError();
-        if (would_block(code)) {
-            if (left_ms(deadline) == 0) {
-                return TCP_TIMEOUT;
-            }
-
-            continue;
-        }
-
-        if (closed_code(code)) {
-            g_last = code;
-            return TCP_CLOSED;
-        }
-
-        return fail(code);
-    }
+    return overlapped((SOCKET)h, 0, buf, (int)len, timeout_ms);
 }
 
 int64_t tcp_send(int64_t h, const uint8_t *buf, int64_t len, int32_t timeout_ms)
 {
-    int64_t deadline = deadline_of(timeout_ms);
-    int put;
-    int code;
-    int ready;
-
     if (len < 0) {
         return fail(WSAEINVAL);
     }
@@ -494,46 +583,17 @@ int64_t tcp_send(int64_t h, const uint8_t *buf, int64_t len, int32_t timeout_ms)
     }
 
     /*
-     * A non-blocking send takes the whole call into the kernel whenever the buffer has any room,
-     * so one 64 MiB call to a peer that never reads returns at once and holds all 64 MiB. Small
-     * calls keep what is queued near the send buffer, and a full buffer pushes back. The caller
-     * loops on a short send.
+     * Winsock takes a whole send into the kernel whenever its buffer has any room, so one 64 MiB
+     * call to a peer that never reads would return at once holding all 64 MiB. Small calls keep
+     * what is queued near the send buffer, and a full buffer pushes back. The caller loops on a
+     * short send. A send cut off by its deadline may have sent part of the chunk: after a write
+     * times out the stream is no use, as the contract says.
      */
     if (len > SEND_CHUNK) {
         len = SEND_CHUNK;
     }
 
-    for (;;) {
-        ready = wait_for((SOCKET)h, 1, deadline);
-        if (ready < 0) {
-            return TCP_ERR;
-        }
-
-        if (ready == 0) {
-            return TCP_TIMEOUT;
-        }
-
-        put = send((SOCKET)h, (const char *)buf, (int)len, 0);
-        if (put >= 0) {
-            return (int64_t)put;
-        }
-
-        code = WSAGetLastError();
-        if (would_block(code)) {
-            if (left_ms(deadline) == 0) {
-                return TCP_TIMEOUT;
-            }
-
-            continue;
-        }
-
-        if (closed_code(code)) {
-            g_last = code;
-            return TCP_CLOSED;
-        }
-
-        return fail(code);
-    }
+    return overlapped((SOCKET)h, 1, (uint8_t *)buf, (int)len, timeout_ms);
 }
 
 int32_t tcp_shutdown_write(int64_t h)

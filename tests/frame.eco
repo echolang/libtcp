@@ -10,12 +10,57 @@ test tcp_frame_header_is_big_endian
     assert(tcp::frameLength($h) == 0x01020304, 'round trip');
 }
 
+test tcp_frame_header_extremes
+{
+    string $zero = tcp::frameHeader(0);
+    assert($zero->size() == 4 && $zero->byte(0) == 0 && $zero->byte(3) == 0, 'zero is four zero bytes');
+    string $max = tcp::frameHeader(0xFFFFFFFF);
+    assert($max->byte(0) == 255 && $max->byte(1) == 255 && $max->byte(2) == 255 && $max->byte(3) == 255, 'the largest is four 0xFF');
+    assert(tcp::frameLength($max) == tcp::FRAME_MAX, 'reads back as FRAME_MAX, not a negative');
+    assert(tcp::FRAME_HEADER == 4, 'a four-byte prefix');
+}
+
+test tcp_frame_length_reads_at_an_offset
+{
+    string $bytes = 'ab';
+    $bytes->append(tcp::frameHeader(70000));
+    assert(tcp::frameLength($bytes, 2) == 70000, 'the prefix after two bytes');
+}
+
 internal function framed(const string& $body) : string
 {
     string $out = guard tcp::frame($body) else ($e) {
         die($e->message());
     }
     return $out;
+}
+
+test tcp_frame_is_prefix_then_body
+{
+    string $f = framed('abc');
+    assert($f->size() == 7, 'four plus three');
+    assert(tcp::frameLength($f) == 3, 'announces three');
+    assert($f->sub(4, 3) == 'abc', 'then the body, untouched');
+}
+
+test tcp_frame_carries_any_bytes
+{
+    string $body = '';
+    $body->push(0);
+    $body->push(255);
+    $body->push(13);
+    $body->push(10);
+    $body->push(0);
+    tcp::FrameReader $reader = tcp::FrameReader(16);
+    $reader->feed(framed($body));
+    string? $got = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    string $b = guard $got else {
+        die('no frame');
+    }
+    assert($b->size() == 5, 'NUL bytes do not end it');
+    assert(firstDiff($b, $body) == -1, 'byte for byte');
 }
 
 test tcp_frame_round_trip_in_pieces
@@ -45,6 +90,119 @@ test tcp_frame_round_trip_in_pieces
     assert($reader->buffered() == 0, 'nothing left over');
 }
 
+test tcp_frame_reader_waits_for_the_whole_frame
+{
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    string $wire = framed('hello');
+    $reader->feed($wire->sub(0, 3));
+    string? $short = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    assert($short == null && $reader->buffered() == 3, 'part of a prefix: nothing yet, three held');
+    $reader->feed($wire->sub(3, 3));
+    string? $partial = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    assert($partial == null && $reader->buffered() == 6, 'a prefix and part of the body: nothing yet');
+    $reader->feed($wire->sub(6, 3));
+    string? $whole = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    assert(($whole ?? '-') == 'hello' && $reader->buffered() == 0, 'the rest: the frame');
+    string? $empty = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    assert($empty == null, 'nothing more');
+}
+
+test tcp_frame_many_in_one_feed
+{
+    string $wire = framed('one');
+    $wire->append(framed('two'));
+    $wire->append(framed('three'));
+    $wire->append(framed('fo'));
+    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    $reader->feed($wire->sub(0, $wire->size() - 1));
+    array<string> $got = array<string>();
+    while (true) {
+        string? $body = guard $reader->take() else ($e) {
+            die($e->message());
+        }
+        if ($body == null) {
+            break;
+        }
+        string $b = guard $body;
+        $got[] = $b;
+    }
+    assert($got->count() == 3, 'three whole frames and part of a fourth');
+    assert($got[0] == 'one' && $got[1] == 'two' && $got[2] == 'three', 'in order');
+    assert($reader->buffered() == 5, 'the fourth waits: prefix and one byte');
+}
+
+test tcp_frame_small_frames_take_in_linear_time
+{
+    usize $count = 100000;
+    string $wire = '';
+    $wire->reserve($count * 5);
+    usize $i = 0;
+    while ($i < $count) {
+        $wire->append(tcp::frameHeader(1));
+        $wire->push(($i % 251) as uint8);
+        $i = $i + 1;
+    }
+    tcp::FrameReader $reader = tcp::FrameReader(16);
+    $reader->feed($wire);
+    std::time::instant $t = std::time::instant::now();
+    usize $n = 0;
+    while (true) {
+        string? $body = guard $reader->take() else ($e) {
+            die($e->message());
+        }
+        if ($body == null) {
+            break;
+        }
+        string $b = guard $body;
+        assert($b->size() == 1 && $b->byte(0) == ($n % 251) as uint8, 'in order');
+        $n = $n + 1;
+    }
+    int64 $spent = elapsedMs($t);
+    assert($n == $count, 'every frame');
+    expect($spent < 1000, "100000 one-byte frames took {$spent} ms");
+}
+
+test tcp_frame_small_body_does_not_hold_the_buffer
+{
+    // a small frame, then most of a large one: the small body comes out of a 100 KiB buffer
+    string $wire = framed('small');
+    $wire->append(tcp::frameHeader(200000));
+    $wire->append(pattern(100000));
+    tcp::FrameReader $reader = tcp::FrameReader(1024 * 1024);
+    $reader->feed($wire);
+    string? $got = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    string $body = guard $got else {
+        die('no frame');
+    }
+    assert($body == 'small', 'the small body');
+    usize $held = $body->capacity();
+    expect($held < 1024, "a 5-byte body kept {$held} bytes alive");
+}
+
+test tcp_frame_large_body_is_not_copied_out
+{
+    string $wire = framed(pattern(100000));
+    tcp::FrameReader $reader = tcp::FrameReader(1024 * 1024);
+    $reader->feed($wire);
+    string? $got = guard $reader->take() else ($e) {
+        die($e->message());
+    }
+    string $body = guard $got else {
+        die('no frame');
+    }
+    assert(firstDiff($body, pattern(100000)) == -1, 'the body, intact');
+}
+
 test tcp_frame_refuses_http_text
 {
     tcp::FrameReader $reader = tcp::FrameReader(16 * 1024 * 1024);
@@ -59,10 +217,58 @@ test tcp_frame_refuses_http_text
     assert($refused, 'an HTTP request line reads as an oversized frame');
 }
 
+test tcp_frame_cap_is_inclusive_and_sticky
+{
+    tcp::FrameReader $ok = tcp::FrameReader(3);
+    $ok->feed(framed('abc'));
+    string? $at = guard $ok->take() else ($e) {
+        die("a body of exactly max: {$e->message()}");
+    }
+    assert(($at ?? '-') == 'abc', 'a body of exactly max is taken');
+
+    tcp::FrameReader $over = tcp::FrameReader(3);
+    $over->feed(framed('abcd'));
+    uint64 $first = match ($over->take()) {
+        .error($e) => match ($e) {
+            tcp::FrameError::tooLarge($size) => $size,
+            else => 0,
+        },
+        else => 0,
+    };
+    assert($first == 4, 'one over max is tooLarge with the announced size');
+    uint64 $second = match ($over->take()) {
+        .error($e) => match ($e) {
+            tcp::FrameError::tooLarge($size) => $size,
+            else => 0,
+        },
+        else => 0,
+    };
+    assert($second == 4, 'and stays that way: the stream is not frames');
+
+    tcp::FrameReader $none = tcp::FrameReader(0);
+    $none->feed(framed(''));
+    string? $empty = guard $none->take() else ($e) {
+        die($e->message());
+    }
+    assert(($empty ?? '-') == '', 'a cap of zero still takes empty frames');
+}
+
 test tcp_frame_size_must_fit_the_prefix
 {
     assert(tcp::frameFits(0), 'empty');
     assert(tcp::frameFits(4294967295), 'the largest a prefix holds');
     assert(!tcp::frameFits(4294967296), 'one past it would wrap to an empty frame');
     assert(!tcp::frameFits(4294967296 + 5), 'or to a short one');
+}
+
+test tcp_error_messages_read_as_sentences
+{
+    tcp::Error $big = tcp::Error::tooLarge(5000000000);
+    assert($big->message()->contains('5000000000'), 'tooLarge names the size');
+    tcp::Error $bind = tcp::Error::bind('in use');
+    assert($bind->message() == 'bind: in use', 'bind prefixes the OS text');
+    tcp::FrameError $over = tcp::FrameError::tooLarge(99);
+    assert($over->message()->contains('99'), 'a frame tooLarge names the size');
+    tcp::FrameError $cut = tcp::FrameError::truncated;
+    assert($cut->message() != tcp::FrameError::closed->message(), 'truncated is not a clean close');
 }

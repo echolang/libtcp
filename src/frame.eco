@@ -18,6 +18,12 @@ public const uint64 FRAME_MAX = 4294967295;
 // one read takes at most this much off the socket
 internal const usize FRAME_READ_CHUNK = 65536;
 
+// a read into the rest of a large frame takes up to this much at once
+internal const usize FRAME_READ_BIG = 1048576;
+
+// writeFrame copies a body this size or smaller behind its prefix; a larger one is sent as is
+internal const usize FRAME_COPY_MAX = 65536;
+
 /**
  * The 4-byte prefix for a body of `$size` bytes. A `uint32`, so a larger size has to be checked
  * (`frameFits`) before it can be written down, never cut short.
@@ -74,10 +80,30 @@ public function frame(const string& $body) : result<string, Error>
  */
 public function writeFrame(Stream $stream, const string& $body, int32 $timeoutMs = 5000) : status<Error>
 {
-    string $bytes = guard frame($body) else ($e) {
+    // a small frame is copied behind its prefix and goes out as one write, so it travels in one
+    // packet; a large one is not worth a copy of itself, and goes out as prefix, then body
+    if ($body->size() <= FRAME_COPY_MAX) {
+        string $bytes = guard frame($body) else ($e) {
+            return .error($e);
+        }
+        return $stream->writeAll($bytes, $timeoutMs);
+    }
+
+    uint64 $size = $body->size() as uint64;
+    if (!frameFits($size)) {
+        return .error(.tooLarge($size));
+    }
+
+    time::instant $start = time::instant::now();
+    guard $stream->writeAll(frameHeader($size as uint32), $timeoutMs) else ($e) {
         return .error($e);
     }
-    return $stream->writeAll($bytes, $timeoutMs);
+    int32 $left = remainingMs($start, $timeoutMs);
+    if ($left == 0 && $timeoutMs != 0) {
+        return .error(.timeout);
+    }
+
+    return $stream->writeAll($body, $left);
 }
 
 /**
@@ -142,53 +168,113 @@ public class FrameReader
             return .ok($none);
         }
 
-        string? $body = $this->pending->sub(FRAME_HEADER, $size as usize);
+        // a body shares the read buffer, so one the caller keeps keeps all of it: a small body
+        // pinning a buffer many times its size is copied out instead
+        string $shared = $this->pending->sub(FRAME_HEADER, $size as usize);
+        string? $body = $shared;
+        if (($size as usize) * 2 < $this->pending->capacity()) {
+            $body = $shared->clone();
+        }
         $this->pending = $this->pending->sub($need, $have - $need);
         $this->lastFrame = time::instant::now();
         return .ok($body);
     }
 
     /**
-     * The next frame off `$stream`: null when `$timeoutMs` passed first, `.idle` once no frame
-     * came within the idle limit. A partial frame is kept for the next call.
+     * The next frame off `$stream`, waiting up to `$timeoutMs` (-1 forever) for all of it, however
+     * many reads it takes: null only when the timeout passed first. `.idle` once no frame came
+     * within the idle limit, which also cuts a longer wait short. A partial frame is kept for the
+     * next call.
      */
     public function read(Stream $stream, int32 $timeoutMs) : result<string?, FrameError>
     {
-        string? $ready = guard $this->take() else ($e) {
-            return .error($e);
-        }
-        if ($ready != null) {
-            return .ok($ready);
-        }
+        time::instant $start = time::instant::now();
+        bool $first = true;
+        while (true) {
+            string? $ready = guard $this->take() else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
 
-        usize $got = guard $stream->append($this->pending, FRAME_READ_CHUNK, $timeoutMs) else ($e) {
-            return match ($e) {
-                Error::timeout => $this->quiet(),
-                Error::closed => $this->endOfStream(),
-                else => .error(.io($e->message())),
-            };
-        }
-        string? $next = guard $this->take() else ($e) {
-            return .error($e);
-        }
-        if ($next != null) {
-            return .ok($next);
-        }
+            int32 $left = remainingMs($start, $timeoutMs);
+            int32 $idle = $this->idleLeftMs();
 
-        return $this->quiet();
+            // the first pass always reads once, so a frame already in the socket beats the limits
+            if (!$first) {
+                if ($idle == 0) {
+                    return .error(.idle);
+                }
+
+                if ($left == 0) {
+                    string? $none = null;
+                    return .ok($none);
+                }
+            }
+            $first = false;
+
+            int32 $wait = $left;
+            if ($idle >= 0 && ($wait < 0 || $idle < $wait)) {
+                $wait = $idle;
+            }
+
+            usize $got = guard $stream->append($this->pending, $this->readSize(), $wait) else ($e) {
+                bool $quiet = match ($e) {
+                    Error::timeout => true,
+                    else => false,
+                };
+                if ($quiet) {
+                    // the checks at the top decide: a limit passed, or there is time left
+                    continue;
+                }
+
+                return match ($e) {
+                    Error::closed => $this->endOfStream(),
+                    else => .error(.io($e->message())),
+                };
+            }
+        }
     }
 
     /**
-     * No whole frame this call: null, or `.idle` once the limit has passed.
+     * How much the next read takes: one chunk, or more once a prefix (already checked against
+     * `$max`) says a large frame is still coming, so a big body takes fewer reads.
      */
-    private const function quiet() : result<string?, FrameError>
+    private const function readSize() : usize
     {
-        if ($this->idleMs >= 0 && $this->lastFrame->elapsed()->as_millis() >= ($this->idleMs as int64)) {
-            return .error(.idle);
+        usize $have = $this->pending->size();
+        if ($have < FRAME_HEADER) {
+            return FRAME_READ_CHUNK;
         }
 
-        string? $none = null;
-        return .ok($none);
+        usize $missing = FRAME_HEADER + (frameLength($this->pending) as usize) - $have;
+        if ($missing <= FRAME_READ_CHUNK) {
+            return FRAME_READ_CHUNK;
+        }
+
+        if ($missing > FRAME_READ_BIG) {
+            return FRAME_READ_BIG;
+        }
+
+        return $missing;
+    }
+
+    /**
+     * What is left of the idle limit: -1 with none, 0 once it has passed.
+     */
+    private const function idleLeftMs() : int32
+    {
+        if ($this->idleMs < 0) {
+            return -1;
+        }
+
+        int64 $left = ($this->idleMs as int64) - ($this->lastFrame->elapsed()->as_millis() as int64);
+        if ($left <= 0) {
+            return 0;
+        }
+
+        return $left as int32;
     }
 
     private const function endOfStream() : result<string?, FrameError>

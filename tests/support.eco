@@ -1,0 +1,126 @@
+/**
+ * Helpers the socket tests share. Each one dies with a sentence instead of handing a failure back,
+ * so a test reads as the behaviour it checks.
+ */
+
+internal function listenLocal() : tcp::Listener
+{
+    tcp::Listener $l = guard tcp::Listener::open('127.0.0.1', 0) else ($e) {
+        die("listen: {$e->message()}");
+    }
+    return $l;
+}
+
+internal function connectLocal(int32 $port) : tcp::Stream
+{
+    tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
+        die("connect: {$e->message()}");
+    }
+    return $s;
+}
+
+/**
+ * The next connection on `$l`, waiting up to five seconds.
+ */
+internal function acceptOne(tcp::Listener $l) : tcp::Stream
+{
+    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
+        die("accept: {$e->message()}");
+    }
+    tcp::Stream $s = guard $maybe else {
+        die('no client connected within 5 s');
+    }
+    return $s;
+}
+
+/**
+ * `$n` bytes counting 0..250 over and over: a chunk dropped, repeated or reordered shows up as a
+ * byte out of step, which a run of one value would hide.
+ */
+internal function pattern(usize $n) : string
+{
+    string $out = '';
+    $out->reserve($n);
+    usize $i = 0;
+    while ($i < $n) {
+        $out->push(($i % 251) as uint8);
+        $i = $i + 1;
+    }
+    return $out;
+}
+
+/**
+ * The index of the first byte where `$a` and `$b` differ, or -1 when they are equal.
+ */
+internal function firstDiff(const string& $a, const string& $b) : int64
+{
+    usize $n = $a->size();
+    if ($b->size() < $n) {
+        $n = $b->size();
+    }
+    usize $i = 0;
+    while ($i < $n) {
+        if ($a->byte($i) != $b->byte($i)) {
+            return $i as int64;
+        }
+        $i = $i + 1;
+    }
+    if ($a->size() != $b->size()) {
+        return $n as int64;
+    }
+    return -1;
+}
+
+/**
+ * One frame off `$s` in one call, as `FrameReader::read` promises within its timeout.
+ */
+internal function readFrame(tcp::Stream $s, tcp::FrameReader $r, int32 $timeoutMs) : string
+{
+    string? $got = guard $r->read($s, $timeoutMs) else ($e) {
+        die("read: {$e->message()}");
+    }
+    string $body = guard $got else {
+        die("no frame within {$timeoutMs} ms");
+    }
+    return $body;
+}
+
+/**
+ * Everything `$s` delivers until the peer closes, giving up after `$timeoutMs` in all.
+ */
+internal function readToEnd(tcp::Stream $s, int32 $timeoutMs) : string
+{
+    string $all = '';
+    std::time::instant $start = std::time::instant::now();
+    while (true) {
+        if ($start->elapsed()->as_millis() > ($timeoutMs as int64)) {
+            die("the peer did not close within {$timeoutMs} ms ({$all->size()} bytes read)");
+        }
+        bool $done = match ($s->append($all, 65536, 100)) {
+            .error($e) => match ($e) {
+                tcp::Error::closed => true,
+                tcp::Error::timeout => false,
+                else => die("read: {$e->message()}"),
+            },
+            else => false,
+        };
+        if ($done) {
+            return $all;
+        }
+    }
+}
+
+internal function elapsedMs(std::time::instant $since) : int64
+{
+    return $since->elapsed()->as_millis() as int64;
+}
+
+/**
+ * `assert` with a message built at run time: `assert` only takes a literal.
+ */
+internal function expect(bool $ok, const string& $why) : void
+{
+    if (!$ok) {
+        die($why);
+    }
+}

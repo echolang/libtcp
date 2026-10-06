@@ -1,6 +1,7 @@
 /**
  * One TCP connection. Closes on drop. `#[atomic]` so an accept thread can hand it to the thread
- * that serves it; use it from one thread at a time.
+ * that serves it. One thread may read while another writes; close it only once neither is in a
+ * call.
  */
 
 namespace tcp;
