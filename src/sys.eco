@@ -1,5 +1,5 @@
 /**
- * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c). One block: a C symbol
+ * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c or c/win32.c). One block: a C symbol
  * may only appear once per module.
  */
 

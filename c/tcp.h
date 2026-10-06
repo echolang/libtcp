@@ -1,7 +1,7 @@
 /*
  * libtcp: the platform contract.
  *
- * Every backend (c/posix.c now, c/win32.c later) implements exactly these
+ * Every backend (c/posix.c, c/win32.c) implements exactly these
  * symbols. Nothing above this header knows the operating system: framing,
  * read-exact, write-all and every loop are Echo.
  *

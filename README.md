@@ -7,7 +7,7 @@ The platform layer is C behind one contract (`c/tcp.h`). Everything above it is 
 | Platform | Backend | State |
 |---|---|---|
 | macOS, Linux | `c/posix.c` | done |
-| Windows | `c/win32.c` (Winsock) | TODO |
+| Windows | `c/win32.c` (Winsock) | done |
 
 ## Use
 
@@ -58,18 +58,22 @@ A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text 
 - **`timeout_ms`:** -1 waits forever, 0 polls once.
 - No call raises a signal, and no handle is inherited by a child process.
 
-| Concern | `posix.c` | `win32.c` (to write) |
+| Concern | `posix.c` | `win32.c` |
 |---|---|---|
 | Init | nothing | `WSAStartup(2.2)` once (`InitOnceExecuteOnce`) in `tcp_listen` / `tcp_connect` |
-| Socket | `socket`, `FD_CLOEXEC`, `O_NONBLOCK` | `WSASocketW(..., WSA_FLAG_NO_HANDLE_INHERIT)`, `ioctlsocket(FIONBIO)` |
-| Rebind | `SO_REUSEADDR` | `SO_EXCLUSIVEADDRUSE` |
-| Wait | `poll` | `WSAPoll` |
-| Connect | non-blocking connect, wait writable, `SO_ERROR` | the same; always check `SO_ERROR` |
+| Socket | `socket`, `FD_CLOEXEC`, `O_NONBLOCK` | `WSASocketW(..., WSA_FLAG_NO_HANDLE_INHERIT)`, `ioctlsocket(FIONBIO)`; accepted sockets also `SetHandleInformation` |
+| Rebind | `SO_REUSEADDR` | `SO_EXCLUSIVEADDRUSE` (Windows `SO_REUSEADDR` lets a second socket take a bound port) |
+| Wait | `poll` | `select` with `exceptfds` (`WSAPoll` missed failed connects before Windows 10 2004) |
+| Connect | non-blocking connect, wait writable, `SO_ERROR` | the same; `WSAEWOULDBLOCK` is in progress, always check `SO_ERROR` |
 | No SIGPIPE | `MSG_NOSIGNAL` / `SO_NOSIGPIPE` | not needed |
-| Closed | `recv` 0, `ECONNRESET`, `EPIPE` | `recv` 0, `WSAECONNRESET`, `WSAECONNABORTED` |
-| Lengths | `size_t` | `int`: clamp each call to `INT_MAX` |
+| Closed | `recv` 0, `ECONNRESET`, `EPIPE` | `recv` 0, `WSAECONNRESET`, `WSAECONNABORTED`, `WSAESHUTDOWN` |
+| Lengths | `size_t` | `int`: `recv` clamps to `INT_MAX`, `send` to 64 KiB (see below) |
 | Close | `close`, `shutdown(SHUT_WR)` | `closesocket`, `shutdown(SD_SEND)` |
-| Errors | `errno`, `strerror` | `WSAGetLastError`, `FormatMessageA` |
+| Clock | `CLOCK_MONOTONIC` | `GetTickCount64` |
+| Last error | `__thread` | `__declspec(thread)` |
+| Errors | `errno`, `strerror_r` | `WSAGetLastError`, `FormatMessageW` as UTF-8 |
+
+A non-blocking Winsock `send` takes the whole call into the kernel whenever the buffer has any room, so one large call to a peer that never reads would return at once. `win32.c` hands it at most 64 KiB per call, so a full buffer pushes back and `writeAll`'s deadline holds.
 
 The manifest picks the backend:
 
@@ -85,8 +89,9 @@ The manifest picks the backend:
 ## Limits
 
 - **Name lookup is not bounded.** `connect` resolves a host name with `getaddrinfo` before its timeout starts, and a DNS stall blocks it. Pass an address where that matters.
-- **One thread per `Stream` at a time.** Closing a stream on one thread while another reads it can hit a recycled descriptor. Hand a stream over; do not share it.
+- **One thread per `Stream` at a time.** Closing a stream on one thread while another reads it can hit a recycled descriptor (or `SOCKET`). Hand a stream over; do not share it.
 - **CLOEXEC on macOS.** Linux creates every socket `CLOEXEC` atomically (`SOCK_CLOEXEC`, `accept4`). macOS has no such call: the flag is set right after, and a `fork` + `exec` on another thread in that gap inherits the descriptor. Spawn children with `POSIX_SPAWN_CLOEXEC_DEFAULT` where it matters.
+- **Windows.** A connect to a closed port can come back as `timeout` rather than a connect error: Windows retries a refused SYN for about two seconds. A reset from the peer drops bytes this side has not read yet. A listener's port cannot be bound again while connections it accepted are still open (`SO_EXCLUSIVEADDRUSE`).
 - **Slow peers are the caller's policy.** Use `FrameReader`'s `idleMs` and a `writeAll` deadline, and cap connections; the library does not.
 
 `tests/` is the conformance suite. It is written against the Echo API only, so a backend is done when `echoc test` passes unchanged on its platform.
