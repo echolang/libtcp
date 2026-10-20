@@ -1,42 +1,134 @@
 /**
- * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c or c/win32.c). One block: a C symbol
- * may only appear once per module.
+ * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c or c/win32.c). One
+ * block: a C symbol may only appear once per module. The structs mirror the C layouts field for
+ * field; `tcp_event` is the public `Event` (src/poll.eco), so a wait fills the caller's array.
  */
 
 namespace tcp;
 
+internal struct tcp_err
+{
+    public int32 $kind = 0;
+    public int32 $code = 0;
+}
+
+internal struct tcp_addr
+{
+    public uint8 $family = 0;
+    public uint8 $pad = 0;
+    public uint16 $port = 0;
+    public uint32 $scope = 0;
+    public uint8[16] $bytes;
+    // a unix socket's path, NUL-terminated; starts as zeros
+    public uint8[108] $path;
+
+    // every field has its default (the path its zeros): an empty endpoint for C to fill
+    public constructor()
+    {
+    }
+}
+
 internal extern {
-    function tcp_listen(ptr<const uint8> $host, int32 $port, int32 $backlog) : int64;
-    function tcp_port(int64 $h) : int32;
-    function tcp_accept(int64 $listener, int32 $timeoutMs) : int64;
-    function tcp_connect(ptr<const uint8> $host, int32 $port, int32 $timeoutMs) : int64;
-    function tcp_recv(int64 $h, ptr<uint8> $buf, int64 $len, int32 $timeoutMs) : int64;
-    function tcp_send(int64 $h, ptr<const uint8> $buf, int64 $len, int32 $timeoutMs) : int64;
-    function tcp_shutdown_write(int64 $h) : int32;
+    function tcp_resolve(ptr<const uint8> $host, int32 $port, int32 $passive, ptr<tcp_addr> $out, int32 $max, ptr<tcp_err> $err) : int32;
+    function tcp_parse(ptr<const uint8> $text, int32 $port, ptr<tcp_addr> $out, ptr<tcp_err> $err) : int32;
+    function tcp_addr_text(ptr<const tcp_addr> $addr, ptr<uint8> $buf, int32 $len) : int32;
+    function tcp_unix_path_max() : int32;
+    function tcp_unlink_socket(ptr<const uint8> $path) : int32;
+    function tcp_listen(ptr<const tcp_addr> $at, int32 $backlog, int32 $flags, ptr<tcp_err> $err) : int64;
+    function tcp_listener_socket(int64 $l) : int64;
+    function tcp_accept(int64 $l, int32 $timeoutMs, ptr<tcp_addr> $peer, ptr<tcp_err> $err) : int64;
+    function tcp_try_accept(int64 $l, ptr<tcp_addr> $peer, ptr<tcp_err> $err) : int64;
+    function tcp_listener_cancel(int64 $l) : void;
+    function tcp_listener_close(int64 $l) : void;
+    function tcp_connect(ptr<const tcp_addr> $to, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
+    function tcp_connect_start(ptr<const tcp_addr> $to, ptr<int32> $done, ptr<tcp_err> $err) : int64;
+    function tcp_connect_finish(int64 $h, ptr<tcp_err> $err) : int32;
+    function tcp_local(int64 $h, ptr<tcp_addr> $out, ptr<tcp_err> $err) : int32;
+    function tcp_recv(int64 $h, ptr<uint8> $buf, int64 $len, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
+    function tcp_sendv(int64 $h, ptr<const uint8> $a, int64 $alen, ptr<const uint8> $b, int64 $blen, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
+    function tcp_try_recv(int64 $h, ptr<uint8> $buf, int64 $len, ptr<tcp_err> $err) : int64;
+    function tcp_try_sendv(int64 $h, ptr<const uint8> $a, int64 $alen, ptr<const uint8> $b, int64 $blen, ptr<tcp_err> $err) : int64;
+    function tcp_shutdown(int64 $h, int32 $how, ptr<tcp_err> $err) : int32;
+    function tcp_cancel(int64 $h) : void;
     function tcp_close(int64 $h) : void;
-    function tcp_last_error() : int32;
-    function tcp_error_text(int32 $code, ptr<uint8> $buf, int32 $len) : int32;
+    function tcp_set_option(int64 $h, int32 $opt, int64 $value, ptr<tcp_err> $err) : int32;
+    function tcp_wake_open(ptr<tcp_err> $err) : int64;
+    function tcp_wake_handle(int64 $w) : int64;
+    function tcp_wake_signal(int64 $w) : void;
+    function tcp_wake_drain(int64 $w) : void;
+    function tcp_wake_close(int64 $w) : void;
+    function tcp_wake_wait(int64 $w, int32 $timeoutMs) : int32;
+    function tcp_error_text(int32 $kind, int32 $code, ptr<uint8> $buf, int32 $len) : int32;
+    function tcp_poll_open(ptr<tcp_err> $err) : int64;
+    function tcp_poll_ctl(int64 $p, int32 $op, int64 $h, uint64 $token, int32 $interest, int32 $oneshot, ptr<tcp_err> $err) : int32;
+    function tcp_poll_wait(int64 $p, ptr<Event> $out, int32 $max, int32 $timeoutMs, ptr<tcp_err> $err) : int32;
+    function tcp_poll_close(int64 $p) : void;
 }
 
 internal const int64 TCP_ERR = -1;
-internal const int64 TCP_CLOSED = -2;
+internal const int64 TCP_EOF = -2;
 internal const int64 TCP_TIMEOUT = -3;
+internal const int64 TCP_AGAIN = -4;
+
+internal const int32 TCP_LISTEN_REUSE_PORT = 1;
+internal const int32 TCP_LISTEN_DUAL_STACK = 2;
+
+internal const int32 TCP_OPT_NODELAY = 1;
+internal const int32 TCP_OPT_KEEPALIVE = 2;
+internal const int32 TCP_OPT_SEND_BUFFER = 3;
+internal const int32 TCP_OPT_RECV_BUFFER = 4;
+
+internal const int32 TCP_EV_READ = 1;
+internal const int32 TCP_EV_WRITE = 2;
+internal const int32 TCP_EV_HANGUP = 4;
+internal const int32 TCP_EV_ERROR = 8;
+
+internal const int32 TCP_POLL_BATCH = 256;
+
+internal const int32 TCP_POLL_ADD = 0;
+internal const int32 TCP_POLL_MODIFY = 1;
+internal const int32 TCP_POLL_REMOVE = 2;
+
+// the most addresses one lookup hands back
+internal const int32 RESOLVE_MAX = 16;
 
 /**
- * The OS text of the last failure on this thread.
+ * `tcp_addr.family`.
  */
-internal function lastError() : string
+internal map wire : uint8 for Family
 {
-    int32 $code = tcp_last_error();
-    string $text = '';
-    $text->reserve(256);
-    int32 $n = tcp_error_text($code, $text->spare(), 256);
-    if ($n <= 0) {
-        return "error {$code}";
-    }
+    .unix = 1;
+    .v4 = 4;
+    .v6 = 6;
+}
 
-    $text->commit($n as usize);
-    return $text;
+/**
+ * `tcp_shutdown`'s how.
+ */
+internal map wire : int32 for Direction
+{
+    .read = 0;
+    .write = 1;
+    .both = 2;
+}
+
+/**
+ * `tcp_poll_ctl`'s interest.
+ */
+internal map wire : int32 for Interest
+{
+    .read = TCP_EV_READ;
+    .write = TCP_EV_WRITE;
+    .both = TCP_EV_READ | TCP_EV_WRITE;
+}
+
+/**
+ * `tcp_poll_ctl`'s oneshot.
+ */
+internal map wire : int32 for Trigger
+{
+    .level = 0;
+    .oneshot = 1;
 }
 
 /**
@@ -49,4 +141,12 @@ internal function cstrOf(const string& $s) : string
     }
 
     return $s->clone();
+}
+
+// the structs C writes into have to match c/tcp.h byte for byte
+test tcp_layouts_match_the_c_contract
+{
+    assert(mem::size<tcp_err>() == 8);
+    assert(mem::size<tcp_addr>() == 132);
+    assert(mem::size<Event>() == 16);
 }

@@ -1,94 +1,289 @@
 /**
- * A listening TCP socket (IPv4). Closes on drop. `#[atomic]` so it can be built on one thread and
- * served from another; accept from one thread at a time.
+ * A listening TCP socket. `#[atomic]` so it can be built on one thread and served from others.
+ * `close` is safe from any thread: an accept blocked on the listener wakes at once, and the port
+ * is free as soon as no call is inside.
  */
 
 namespace tcp;
 
 #[atomic]
-public class Listener
+public class Listener : Pollable
 {
-    private int64 $handle;
+    public const Address $local;
+    // the backend's listener (c/tcp.h), and the socket inside it for a Poller
+    private const int64 $listener;
+    private const int64 $fd;
+    private const StreamOptions $accepted;
+    private Gate $gate;
+    // a unix socket's file this listener made, removed when it is released
+    private bool $removes;
 
-    internal constructor(int64 $handle)
+    internal constructor(int64 $listener, Address $local, StreamOptions $accepted)
     {
-        $this->handle = $handle;
+        $this->listener = $listener;
+        $this->fd = tcp_listener_socket($listener);
+        $this->local = $local;
+        $this->accepted = $accepted;
+        $this->gate = Gate();
+        $this->removes = false;
     }
 
     destructor()
     {
-        $this->close();
+        if (!$this->gate->released()) {
+            $this->release();
+        }
     }
 
     /**
-     * Bind and listen on `$host:$port`. `0.0.0.0` is every interface; an empty host is refused,
-     * so nothing listens wider than it asked. Port 0 lets the OS pick one (read it back with
-     * `port`).
+     * Bind and listen on `$at`. Port 0 lets the OS pick one; `$local->port` reads it back.
+     *
+     * A unix socket's file is made here and removed when the listener is released. A file left
+     * by a listener that is gone (the process died) is replaced: one that nothing answers on is
+     * stale. A live listener on the path stays `.addressInUse`, and a file that is not a socket
+     * is never touched.
      */
-    public static function open(const string& $host, int32 $port, int32 $backlog = 16) : result<Listener, Error>
+    public static function bind(const Address& $at, ListenOptions $options = ListenOptions()) : result<Listener, Error>
     {
-        if ($port < 0 || $port > 65535) {
-            return .error(.badPort);
+        if ($at->family != Family::unix) {
+            return Listener::listen($at, $options);
+        }
+        guard unixPath($at) else ($e) {
+            return .error($e);
         }
 
-        if ($host->empty()) {
-            return .error(.badHost);
+        result<Listener, Error> $first = Listener::listen($at, $options);
+        if (!$first->has_value()) {
+            Error $e = $first->failure();
+            if ($e->name() != 'addressInUse' || !Listener::stale($at)) {
+                return $first;
+            }
+            $first = Listener::listen($at, $options);
         }
-
-        string $name = cstrOf($host);
-        int64 $h = tcp_listen($name->cstr(), $port, $backlog);
-        if ($h < 0) {
-            return .error(.bind(lastError()));
+        if ($first->has_value()) {
+            Listener $made = $first->unwrap();
+            $made->removes = true;
         }
-
-        return .ok(Listener($h));
+        return $first;
     }
 
     /**
-     * The bound port, or -1 once closed.
+     * True when the file at a unix path is a socket nothing listens on any more, and it is gone
+     * now.
      */
-    public const function port() : int32
+    private static function stale(const Address& $at) : bool
     {
-        if ($this->handle < 0) {
-            return -1;
+        result<Stream, Error> $probe = Stream::connect($at, Deadline(ms: 500));
+        if ($probe->has_value()) {
+            Stream $live = $probe->unwrap();
+            $live->close();
+            return false;
         }
-
-        return tcp_port($this->handle);
+        Error $e = $probe->failure();
+        if ($e->name() != 'refused') {
+            return false;
+        }
+        string $path = cstrOf($at->path);
+        return tcp_unlink_socket($path->cstr()) == 0;
     }
 
-    public const function open() : bool
+    private static function listen(const Address& $at, ListenOptions $options) : result<Listener, Error>
     {
-        return $this->handle >= 0;
+        int32 $flags = 0;
+        if ($options->reusePort) {
+            $flags = $flags | TCP_LISTEN_REUSE_PORT;
+        }
+        if ($options->dualStack) {
+            $flags = $flags | TCP_LISTEN_DUAL_STACK;
+        }
+
+        tcp_addr $raw = $at->raw();
+        tcp_err $err = tcp_err();
+        int64 $l = tcp_listen(&$raw, $options->backlog, $flags, &$err);
+        if ($l < 0) {
+            return .error(failure(.bind, $err));
+        }
+
+        tcp_addr $bound = tcp_addr();
+        if (tcp_local(tcp_listener_socket($l), &$bound, &$err) < 0) {
+            tcp_listener_close($l);
+            return .error(failure(.bind, $err));
+        }
+
+        return .ok(Listener($l, Address(raw: $bound), $options->accepted));
     }
 
     /**
-     * The next connection, or null when none arrived within `$timeoutMs`.
+     * Resolve `$host` for listening and bind the first address that takes. Every interface is
+     * spelled out, `0.0.0.0` or `::`: an empty host is refused, so nothing listens wider than
+     * it asked.
      */
-    public function accept(int32 $timeoutMs) : result<Stream?, Error>
+    public static function bind(host: const string& $host, uint16 $port, ListenOptions $options = ListenOptions()) : result<Listener, Error>
     {
-        if ($this->handle < 0) {
+        array<Address> $addrs = guard lookup($host, $port, passive: true) else ($e) {
+            return .error($e);
+        }
+
+        Error $last = .invalid("{$host} has no address to listen on");
+        foreach ($addrs as $a) {
+            result<Listener, Error> $tried = Listener::bind($a, $options);
+            if ($tried->has_value()) {
+                return $tried;
+            }
+            $last = $tried->failure();
+        }
+        return .error($last);
+    }
+
+    /**
+     * The next connection, or null when nobody connected before the deadline. `.closed` once
+     * the listener is closed, also for an accept blocked when it happened. A connection the
+     * peer reset before it could be set up is skipped, not reported.
+     */
+    public function accept(Deadline $by) : result<Stream?, Error>
+    {
+        return $this->next($by);
+    }
+
+    /**
+     * The next connection if one is already waiting, else null. For a reactor.
+     */
+    public function tryAccept() : result<Stream?, Error>
+    {
+        return $this->next(null);
+    }
+
+    /**
+     * Both accepts: wait up to `$by` for a connection, or not at all when there is no deadline.
+     */
+    private function next(Deadline? $by) : result<Stream?, Error>
+    {
+        Stream? $none = null;
+        // what the backend answers when nobody connected: a wait that ran out, or a try too early
+        int64 $quiet = TCP_AGAIN;
+        if ($by != null) {
+            $quiet = TCP_TIMEOUT;
+        }
+
+        while (true) {
+            if (!$this->gate->enter()) {
+                return .error(.closed);
+            }
+
+            tcp_addr $peer = tcp_addr();
+            tcp_err $err = tcp_err();
+            int64 $fd = TCP_AGAIN;
+            if ($by == null) {
+                $fd = tcp_try_accept($this->listener, &$peer, &$err);
+            } else {
+                Deadline $until = guard $by;
+                $fd = tcp_accept($this->listener, $until->ms(), &$peer, &$err);
+            }
+            bool $closed = $this->leave();
+
+            if ($fd == $quiet && !$closed) {
+                return .ok($none);
+            }
+            result<Stream?, Error> $got = $this->adopted($fd, $peer, $err, $closed);
+            // null: that connection died on the way in, and another may come (or wait) behind it
+            if (!$got->has_value() || $got->unwrap() != null) {
+                return $got;
+            }
+        }
+    }
+
+    /**
+     * Stop listening, from any thread. An accept blocked on the listener wakes with `.closed`.
+     */
+    public function close() : void
+    {
+        int32 $inside = $this->gate->shut();
+        if ($inside < 0) {
+            return;
+        }
+        if ($inside > 0) {
+            tcp_listener_cancel($this->listener);
+        }
+        $this->leave();
+    }
+
+    public const function closed() : bool
+    {
+        return $this->gate->has(GATE_CLOSED);
+    }
+
+    /**
+     * A listener needs exactly what the caller wants: read, for the next connection.
+     */
+    public const function needs(Interest? $want) : Interest?
+    {
+        return $want;
+    }
+
+    /**
+     * The OS descriptor, for a `Poller`: readable while a connection waits.
+     */
+    public const function handle() : int64
+    {
+        return $this->fd;
+    }
+
+    /**
+     * Counts a call out of the gate, and releases the listener when it was the last one in after
+     * a close. True when the listener was closed by the time the call left.
+     */
+    private function leave() : bool
+    {
+        Exit $exit = $this->gate->leave();
+        if ($exit->last) {
+            $this->release();
+        }
+        return $exit->closed;
+    }
+
+    /**
+     * Give the socket back, and the file of a unix one this listener made.
+     */
+    private function release() : void
+    {
+        tcp_listener_close($this->listener);
+        if ($this->removes) {
+            string $path = cstrOf($this->local->path);
+            tcp_unlink_socket($path->cstr());
+        }
+    }
+
+    /**
+     * An accepted descriptor as a stream: null when the peer reset it before its setup was done,
+     * which is that connection's failure and not the listener's.
+     */
+    private function adopted(int64 $fd, const tcp_addr& $peer, const tcp_err& $err, bool $closed) : result<Stream?, Error>
+    {
+        Stream? $none = null;
+        if ($fd < 0) {
+            return .error(outcome(.accept, $fd, $err, $closed));
+        }
+        // the accept won a race with close: the listener is closed all the same
+        if ($closed) {
+            tcp_close($fd);
             return .error(.closed);
         }
 
-        int64 $h = tcp_accept($this->handle, $timeoutMs);
-        if ($h == TCP_TIMEOUT) {
-            Stream? $none = null;
-            return .ok($none);
+        // a connection to a listener on one address arrived at that address: no getsockname. One
+        // on 0.0.0.0 or :: arrived at some interface, and only the OS knows which
+        Address? $local = null;
+        if (!$this->local->unspecified()) {
+            $local = $this->local;
         }
-
-        if ($h < 0) {
-            return .error(.accept(lastError()));
+        result<Stream, Error> $made = Stream::adopt($fd, Address(raw: $peer), $this->accepted, .accept, $local);
+        if (!$made->has_value()) {
+            Error $e = $made->failure();
+            return match ($e) {
+                Error::reset($sys) => .ok($none),
+                else => .error($e),
+            };
         }
-
-        Stream? $got = Stream($h);
+        Stream? $got = $made->unwrap();
         return .ok($got);
-    }
-
-    public function close() : void
-    {
-        if ($this->handle >= 0) {
-            tcp_close($this->handle);
-            $this->handle = -1;
-        }
     }
 }

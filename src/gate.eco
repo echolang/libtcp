@@ -1,0 +1,135 @@
+/**
+ * Closing a handle while another thread is inside a call on it. The handle's number is released
+ * exactly once, by whoever leaves last after a close, so no call ever runs on a number that has
+ * since been handed to another socket. The gate only counts and says who that is; the owner
+ * (`Stream`, `Listener`) does the release, so the gate knows no kind of handle.
+ */
+
+namespace tcp;
+
+// the low bits count the calls inside; the high bits are state
+internal const int32 GATE_USERS = 0x03FFFFFF;
+internal const int32 GATE_CLOSED = 0x40000000;
+internal const int32 GATE_BROKEN = 0x20000000;
+internal const int32 GATE_WRITE_SHUT = 0x10000000;
+internal const int32 GATE_READ_SHUT = 0x04000000;
+
+// a hint, not state: the last read filled all it asked for, so more is likely waiting
+internal const int32 GATE_MORE = 0x08000000;
+
+/**
+ * How a call left a `Gate`.
+ */
+internal struct Exit
+{
+    /**
+     * The handle was closed before the call left, so the call was cancelled.
+     */
+    public const bool $closed;
+
+    /**
+     * The call was the last one in after a close: it releases the handle.
+     */
+    public const bool $last;
+}
+
+/**
+ * Who is inside a call on a handle, and what state it is in, in one atomic word. A call enters
+ * before it touches the handle and leaves after it. `shut` marks the word closed and counts the
+ * closer in too, so the handle cannot be released under it while it wakes the others.
+ */
+internal struct Gate
+{
+    private atomic<int32> $word;
+
+    public constructor()
+    {
+        $this->word = atomic<int32>(0);
+    }
+
+    /**
+     * Counts the caller in: false once closed, and then the handle must not be touched.
+     */
+    public function enter() : bool
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & GATE_CLOSED) != 0) {
+                return false;
+            }
+            if ($this->word->compare_exchange($w, $w + 1)) {
+                return true;
+            }
+        }
+    }
+
+    /**
+     * Counts the caller out. When it was the last one in after a close, `last` says so and the
+     * caller releases the handle: the gate never touches it. `closed` says the handle was closed
+     * by the time the call left: then the call was cancelled, and what it returned says nothing
+     * about the peer (c/tcp.h).
+     */
+    public function leave() : Exit
+    {
+        int32 $was = $this->word->sub(1);
+        bool $closed = ($was & GATE_CLOSED) != 0;
+        return Exit($closed, $closed && ($was & GATE_USERS) == 1);
+    }
+
+    /**
+     * True once a close has released the handle, or will as its last call leaves. The owner's
+     * destructor releases it only when this is false.
+     */
+    public const function released() : bool
+    {
+        return $this->has(GATE_CLOSED);
+    }
+
+    /**
+     * Marks the word closed and counts the closer in: how many calls were inside, or -1 when it
+     * was already closed (and the closer is not counted in).
+     */
+    public function shut() : int32
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & GATE_CLOSED) != 0) {
+                return -1;
+            }
+            if ($this->word->compare_exchange($w, ($w | GATE_CLOSED) + 1)) {
+                return $w & GATE_USERS;
+            }
+        }
+    }
+
+    public function mark(int32 $flag) : void
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & $flag) == $flag) {
+                return;
+            }
+            if ($this->word->compare_exchange($w, $w | $flag)) {
+                return;
+            }
+        }
+    }
+
+    public function unmark(int32 $flag) : void
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & $flag) == 0) {
+                return;
+            }
+            if ($this->word->compare_exchange($w, $w & ~$flag)) {
+                return;
+            }
+        }
+    }
+
+    public const function has(int32 $flag) : bool
+    {
+        return ($this->word->load() & $flag) != 0;
+    }
+}

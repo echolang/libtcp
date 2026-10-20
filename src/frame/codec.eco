@@ -1,0 +1,56 @@
+/**
+ * Length-prefixed frames: a uint32 big-endian byte count, then that many bytes. This file is the
+ * pure encoding; `Reader` and `write` move frames over any `tcp::Source` and `tcp::Sink`.
+ */
+
+namespace tcp::frame;
+
+public const usize HEADER = 4;
+
+/**
+ * The largest body a 4-byte prefix can announce.
+ */
+public const uint64 MAX = 4294967295;
+
+/**
+ * The 4-byte prefix for a body of `$n` bytes. A `uint32`, so a larger size has to be checked
+ * (`fits`) before it can be written down, never cut short.
+ */
+public function header(uint32 $n) : string
+{
+    string $out = '';
+    tcp::wire::putBe32($out, $n);
+    return $out;
+}
+
+/**
+ * The length a prefix starting at `$at` of `$bytes` announces. `$bytes` holds four bytes there.
+ */
+public function length(const string& $bytes, usize $at = 0) : uint64
+{
+    return tcp::wire::be32($bytes, $at) as uint64;
+}
+
+/**
+ * True when a body of `$size` bytes fits the prefix. A larger one cut to 32 bits would announce a
+ * shorter frame, and the receiver would read the rest of the body as frames of its own.
+ */
+public function fits(uint64 $size) : bool
+{
+    return $size <= MAX;
+}
+
+/**
+ * `$body` behind its prefix, as one string. `.tooLarge` past `MAX`.
+ */
+public function encode(const string& $body) : result<string, Error>
+{
+    uint64 $size = $body->size() as uint64;
+    if (!fits($size)) {
+        return .error(.tooLarge($size));
+    }
+
+    string $out = header($size as uint32);
+    $out->append($body);
+    return .ok($out);
+}

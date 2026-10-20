@@ -1,0 +1,420 @@
+/**
+ * A buffered reader for any wire format: a line protocol (Redis), a length in a header (MySQL,
+ * Postgres, frames), or both. The core is free of I/O (`feed` bytes in, `take` and `until` out),
+ * so it also parses bytes that come from somewhere else; `exactly` and `until` drive it from any
+ * `Source` under a deadline, and `pullExactly` and `pullUntil` from a reactor without waiting.
+ * Bytes read past a message stay buffered for the next one, and `rest` hands them over whole,
+ * to a TLS layer after a plaintext start.
+ */
+
+namespace tcp;
+
+// one read takes at most this much off the source
+internal const usize READ_CHUNK = 65536;
+
+// a read into the rest of a long message takes up to this much at once
+internal const usize READ_BIG = 1048576;
+
+public class Reader
+{
+    /**
+     * The longest message `exactly` and `until` hold for: a larger one is `.tooLarge` before it
+     * is read, so a peer cannot make the reader buffer without end.
+     */
+    public const usize $max;
+    private string $pending;
+    // where the unread bytes start in $pending: the bytes before it were consumed already
+    private usize $start;
+    // how far past $start `until` has looked for $scanFor without finding it
+    private usize $scanned;
+    private string $scanFor;
+    // the peer closed: what is buffered is all that will come
+    private bool $ended;
+
+    public constructor(max: usize $max = 1048576)
+    {
+        $this->max = $max;
+        $this->pending = '';
+        $this->start = 0;
+        $this->scanned = 0;
+        $this->scanFor = '';
+        $this->ended = false;
+    }
+
+    /**
+     * Bytes read and not consumed yet.
+     */
+    public const function buffered() : usize
+    {
+        return $this->pending->size() - $this->start;
+    }
+
+    /**
+     * True once a read found the peer closed: what is buffered is all there will be.
+     */
+    public const function ended() : bool
+    {
+        return $this->ended;
+    }
+
+    /**
+     * Append raw bytes, as a read gave them.
+     */
+    public function feed(const string& $bytes) : void
+    {
+        $this->pending->append($bytes);
+    }
+
+    /**
+     * The unread byte `$at` places in. It has to be buffered.
+     */
+    public const function byte(usize $at) : uint8
+    {
+        assert($at < $this->buffered(), 'a byte past what is buffered');
+        return $this->pending->byte($this->start + $at);
+    }
+
+    /**
+     * A copy of the next `$n` bytes, nothing consumed, or null while fewer are buffered. For a
+     * header: decode it with `tcp::wire`, then `take` the message it announces.
+     */
+    public const function peek(usize $n) : string?
+    {
+        string? $none = null;
+        if ($this->buffered() < $n) {
+            return $none;
+        }
+        string? $copy = $this->pending->sub($this->start, $n)->clone();
+        return $copy;
+    }
+
+    /**
+     * Where `$delim` starts among the unread bytes, or null when it is not buffered.
+     */
+    public const function find(const string& $delim) : usize?
+    {
+        usize? $none = null;
+        usize $at = $this->pending->find($delim, $this->start);
+        if ($delim->empty() || $at == $this->pending->size()) {
+            return $none;
+        }
+        usize? $found = $at - $this->start;
+        return $found;
+    }
+
+    /**
+     * The next `$n` bytes, consumed, or null while fewer are buffered. A message that is most of
+     * the buffer takes the buffer with it, and a small one is copied out, so a caller that keeps
+     * small messages does not keep a large buffer alive.
+     */
+    public function take(usize $n) : string?
+    {
+        string? $none = null;
+        usize $have = $this->buffered();
+        if ($have < $n) {
+            return $none;
+        }
+        $this->scanned = 0;
+
+        // a message shares the read buffer, so one the caller keeps keeps all of it. a large one
+        // takes the buffer, and the bytes after it are copied to one of their own (a sub would
+        // share it still), so the message leaves as the buffer's only owner
+        string $shared = $this->pending->sub($this->start, $n);
+        if ($n * 2 >= $this->pending->capacity()) {
+            string? $whole = $shared;
+            $this->pending = $this->pending->sub($this->start + $n, $have - $n)->clone();
+            $this->start = 0;
+            return $whole;
+        }
+
+        // a small one is copied out, so the buffer stays this reader's alone and is reused, not
+        // reallocated, for the next message
+        string? $copy = $shared->clone();
+        $shared = '';
+        $this->advance($n);
+        return $copy;
+    }
+
+    /**
+     * Consume `$n` bytes without looking at them. They have to be buffered.
+     */
+    public function skip(usize $n) : void
+    {
+        assert($n <= $this->buffered(), 'a skip past what is buffered');
+        $this->scanned = 0;
+        $this->advance($n);
+    }
+
+    /**
+     * Everything buffered, consumed: the hand-off when another layer (TLS after a plaintext
+     * start) takes the connection over and must see the bytes this reader read ahead.
+     */
+    public function rest() : string
+    {
+        string $all = $this->pending->sub($this->start, $this->buffered());
+        $this->pending = '';
+        $this->start = 0;
+        $this->scanned = 0;
+        return $all;
+    }
+
+    /**
+     * The next `$n` bytes, or null while fewer are buffered. `.tooLarge` when `$n` is over
+     * `max`.
+     */
+    public function exactly(usize $n) : result<string?, Error>
+    {
+        if ($n > $this->max) {
+            return .error(.tooLarge($n as uint64));
+        }
+        string? $got = $this->take($n);
+        return .ok($got);
+    }
+
+    /**
+     * The bytes before the next `$delim`, consumed with it, or null while it is not buffered.
+     * `.tooLarge` once more than `max` bytes are buffered without it. A long message is not
+     * searched again from its start on every call.
+     */
+    public function until(const string& $delim) : result<string?, Error>
+    {
+        string? $none = null;
+        assert(!$delim->empty(), 'an empty delimiter');
+        if ($this->scanFor != $delim) {
+            $this->scanFor = $delim;
+            $this->scanned = 0;
+        }
+
+        // the delimiter may have begun in the last few bytes looked at already
+        usize $from = $this->start;
+        if ($this->scanned >= $delim->size()) {
+            $from = $this->start + $this->scanned - $delim->size() + 1;
+        }
+        usize $at = $this->pending->find($delim, $from);
+        if ($at == $this->pending->size()) {
+            usize $have = $this->buffered();
+            $this->scanned = $have;
+            if ($have >= $this->max + $delim->size()) {
+                return .error(.tooLarge($have as uint64));
+            }
+            return .ok($none);
+        }
+
+        usize $len = $at - $this->start;
+        if ($len > $this->max) {
+            return .error(.tooLarge($len as uint64));
+        }
+        string? $message = $this->take($len);
+        $this->skip($delim->size());
+        return .ok($message);
+    }
+
+    /**
+     * One read off `$src` into the buffer, waiting until the deadline: how many bytes, or null
+     * when it passed first. `.eof` once the peer has closed.
+     */
+    public function fill<S : Source>(S $src, Deadline $by) : result<usize?, Error>
+    {
+        return $this->fillFor($src, 0, $by);
+    }
+
+    /**
+     * One read off `$src` of what is already there, without waiting: how many bytes, or null
+     * when there is nothing yet.
+     */
+    public function tryFill<S : Source>(S $src) : result<usize?, Error>
+    {
+        Deadline? $none = null;
+        return $this->fillFor($src, 0, $none);
+    }
+
+    /**
+     * The next `$n` bytes off `$src`, waiting until the deadline for all of them however many
+     * reads it takes: null only when the deadline passed first, with what arrived kept for the
+     * next call. `.eof` when the peer closes first (`buffered` says how much came).
+     */
+    public function exactly<S : Source>(S $src, usize $n, Deadline $by) : result<string?, Error>
+    {
+        string? $none = null;
+        bool $first = true;
+        while (true) {
+            string? $ready = guard $this->exactly($n) else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+            // the first pass always reads once, so bytes already in the socket beat a passed deadline
+            if (!$first && $by->passed()) {
+                return .ok($none);
+            }
+            $first = false;
+
+            Deadline? $until = $by;
+            result<usize?, Error> $got = $this->fillFor($src, $n, $until);
+            if (!$got->has_value()) {
+                return .error($got->failure());
+            }
+        }
+    }
+
+    /**
+     * The bytes before the next `$delim` off `$src`, consumed with it, waiting until the
+     * deadline: null only when it passed first, with what arrived kept. `.eof` when the peer
+     * closes first, `.tooLarge` past `max`.
+     */
+    public function until<S : Source>(S $src, const string& $delim, Deadline $by) : result<string?, Error>
+    {
+        string? $none = null;
+        bool $first = true;
+        while (true) {
+            string? $ready = guard $this->until($delim) else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+            if (!$first && $by->passed()) {
+                return .ok($none);
+            }
+            $first = false;
+
+            Deadline? $until = $by;
+            result<usize?, Error> $got = $this->fillFor($src, 0, $until);
+            if (!$got->has_value()) {
+                return .error($got->failure());
+            }
+        }
+    }
+
+    /**
+     * The next `$n` bytes from what `$src` already has, without waiting: null when it would have
+     * to. For a reactor, which calls it until it answers null. Bytes that came in with the peer's
+     * close still come out first, then `.eof`.
+     */
+    public function pullExactly<S : Source>(S $src, usize $n) : result<string?, Error>
+    {
+        string? $none = null;
+        Deadline? $now = null;
+        while (true) {
+            string? $ready = guard $this->exactly($n) else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+            if ($this->ended) {
+                return .error(.eof);
+            }
+
+            usize? $got = guard $this->fillFor($src, $n, $now) else ($e) {
+                return .error($e);
+            }
+            if ($got == null) {
+                return .ok($none);
+            }
+        }
+    }
+
+    /**
+     * The bytes before the next `$delim` from what `$src` already has, without waiting: null
+     * when it would have to. Call it until it answers null. Messages that came in with the peer's
+     * close still come out first, then `.eof`.
+     */
+    public function pullUntil<S : Source>(S $src, const string& $delim) : result<string?, Error>
+    {
+        string? $none = null;
+        Deadline? $now = null;
+        while (true) {
+            string? $ready = guard $this->until($delim) else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+            if ($this->ended) {
+                return .error(.eof);
+            }
+
+            usize? $got = guard $this->fillFor($src, 0, $now) else ($e) {
+                return .error($e);
+            }
+            if ($got == null) {
+                return .ok($none);
+            }
+        }
+    }
+
+    /**
+     * One read into the buffer, sized for a message of `$need` bytes from the read position (0
+     * when unknown): waiting until `$by`, or not at all without one. Marks the end when the peer
+     * has closed.
+     */
+    internal function fillFor<S : Source>(S $src, usize $need, Deadline? $by) : result<usize?, Error>
+    {
+        if ($this->ended) {
+            return .error(.eof);
+        }
+        usize $want = $this->readSize($need);
+        $this->compact($want);
+
+        Deadline $until = guard $by else {
+            return $this->filled($src->tryRead($this->pending, $want));
+        }
+        return $this->filled($src->read($this->pending, $want, $until));
+    }
+
+    private function filled(result<usize?, Error> $got) : result<usize?, Error>
+    {
+        if (!$got->has_value()) {
+            Error $e = $got->failure();
+            bool $eof = match ($e) {
+                Error::eof => true,
+                else => false,
+            };
+            if ($eof) {
+                $this->ended = true;
+            }
+        }
+        return $got;
+    }
+
+    private function advance(usize $n) : void
+    {
+        $this->start = $this->start + $n;
+        if ($this->start == $this->pending->size()) {
+            // all consumed: the buffer stays, empty, for the next read
+            $this->pending->clear();
+            $this->start = 0;
+        }
+    }
+
+    /**
+     * Before a read of `$want` bytes: the unread bytes move to the front when the buffer would
+     * otherwise have to grow for it.
+     */
+    private function compact(usize $want) : void
+    {
+        if ($this->start > 0 && $this->pending->room() < $want) {
+            $this->pending = $this->pending->sub($this->start, $this->pending->size() - $this->start);
+            $this->start = 0;
+        }
+    }
+
+    /**
+     * How much the next read takes: one chunk, or more while a long message is still coming, so
+     * a big one takes fewer reads.
+     */
+    private const function readSize(usize $need) : usize
+    {
+        usize $have = $this->buffered();
+        if ($need <= $have + READ_CHUNK) {
+            return READ_CHUNK;
+        }
+        usize $missing = $need - $have;
+        if ($missing > READ_BIG) {
+            return READ_BIG;
+        }
+        return $missing;
+    }
+}

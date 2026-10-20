@@ -1,0 +1,434 @@
+/**
+ * A layer over a stream, the way TLS will sit: `Scrambled` implements Source, Sink and Pollable
+ * around a `Stream`. It XORs every byte, sends a one-byte hello before anything else and needs the
+ * peer's before it can read, and hands the socket at most a few bytes of what it holds per flush.
+ * So it holds bytes of its own after a try write, needs write readiness to read, and has bytes
+ * read ahead when it takes over after a plaintext start: what a real TLS layer does. Frames, the
+ * buffered reader, and a reactor loop all run through it unchanged.
+ */
+
+use std::thread;
+use std::time;
+
+// the byte each side sends before any data: its handshake
+internal const uint8 HELLO = 22;
+internal const uint8 KEY = 90;
+
+// the most ciphertext one try flush hands the socket, so a flush leaves some held
+internal const usize SLICE = 7;
+
+// the most plaintext one try write takes, as a TLS layer takes a record at a time
+internal const usize RECORD = 64;
+
+// past this much held ciphertext a try write takes nothing until the socket has drained some
+internal const usize HELD_MAX = 256;
+
+internal class Scrambled : tcp::Source, tcp::Sink, tcp::Pollable
+{
+    public tcp::Stream $inner;
+    // ciphertext read off the socket and not handed out yet
+    private string $raw;
+    // ciphertext owed to the socket, and how much of it went already
+    private string $out;
+    private usize $sent;
+    // the peer's hello arrived
+    private bool $greeted;
+
+    /**
+     * Take `$inner` over. `$already` is ciphertext a plaintext reader read ahead before the
+     * switch (`tcp::Reader::rest`).
+     */
+    public constructor(tcp::Stream $inner, string $already = '')
+    {
+        $this->inner = $inner;
+        $this->raw = $already;
+        $this->out = '';
+        $this->out->push(HELLO);
+        $this->sent = 0;
+        $this->greeted = false;
+    }
+
+    public function read(string& $into, usize $most, tcp::Deadline $by) : result<usize?, tcp::Error>
+    {
+        usize? $none = null;
+        guard $this->flushBy($by) else ($e) {
+            return .error($e);
+        }
+        while (true) {
+            usize $n = $this->decode($into, $most);
+            if ($n > 0) {
+                usize? $got = $n;
+                return .ok($got);
+            }
+            usize? $read = guard $this->inner->read($this->raw, 4096, $by) else ($e) {
+                return .error($e);
+            }
+            if ($read == null) {
+                return .ok($none);
+            }
+        }
+    }
+
+    public function tryRead(string& $into, usize $most) : result<usize?, tcp::Error>
+    {
+        usize? $none = null;
+        // a read may have to send first: the hello goes out before anything is read
+        bool $drained = guard $this->tryFlush() else ($e) {
+            return .error($e);
+        }
+        while (true) {
+            usize $n = $this->decode($into, $most);
+            if ($n > 0) {
+                usize? $got = $n;
+                return .ok($got);
+            }
+            usize? $read = guard $this->inner->tryRead($this->raw, 4096) else ($e) {
+                return .error($e);
+            }
+            if ($read == null) {
+                return .ok($none);
+            }
+        }
+    }
+
+    public function write(const string& $bytes, tcp::Deadline $by) : status<tcp::Error>
+    {
+        $this->encode($bytes, 0, $bytes->size());
+        return $this->flushBy($by);
+    }
+
+    public function write(const string& $head, const string& $body, tcp::Deadline $by) : status<tcp::Error>
+    {
+        $this->encode($head, 0, $head->size());
+        $this->encode($body, 0, $body->size());
+        return $this->flushBy($by);
+    }
+
+    public function tryWrite(const string& $bytes, usize $from) : result<usize?, tcp::Error>
+    {
+        usize? $none = null;
+        if ($this->sent + HELD_MAX < $this->out->size()) {
+            bool $drained = guard $this->tryFlush() else ($e) {
+                return .error($e);
+            }
+            if ($this->sent + HELD_MAX < $this->out->size()) {
+                return .ok($none);
+            }
+        }
+        usize $n = $bytes->size() - $from;
+        if ($n > RECORD) {
+            $n = RECORD;
+        }
+        $this->encode($bytes, $from, $n);
+        bool $drained = guard $this->tryFlush() else ($e) {
+            return .error($e);
+        }
+        usize? $took = $n;
+        return .ok($took);
+    }
+
+    /**
+     * One slice of what is held, at most: the caller comes back on writable for the rest.
+     */
+    public function tryFlush() : result<bool, tcp::Error>
+    {
+        if ($this->sent < $this->out->size()) {
+            usize $end = $this->sent + SLICE;
+            if ($end > $this->out->size()) {
+                $end = $this->out->size();
+            }
+            usize? $put = guard $this->inner->tryWrite($this->out->sub(0, $end), $this->sent) else ($e) {
+                return .error($e);
+            }
+            if ($put != null) {
+                usize $n = guard $put;
+                $this->sent = $this->sent + $n;
+            }
+        }
+        if ($this->sent < $this->out->size()) {
+            return .ok(false);
+        }
+        $this->out->clear();
+        $this->sent = 0;
+        return .ok(true);
+    }
+
+    public const function handle() : int64
+    {
+        return $this->inner->handle();
+    }
+
+    public const function closed() : bool
+    {
+        return $this->inner->closed();
+    }
+
+    /**
+     * Read readiness until the peer's hello is in, write readiness while ciphertext is held,
+     * on top of what the caller wants.
+     */
+    public const function needs(tcp::Interest? $want) : tcp::Interest?
+    {
+        bool $read = !$this->greeted;
+        bool $write = $this->sent < $this->out->size();
+        if ($want != null) {
+            tcp::Interest $w = guard $want;
+            $read = $read || $w != tcp::Interest::write;
+            $write = $write || $w != tcp::Interest::read;
+        }
+        tcp::Interest? $need = null;
+        if ($read && $write) {
+            $need = tcp::Interest::both;
+        } else if ($read) {
+            $need = tcp::Interest::read;
+        } else if ($write) {
+            $need = tcp::Interest::write;
+        }
+        return $need;
+    }
+
+    /**
+     * Everything held, sent before the deadline.
+     */
+    private function flushBy(tcp::Deadline $by) : status<tcp::Error>
+    {
+        if ($this->sent == $this->out->size()) {
+            return .ok;
+        }
+        guard $this->inner->write($this->out->sub($this->sent, $this->out->size() - $this->sent), $by) else ($e) {
+            return .error($e);
+        }
+        $this->out->clear();
+        $this->sent = 0;
+        return .ok;
+    }
+
+    private function encode(const string& $bytes, usize $from, usize $n) : void
+    {
+        usize $i = $from;
+        while ($i < $from + $n) {
+            $this->out->push($bytes->byte($i) ^ KEY);
+            $i = $i + 1;
+        }
+    }
+
+    /**
+     * Plaintext from what was read: the peer's hello first, then at most `$most` bytes.
+     */
+    private function decode(string& $into, usize $most) : usize
+    {
+        usize $i = 0;
+        if (!$this->greeted && !$this->raw->empty()) {
+            $this->greeted = true;
+            $i = 1;
+        }
+        usize $n = 0;
+        while ($i < $this->raw->size() && $n < $most) {
+            $into->push($this->raw->byte($i) ^ KEY);
+            $i = $i + 1;
+            $n = $n + 1;
+        }
+        $this->raw = $this->raw->sub($i, $this->raw->size() - $i)->clone();
+        return $n;
+    }
+}
+
+test tcp_a_layer_changes_the_bytes_on_the_wire
+{
+    tcp::StreamPair $pair = connectedPair();
+    Scrambled $c = Scrambled($pair->client);
+    guard $c->write('abc', ms(5000)) else ($e) {
+        die("write: {$e}");
+    }
+    string $raw = '';
+    guard tcp::readExactly($pair->server, $raw, 4, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($raw->byte(0) == HELLO, 'the hello first');
+    assert($raw->byte(1) == (97 ^ KEY), 'then the bytes, scrambled');
+    assert($raw->byte(3) == (99 ^ KEY), 'every one of them');
+}
+
+test tcp_frames_cross_a_layer
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $plainClient = $pair->client;
+    thread::task<string> $sender = guard thread::spawn(function() : string {
+        Scrambled $c = Scrambled($plainClient);
+        usize $i = 0;
+        while ($i < 100) {
+            guard tcp::frame::write($c, pattern($i * 13), ms(5000)) else ($e) {
+                return "frame {$i}: {$e}";
+            }
+            $i = $i + 1;
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    Scrambled $s = Scrambled($pair->server);
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 4096);
+    usize $i = 0;
+    while ($i < 100) {
+        string? $got = guard $r->read($s, ms(5000)) else ($e) {
+            die("read: {$e}");
+        }
+        string $body = guard $got else {
+            die('no frame within 5 s');
+        }
+        expect(firstDiff($body, pattern($i * 13)) == -1, "frame {$i} is intact");
+        $i = $i + 1;
+    }
+    expect($sender->wait() == 'ok', 'sent');
+}
+
+test tcp_a_reader_reads_lines_through_a_layer
+{
+    tcp::StreamPair $pair = connectedPair();
+    Scrambled $c = Scrambled($pair->client);
+    guard $c->write("one\r\ntwo\r\n", ms(5000)) else ($e) {
+        die("write: {$e}");
+    }
+    Scrambled $s = Scrambled($pair->server);
+    tcp::Reader $r = tcp::Reader();
+    string? $one = guard $r->until($s, "\r\n", ms(5000)) else ($e) {
+        die("until: {$e}");
+    }
+    string? $two = guard $r->until($s, "\r\n", ms(5000)) else ($e) {
+        die("until: {$e}");
+    }
+    assert(($one ?? '') == 'one' && ($two ?? '') == 'two', 'both lines');
+}
+
+test tcp_a_layer_takes_over_after_a_plaintext_start
+{
+    tcp::StreamPair $pair = connectedPair();
+
+    // one send: the plaintext request, then the layer's hello and a scrambled line, so the
+    // server's plaintext reader is likely to read into the scrambled part
+    string $wire = "STARTTLS\r\n";
+    $wire->push(HELLO);
+    string $secret = "secret\r\n";
+    usize $i = 0;
+    while ($i < $secret->size()) {
+        $wire->push($secret->byte($i) ^ KEY);
+        $i = $i + 1;
+    }
+    send($pair->client, $wire);
+
+    tcp::Reader $plain = tcp::Reader();
+    string? $request = guard $plain->until($pair->server, "\r\n", ms(5000)) else ($e) {
+        die("until: {$e}");
+    }
+    assert(($request ?? '') == 'STARTTLS', 'the plaintext request');
+
+    // whatever the plaintext reader read ahead belongs to the layer now
+    Scrambled $layer = Scrambled($pair->server, $plain->rest());
+    assert($plain->buffered() == 0, 'the plaintext reader keeps nothing back');
+    tcp::Reader $r = tcp::Reader();
+    string? $line = guard $r->until($layer, "\r\n", ms(5000)) else ($e) {
+        die("until: {$e}");
+    }
+    assert(($line ?? '') == 'secret', 'the first scrambled line');
+}
+
+test tcp_a_reactor_serves_through_a_layer
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $plainClient = $pair->client;
+    usize $count = 50;
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        Scrambled $c = Scrambled($plainClient);
+        tcp::frame::Reader $back = tcp::frame::Reader(max: 4096);
+        usize $i = 0;
+        while ($i < $count) {
+            guard tcp::frame::write($c, pattern(10 + $i * 17), ms(5000)) else ($e) {
+                return "write {$i}: {$e}";
+            }
+            string? $got = guard $back->read($c, ms(5000)) else ($e) {
+                return "echo {$i}: {$e}";
+            }
+            string $body = guard $got else {
+                return "no echo {$i} within 5 s";
+            }
+            if (firstDiff($body, pattern(10 + $i * 17)) != -1) {
+                return "echo {$i} differs";
+            }
+            $i = $i + 1;
+        }
+        guard $plainClient->shutdown(.write) else ($e) {
+            return "shutdown: {$e}";
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Poller $poller = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    Scrambled $conn = Scrambled($pair->server);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 4096);
+    tcp::Outbox $out = tcp::Outbox();
+    bool $reading = true;
+    // the layer has a hello to send and one to read before anything else: it asks for both
+    tcp::Interest $watching = guard $out->interest($conn, reading: true);
+    assert($watching == tcp::Interest::both, 'a handshake needs both directions');
+    guard $poller->add($conn, 1, $watching) else ($e) {
+        die("add: {$e}");
+    }
+
+    array<tcp::Event> $events = array<tcp::Event>();
+    usize $echoed = 0;
+    tcp::Deadline $by = ms(10000);
+    bool $done = false;
+    while (!$done) {
+        expect(!$by->passed(), "served {$echoed} of {$count} before the deadline");
+        guard $poller->wait($events, ms(100)) else ($e) {
+            die("wait: {$e}");
+        }
+        if ($events->empty()) {
+            continue;
+        }
+        while ($reading) {
+            result<string?, tcp::frame::Error> $frame = $reader->pull($conn);
+            if (!$frame->has_value()) {
+                tcp::frame::Error $e = $frame->failure();
+                expect($e->name() == 'end', "pull: {$e}");
+                $reading = false;
+                break;
+            }
+            string? $whole = $frame->unwrap();
+            string $body = guard $whole else {
+                break;
+            }
+            guard tcp::frame::push($out, $body) else ($e) {
+                die("push: {$e}");
+            }
+            $echoed = $echoed + 1;
+        }
+        guard $out->flush($conn) else ($e) {
+            die("flush: {$e}");
+        }
+        tcp::Interest? $want = $out->interest($conn, reading: $reading);
+        if ($want == null) {
+            $done = true;
+            break;
+        }
+        tcp::Interest $next = guard $want;
+        if ($next != $watching) {
+            guard $poller->modify($conn, 1, $next) else ($e) {
+                die("modify: {$e}");
+            }
+            $watching = $next;
+        }
+    }
+
+    string $said = $client->wait();
+    expect($said == 'ok', "client: {$said}");
+    expect($echoed == $count, "echoed {$echoed} of {$count}");
+    guard $poller->remove($conn) else ($e) {
+        die("remove: {$e}");
+    }
+}

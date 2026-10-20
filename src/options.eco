@@ -1,0 +1,54 @@
+/**
+ * Socket options as plain data: fields with defaults, set by assignment, applied when a stream
+ * is connected or accepted.
+ */
+
+namespace tcp;
+
+use std::time;
+
+public struct StreamOptions
+{
+    /**
+     * Send small writes at once instead of waiting to batch them (TCP_NODELAY). On by default:
+     * request and reply traffic should never wait for a delayed ACK.
+     */
+    public bool $noDelay = true;
+
+    /**
+     * Probe an idle connection after this long, so a peer that vanished is found out. Null
+     * leaves keepalive off.
+     */
+    public time::duration? $keepAlive = null;
+
+    /**
+     * Kernel buffer sizes in bytes; 0 keeps the system's choice.
+     */
+    public usize $sendBuffer = 0;
+    public usize $receiveBuffer = 0;
+}
+
+public struct ListenOptions
+{
+    /**
+     * How many finished handshakes may wait for an accept.
+     */
+    public int32 $backlog = 128;
+
+    /**
+     * Let several listeners bind the same port, so several threads or processes each accept on
+     * their own (SO_REUSEPORT; POSIX only).
+     */
+    public bool $reusePort = false;
+
+    /**
+     * On an IPv6 address (`::`), take IPv4 connections too. Off by default: a listener takes
+     * the family it was given.
+     */
+    public bool $dualStack = false;
+
+    /**
+     * The options every accepted stream starts with.
+     */
+    public StreamOptions $accepted = StreamOptions();
+}

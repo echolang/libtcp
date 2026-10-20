@@ -1,0 +1,124 @@
+/**
+ * Addresses without a network: the named ones, parsing, printing, comparing, and resolving a
+ * numeric host.
+ */
+
+test tcp_named_addresses
+{
+    tcp::Address $lo = tcp::Address(loopback: 80);
+    assert($lo->family == tcp::Family::v4 && $lo->port == 80, 'loopback is IPv4');
+    assert($lo->host() == '127.0.0.1', 'loopback is 127.0.0.1');
+    assert(tcp::Address(any: 1)->host() == '0.0.0.0', 'any is 0.0.0.0');
+    assert(tcp::Address(loopback: 1, .v6)->host() == '::1', 'loopback .v6 is ::1');
+    assert(tcp::Address(any: 1, .v6)->host() == '::', 'any .v6 is ::');
+    assert(tcp::Address(loopback: 1, .v6)->family == tcp::Family::v6, 'and both of those are IPv6');
+}
+
+test tcp_addresses_print_as_host_and_port
+{
+    tcp::Address $four = tcp::Address(loopback: 8080);
+    tcp::Address $six = tcp::Address(loopback: 8080, .v6);
+    assert("{$four}" == '127.0.0.1:8080', 'IPv4 as host:port');
+    assert("{$six}" == '[::1]:8080', 'IPv6 in brackets');
+}
+
+test tcp_addresses_parse
+{
+    tcp::Address $a = guard tcp::Address::parse('192.168.1.20', 443) else ($e) {
+        die("parse: {$e}");
+    }
+    assert($a->host() == '192.168.1.20' && $a->port == 443, 'a host and a port');
+    tcp::Address $b = guard tcp::Address::parse('[2001:db8::1]:9000') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($b->family == tcp::Family::v6 && $b->port == 9000, 'IPv6 in brackets with a port');
+    assert($b->host() == '2001:db8::1', 'written the short way');
+    tcp::Address $c = guard tcp::Address::parse('10.0.0.1:22') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($c->host() == '10.0.0.1' && $c->port == 22, 'host:port in one string');
+}
+
+test tcp_bad_addresses_are_invalid
+{
+    expect(failed(tcp::Address::parse('localhost', 80)) == 'invalid', 'a name is not a numeric address');
+    expect(failed(tcp::Address::parse('300.1.1.1', 80)) == 'invalid', 'nor is an octet over 255');
+    expect(failed(tcp::Address::parse('', 80)) == 'invalid', 'nor is nothing');
+    expect(failed(tcp::Address::parse('10.0.0.1')) == 'invalid', 'host:port needs the port');
+    expect(failed(tcp::Address::parse('10.0.0.1:99999')) == 'invalid', 'in range');
+    expect(failed(tcp::Address::parse('10.0.0.1:http')) == 'invalid', 'and in digits');
+    expect(failed(tcp::Address::parse('10.0.0.1:')) == 'invalid', 'an empty port is none');
+    expect(failed(tcp::Address::parse(':80')) == 'invalid', 'nor is an empty host');
+    expect(failed(tcp::Address::parse('10.0.0.1:+80')) == 'invalid', 'a port has no sign');
+    expect(failed(tcp::Address::parse('10.0.0.1:-0')) == 'invalid', 'not even a minus zero');
+    expect(failed(tcp::Address::parse('10.0.0.1: 80')) == 'invalid', 'nor a space');
+    expect(failed(tcp::Address::parse('[::1]')) == 'invalid', 'brackets still need the port');
+    expect(failed(tcp::Address::parse('[::1]80')) == 'invalid', 'behind a colon');
+    expect(failed(tcp::Address::parse('[::1:80')) == 'invalid', 'and a closing bracket');
+}
+
+test tcp_an_ipv6_host_and_port_needs_brackets
+{
+    // without brackets the last colon could be the port or part of the address
+    expect(failed(tcp::Address::parse('1::2:3')) == 'invalid', '1::2:3 is an address, not [1::2]:3');
+    expect(failed(tcp::Address::parse('::1:80')) == 'invalid', 'nor is ::1:80 split');
+    expect(failed(tcp::Address::parse('fe80::1')) == 'invalid', 'nor fe80::1');
+    expect(failed(tcp::Address::parse('[127.0.0.1]:80')) == 'invalid', 'brackets are for IPv6 only');
+
+    tcp::Address $a = guard tcp::Address::parse('[::ffff:10.0.0.1]:80') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($a->family == tcp::Family::v6 && $a->port == 80, 'an IPv4-mapped address is IPv6');
+    tcp::Address $z = guard tcp::Address::parse('[::]:0') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($z == tcp::Address(any: 0, .v6), 'every interface on port zero');
+    tcp::Address $top = guard tcp::Address::parse('127.0.0.1:65535') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($top->port == 65535, 'the top port');
+    tcp::Address $lead = guard tcp::Address::parse('127.0.0.1:080') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($lead->port == 80, 'a leading zero is still decimal');
+}
+
+test tcp_a_link_local_address_keeps_its_scope
+{
+    // a numeric scope parses on every platform; interface names differ
+    tcp::Address $a = guard tcp::Address::parse('fe80::1%1', 80) else ($e) {
+        die("parse: {$e}");
+    }
+    assert($a->scope == 1, 'the scope is kept');
+    assert($a != tcp::Address::parse('fe80::1', 80)->or(tcp::Address(any: 0)), 'and is part of the endpoint');
+    tcp::Address $b = guard tcp::Address::parse('[fe80::1%1]:80') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($a == $b, 'in brackets too');
+    assert($a->with(port: 81)->scope == 1, 'and survives another port');
+}
+
+test tcp_addresses_compare_and_key_a_map
+{
+    tcp::Address $a = tcp::Address(loopback: 80);
+    tcp::Address $b = tcp::Address::parse('127.0.0.1', 80)->or(tcp::Address(any: 0));
+    assert($a == $b, 'the same endpoint, built two ways');
+    assert($a != $a->with(port: 81), 'another port is another endpoint');
+    assert($a->with(port: 81)->port == 81 && $a->port == 80, 'with makes a copy');
+    assert(tcp::Address(loopback: 80) != tcp::Address(loopback: 80, .v6), 'and another family');
+    map<tcp::Address, int32> $seen = map<tcp::Address, int32>();
+    $seen[$a] = 1;
+    $seen[$b] = 2;
+    $seen[tcp::Address(loopback: 80, .v6)] = 3;
+    assert($seen->count() == 2, 'equal addresses share a key');
+}
+
+test tcp_a_numeric_host_resolves_to_itself
+{
+    array<tcp::Address> $got = guard tcp::resolve('127.0.0.1', 7) else ($e) {
+        die("resolve: {$e}");
+    }
+    assert($got->count() == 1, 'one address');
+    assert($got[0] == tcp::Address(loopback: 7), 'the one it names');
+    expect(failed(tcp::resolve('', 7)) == 'invalid', 'an empty host is invalid');
+}

@@ -1,0 +1,284 @@
+/**
+ * The reactor's halves without a reactor: `frame::Reader::pull` taking frames off a stream
+ * without waiting, and `Outbox` keeping what a try write could not send.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * What `pull` hands out until it fails, with a short sleep after each null: the bodies, then the
+ * failure's name.
+ */
+internal function pullAll(tcp::frame::Reader $r, tcp::Stream $s) : array<string>
+{
+    array<string> $got = array<string>();
+    tcp::Deadline $by = ms(5000);
+    while (!$by->passed()) {
+        result<string?, tcp::frame::Error> $next = $r->pull($s);
+        if (!$next->has_value()) {
+            tcp::frame::Error $e = $next->failure();
+            $got[] = $e->name();
+            return $got;
+        }
+        string? $maybe = $next->unwrap();
+        if ($maybe == null) {
+            thread::sleep(5);
+            continue;
+        }
+        string $body = guard $maybe;
+        $got[] = $body;
+    }
+    $got[] = 'no end within 5 s';
+    return $got;
+}
+
+/**
+ * What an outbox asks to watch for, as a word: `none` when it says the connection is done.
+ */
+internal function watching(tcp::Outbox $out, tcp::Stream $on, bool $reading) : string
+{
+    tcp::Interest? $want = $out->interest($on, reading: $reading);
+    tcp::Interest $i = guard $want else {
+        return 'none';
+    }
+    return match ($i) {
+        tcp::Interest::read => 'read',
+        tcp::Interest::write => 'write',
+        tcp::Interest::both => 'both',
+    };
+}
+
+test tcp_pull_with_nothing_there_is_null
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+    string? $got = guard $r->pull($pair->server) else ($e) {
+        die("pull: {$e}");
+    }
+    assert($got == null, 'nothing yet, and no wait');
+}
+
+test tcp_pull_hands_out_the_frames_that_came_with_the_end
+{
+    tcp::StreamPair $pair = connectedPair();
+    sendFrame($pair->client, 'a');
+    sendFrame($pair->client, 'bb');
+    sendFrame($pair->client, 'ccc');
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    // the frames and the end are all in the socket before the first pull
+    thread::sleep(100);
+    array<string> $got = pullAll(tcp::frame::Reader(max: 1024), $pair->server);
+    expect($got->count() == 4, "three frames and the end, got {$got->count()}");
+    assert($got[0] == 'a' && $got[1] == 'bb' && $got[2] == 'ccc', 'every frame, in order');
+    expect($got[3] == 'end', "then the end: {$got[3]}");
+}
+
+test tcp_pull_reports_a_frame_cut_short
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, tcp::frame::header(10));
+    send($pair->client, 'abc');
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    array<string> $got = pullAll(tcp::frame::Reader(max: 1024), $pair->server);
+    expect($got->count() == 1 && $got[0] == 'truncated', 'a close partway through a frame is truncated');
+}
+
+test tcp_pull_goes_idle_only_once_the_socket_is_empty
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024, idle: time::duration::millis(50));
+    sendFrame($pair->client, 'late but here');
+    thread::sleep(150);
+    string? $first = guard $r->pull($pair->server) else ($e) {
+        die("a frame already in the socket beats the idle limit: {$e}");
+    }
+    assert($first != null, 'it comes out');
+    string? $quiet = guard $r->pull($pair->server) else ($e) {
+        die("the idle clock restarts after a frame: {$e}");
+    }
+    assert($quiet == null, 'nothing more yet');
+    thread::sleep(150);
+    string $why = frameFailed($r->pull($pair->server));
+    expect($why == 'idle', "no frame within the limit is idle: {$why}");
+}
+
+test tcp_pull_on_a_closed_stream_says_why
+{
+    tcp::StreamPair $pair = connectedPair();
+    $pair->server->close();
+    string $why = frameFailed(tcp::frame::Reader(max: 1024)->pull($pair->server));
+    expect($why == 'transport:closed', "pull on a closed stream: {$why}");
+}
+
+test tcp_an_empty_outbox_watches_for_reading_only
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Outbox $out = tcp::Outbox();
+    assert($out->empty() && $out->pending() == 0, 'nothing owed');
+    assert(watching($out, $pair->client, true) == 'read', 'reading: watch for reads');
+    assert(watching($out, $pair->client, false) == 'none', 'not reading and nothing owed: done');
+    $out->push('x');
+    assert(watching($out, $pair->client, true) == 'both', 'owed and reading: both');
+    assert(watching($out, $pair->client, false) == 'write', 'owed, not reading: write');
+}
+
+test tcp_an_outbox_sends_what_it_was_given
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Outbox $out = tcp::Outbox();
+    $out->push('hello ');
+    $out->push('head|', 'body');
+    guard tcp::frame::push($out, 'framed') else ($e) {
+        die("push a frame: {$e}");
+    }
+    expect($out->pending() == 25, "pending counts every byte: {$out->pending()}");
+    guard $out->flush($pair->client) else ($e) {
+        die("flush: {$e}");
+    }
+    assert($out->empty(), 'a small queue goes out at once');
+
+    string $got = '';
+    guard tcp::readExactly($pair->server, $got, 15, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'hello head|body', 'bytes, then head and body');
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+    expect(readFrame($pair->server, $r, 5000) == 'framed', 'then the frame');
+}
+
+test tcp_an_outbox_keeps_what_did_not_fit
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Outbox $out = tcp::Outbox();
+    // far more than the socket buffers take, so the first flush leaves most of it
+    string $all = pattern(16777216);
+    $out->push($all);
+    guard $out->flush($pair->client) else ($e) {
+        die("flush: {$e}");
+    }
+    assert(!$out->empty(), 'a full socket leaves bytes owed');
+    assert(watching($out, $pair->client, false) == 'write', 'and they wait for writable');
+
+    // the peer reads while the outbox keeps flushing from where it stopped
+    string $got = '';
+    tcp::Deadline $by = ms(20000);
+    while ($got->size() < $all->size() && !$by->passed()) {
+        guard $out->flush($pair->client) else ($e) {
+            die("flush again: {$e}");
+        }
+        usize? $n = guard $pair->server->read($got, 1048576, ms(100)) else ($e) {
+            die("read: {$e}");
+        }
+    }
+    assert($out->empty(), 'everything went out');
+    int64 $diff = firstDiff($got, $all);
+    expect($diff == -1, "every byte once, in order; first difference at {$diff}");
+}
+
+test tcp_pull_keeps_answering_the_end
+{
+    tcp::StreamPair $pair = connectedPair();
+    $pair->client->close();
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+    array<string> $got = pullAll($r, $pair->server);
+    expect($got->count() == 1 && $got[0] == 'end', 'a close with nothing sent is the end');
+    string $again = frameFailed($r->pull($pair->server));
+    expect($again == 'end', "and the next pull says so again, without a read: {$again}");
+}
+
+test tcp_pull_refuses_a_frame_over_the_cap
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, tcp::frame::header(1025));
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+    array<string> $got = pullAll($r, $pair->server);
+    expect($got->count() == 1 && $got[0] == 'tooLarge', "a prefix over the cap: {$got[0]}");
+}
+
+test tcp_pull_takes_a_large_frame_over_many_reads
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $client = $pair->client;
+    string $body = pattern(3000000);
+    thread::task<bool> $writer = guard thread::spawn(function() : bool {
+        bool $sent = tcp::frame::write($client, $body, ms(10000))->has_value();
+        $client->close();
+        return $sent;
+    }) else ($e) {
+        die('spawn failed');
+    }
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 4000000);
+    array<string> $got = pullAll($r, $pair->server);
+    expect($writer->wait(), 'the frame went out');
+    expect($got->count() == 2 && $got[1] == 'end', "one frame, then the end: {$got->count()}");
+    int64 $diff = firstDiff($got[0], $body);
+    expect($diff == -1, "every byte, in order; first difference at {$diff}");
+}
+
+test tcp_pull_and_feed_share_one_buffer
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+    // half a prefix fed by hand, the rest from the socket
+    string $whole = tcp::frame::encode('joined')->or('');
+    $r->feed($whole->sub(0, 2));
+    send($pair->client, $whole->sub(2, $whole->size() - 2));
+    sendFrame($pair->client, 'next');
+    $pair->client->close();
+    array<string> $got = pullAll($r, $pair->server);
+    expect($got->count() == 3, "two frames and the end, got {$got->count()}");
+    expect($got[0] == 'joined' && $got[1] == 'next' && $got[2] == 'end', 'in order');
+}
+
+test tcp_an_outbox_on_a_closed_stream_keeps_its_bytes
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Outbox $out = tcp::Outbox();
+    $out->push('owed');
+    $pair->client->close();
+    string $why = failedStatus($out->flush($pair->client));
+    expect($why == 'closed', "flush to a closed stream: {$why}");
+    expect($out->pending() == 4, 'nothing is dropped on a failure');
+    assert(watching($out, $pair->client, false) == 'write', 'and it still says bytes are owed');
+}
+
+test tcp_an_outbox_keeps_order_across_partial_flushes
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Outbox $out = tcp::Outbox();
+    string $first = pattern(8388608);
+    $out->push($first);
+    guard $out->flush($pair->client) else ($e) {
+        die("flush: {$e}");
+    }
+    assert(!$out->empty(), 'the socket took only part of it');
+
+    // more is queued behind the unsent rest, while the flushes compact the queue
+    string $second = 'and then this';
+    $out->push($second);
+    $out->push('|', 'head and body');
+    string $want = $first->clone();
+    $want->append($second);
+    $want->append('|head and body');
+    expect($out->pending() < $want->size(), 'pending counts only what is still owed');
+
+    string $got = '';
+    tcp::Deadline $by = ms(20000);
+    while ($got->size() < $want->size() && !$by->passed()) {
+        guard $out->flush($pair->client) else ($e) {
+            die("flush again: {$e}");
+        }
+        usize? $n = guard $pair->server->read($got, 1048576, ms(100)) else ($e) {
+            die("read: {$e}");
+        }
+    }
+    assert($out->empty() && $out->pending() == 0, 'everything went out');
+    assert(watching($out, $pair->client, true) == 'read', 'and it goes back to reading');
+    int64 $diff = firstDiff($got, $want);
+    expect($diff == -1, "every byte once, in order; first difference at {$diff}");
+}

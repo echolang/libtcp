@@ -1,0 +1,265 @@
+/**
+ * Turns the bytes of one connection back into frames: a `tcp::Reader` that knows the 4-byte
+ * prefix. The core is free of I/O (`feed` bytes in, `take` frames out); `read` drives it from any
+ * `tcp::Source` under a deadline and keeps a partial frame across short waits, and `pull` drives
+ * it from a reactor without waiting. The idle limit lives in the core too: `read` and a reactor
+ * both go by `idleAt`.
+ */
+
+namespace tcp::frame;
+
+use std::time;
+
+public class Reader
+{
+    public const usize $max;
+    // not a public const: echoc 0.8 cannot assign a const nullable struct field
+    private time::duration? $idleLimit;
+    private tcp::Reader $in;
+    private time::instant $lastFrame;
+    // false once a frame was taken and the idle clock has not been restarted for it yet
+    private bool $stamped;
+
+    /**
+     * `$max` caps the body of one frame; a prefix over it is an error, not an allocation.
+     * `$idle` ends a conversation that delivers no whole frame for that long, counted from
+     * construction and, after each frame, from the next `take` that finds no whole frame (so the
+     * time the caller spends on a frame is not the peer's): a server's guard against a peer that
+     * holds a connection open and sends nothing, or a byte at a time.
+     */
+    public constructor(max: usize $max, idle: time::duration? $idle = null)
+    {
+        $this->max = $max;
+        $this->idleLimit = $idle;
+        // the frame cap is checked here, against the prefix: the bytes reader only buffers
+        $this->in = tcp::Reader(max: $max + HEADER);
+        $this->lastFrame = time::instant::now();
+        $this->stamped = true;
+    }
+
+    /**
+     * The idle limit, or null for none.
+     */
+    public const function idle() : time::duration?
+    {
+        return $this->idleLimit;
+    }
+
+    /**
+     * When the conversation goes idle: no whole frame by then, and it is over. Never without a
+     * limit. `read` answers `.idle` itself; a reactor waits no later than its readers' earliest,
+     * and drops a connection whose deadline has passed once it has read what was there and
+     * `take` answered null, so a frame already in the socket beats the limit.
+     */
+    public const function idleAt() : tcp::Deadline
+    {
+        time::duration? $limit = $this->idleLimit;
+        if ($limit == null) {
+            return tcp::Deadline::never();
+        }
+        time::duration $span = guard $limit;
+        return tcp::Deadline(at: $this->lastFrame + $span);
+    }
+
+    /**
+     * Bytes held that are not a whole frame yet.
+     */
+    public const function buffered() : usize
+    {
+        return $this->in->buffered();
+    }
+
+    /**
+     * Append raw bytes, as a read gave them.
+     */
+    public function feed(const string& $bytes) : void
+    {
+        $this->in->feed($bytes);
+    }
+
+    /**
+     * The next whole frame's body, or null while it is not all here yet.
+     */
+    public function take() : result<string?, Error>
+    {
+        string? $none = null;
+        string $prefix = guard $this->in->peek(HEADER) else {
+            $this->settle();
+            return .ok($none);
+        }
+
+        uint64 $size = length($prefix);
+        if ($size > ($this->max as uint64)) {
+            return .error(.tooLarge($size));
+        }
+        if ($this->in->buffered() < HEADER + ($size as usize)) {
+            $this->settle();
+            return .ok($none);
+        }
+
+        // no clock read here: `settle` restarts the idle clock once a take comes up empty, so
+        // frames already in the buffer come out without a system call each
+        $this->stamped = false;
+        $this->in->skip(HEADER);
+        string? $body = $this->in->take($size as usize);
+        return .ok($body);
+    }
+
+    /**
+     * The next frame off `$src`, waiting until the deadline for all of it however many reads it
+     * takes: null only when the deadline passed first. `.idle` once no frame came within the
+     * idle limit, which also cuts a longer wait short. A partial frame is kept for the next
+     * call.
+     */
+    public function read<S : tcp::Source>(S $src, tcp::Deadline $by) : result<string?, Error>
+    {
+        bool $first = true;
+        while (true) {
+            string? $ready = guard $this->take() else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+
+            tcp::Deadline $until = $by;
+            if ($this->idleLimit != null) {
+                $until = $by->earlier($this->idleAt());
+            }
+            // the first pass always reads once, so a frame already in the socket beats the limits
+            if (!$first && $until->passed()) {
+                if ($this->idleAt()->passed()) {
+                    return .error(.idle);
+                }
+                string? $none = null;
+                return .ok($none);
+            }
+            $first = false;
+
+            tcp::Deadline? $wait = $until;
+            result<usize?, tcp::Error> $got = $this->in->fillFor($src, $this->need(), $wait);
+            if (!$got->has_value()) {
+                return .error($this->failed($got->failure()));
+            }
+            // a null read: the wait ran out, and the checks at the top decide what that means
+        }
+    }
+
+    /**
+     * The next frame from what `$src` has already, without waiting: for a reactor, which calls it
+     * until it answers null and then waits on its `Poller`. The bytes go straight into the
+     * reader's buffer. Frames that came in with the peer's close still come out first, then
+     * `.end`, or `.truncated` when the close cut a frame short. `.idle` once the idle limit has
+     * passed with the socket empty and no whole frame here, so a frame already in the socket
+     * still beats the limit.
+     */
+    public function pull<S : tcp::Source>(S $src) : result<string?, Error>
+    {
+        string? $none = null;
+        tcp::Deadline? $now = null;
+        while (true) {
+            string? $ready = guard $this->take() else ($e) {
+                return .error($e);
+            }
+            if ($ready != null) {
+                return .ok($ready);
+            }
+            if ($this->in->ended()) {
+                return .error($this->endOfStream());
+            }
+
+            result<usize?, tcp::Error> $got = $this->in->fillFor($src, $this->need(), $now);
+            if (!$got->has_value()) {
+                return .error($this->failed($got->failure()));
+            }
+            if ($got->unwrap() == null) {
+                if ($this->idleAt()->passed()) {
+                    return .error(.idle);
+                }
+                return .ok($none);
+            }
+        }
+    }
+
+    /**
+     * How many bytes the frame being read needs from the read position: its prefix and body once
+     * the prefix is here (already checked against `$max`), else 0 for unknown.
+     */
+    private const function need() : usize
+    {
+        string $prefix = guard $this->in->peek(HEADER) else {
+            return 0;
+        }
+        return HEADER + (length($prefix) as usize);
+    }
+
+    /**
+     * A failed read as a frame error: the end of the stream is `end` or `truncated`, anything
+     * else is the connection's.
+     */
+    private const function failed(tcp::Error $e) : Error
+    {
+        bool $eof = match ($e) {
+            tcp::Error::eof => true,
+            else => false,
+        };
+        if ($eof) {
+            return $this->endOfStream();
+        }
+        return .transport($e);
+    }
+
+    /**
+     * Restarts the idle clock for the frames taken since it last ran.
+     */
+    private function settle() : void
+    {
+        if ($this->stamped) {
+            return;
+        }
+        $this->stamped = true;
+        if ($this->idleLimit != null) {
+            $this->lastFrame = time::instant::now();
+        }
+    }
+
+    private const function endOfStream() : Error
+    {
+        if ($this->in->buffered() == 0) {
+            return .end;
+        }
+        return .truncated;
+    }
+}
+
+/**
+ * Send `$body` as one frame before the deadline: prefix and body in one gathered write, neither
+ * copied.
+ */
+public function write<S : tcp::Sink>(S $dst, const string& $body, tcp::Deadline $by) : status<Error>
+{
+    uint64 $size = $body->size() as uint64;
+    if (!fits($size)) {
+        return .error(.tooLarge($size));
+    }
+
+    guard $dst->write(header($size as uint32), $body, $by) else ($e) {
+        return .error(.transport($e));
+    }
+    return .ok;
+}
+
+/**
+ * Queue `$body` as one frame on a reactor's `Outbox`: prefix, then body. `.tooLarge` past `MAX`,
+ * with nothing queued.
+ */
+public function push(tcp::Outbox $out, const string& $body) : status<Error>
+{
+    uint64 $size = $body->size() as uint64;
+    if (!fits($size)) {
+        return .error(.tooLarge($size));
+    }
+
+    $out->push(header($size as uint32), $body);
+    return .ok;
+}

@@ -1,0 +1,76 @@
+/**
+ * Listeners beyond the basics: try accepts for a reactor, a closed listener, and sharing a port.
+ */
+
+test tcp_a_try_accept_takes_only_what_waits
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream? $none = guard $l->tryAccept() else ($e) {
+        die("try accept: {$e}");
+    }
+    assert($none == null, 'nobody connected: null, at once');
+
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream? $got = null;
+    tcp::Deadline $by = ms(5000);
+    // the handshake lands in the backlog a moment after the connect returns, on some systems
+    while ($got == null && !$by->passed()) {
+        tcp::Stream? $next = guard $l->tryAccept() else ($e) {
+            die("try accept: {$e}");
+        }
+        $got = $next;
+    }
+    tcp::Stream $s = guard $got else {
+        die('the waiting connection never came out of a try accept');
+    }
+    assert($s->peer == $c->local, 'the one that connected');
+    assert($s->local == $c->peer, 'on the listener address');
+}
+
+test tcp_a_closed_listener_refuses_every_accept
+{
+    tcp::Listener $l = listenLocal();
+    $l->close();
+    $l->close();
+    expect(failed($l->tryAccept()) == 'closed', 'a try accept');
+    expect(failed($l->accept(ms(100))) == 'closed', 'an accept');
+    expect(failed($l->accept(tcp::Deadline::never())) == 'closed', 'even one that would wait forever');
+}
+
+test tcp_accepted_streams_take_the_listener_options
+{
+    tcp::ListenOptions $opts = tcp::ListenOptions();
+    $opts->backlog = 4;
+    $opts->accepted->noDelay = false;
+    $opts->accepted->keepAlive = std::time::duration::secs(30);
+    $opts->accepted->receiveBuffer = 32768;
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0), $opts) else ($e) {
+        die("listen: {$e}");
+    }
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    send($c, 'tuned');
+    string $got = '';
+    guard tcp::readExactly($s, $got, 5, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'tuned', 'a stream set up with every option still carries bytes');
+}
+
+#[if: os != windows]
+test tcp_reuse_port_lets_listeners_share_a_port
+{
+    // SO_REUSEPORT is POSIX; Windows ignores the option and keeps a port exclusive
+    tcp::ListenOptions $opts = tcp::ListenOptions();
+    $opts->reusePort = true;
+    tcp::Listener $a = guard tcp::Listener::bind(tcp::Address(loopback: 0), $opts) else ($e) {
+        die("listen: {$e}");
+    }
+    tcp::Listener $b = guard tcp::Listener::bind($a->local, $opts) else ($e) {
+        die("a second listener on a shared port: {$e}");
+    }
+    assert($a->local == $b->local, 'one port, two listeners');
+    string $plain = failed(tcp::Listener::bind($a->local));
+    expect($plain == 'addressInUse', "one that does not ask to share is refused: {$plain}");
+}
+#[end]

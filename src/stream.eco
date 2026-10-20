@@ -1,185 +1,660 @@
 /**
- * One TCP connection. Closes on drop. `#[atomic]` so an accept thread can hand it to the thread
- * that serves it. One thread may read while another writes; close it only once neither is in a
- * call.
+ * One TCP connection. `#[atomic]` so an accept thread can hand it to the thread that serves it,
+ * and one thread may read while another writes. `close` is safe from any thread at any time: it
+ * wakes every call blocked on the stream, and the descriptor is released once the last of them
+ * has left.
  */
 
 namespace tcp;
 
 use std::time;
 
-#[atomic]
-public class Stream
+/**
+ * Which side of a stream a `shutdown` closes.
+ */
+public enum Direction
 {
-    private int64 $handle;
+    case read;
+    case write;
+    case both;
+}
 
-    internal constructor(int64 $handle)
+/**
+ * Two ends of one loopback connection, from `Stream::pair`.
+ */
+public struct StreamPair
+{
+    /**
+     * The end that connected.
+     */
+    public Stream $client;
+
+    /**
+     * The end the listener accepted.
+     */
+    public Stream $server;
+}
+
+#[atomic]
+public class Stream : Source, Sink, Pollable
+{
+    public const Address $local;
+    public const Address $peer;
+    private const int64 $fd;
+    private Gate $gate;
+
+    internal constructor(int64 $fd, Address $local, Address $peer)
     {
-        $this->handle = $handle;
+        $this->fd = $fd;
+        $this->local = $local;
+        $this->peer = $peer;
+        $this->gate = Gate();
     }
 
     destructor()
     {
-        $this->close();
+        if (!$this->gate->released()) {
+            tcp_close($this->fd);
+        }
     }
 
     /**
-     * Connect to `$host:$port` (IPv4), waiting at most `$timeoutMs` (-1 forever). A host name is
-     * resolved first, and the lookup is not bounded by the timeout: pass an address where a stall
-     * matters.
+     * Connect to `$to` before the deadline.
      */
-    public static function connect(const string& $host, int32 $port, int32 $timeoutMs = 5000) : result<Stream, Error>
+    public static function connect(const Address& $to, Deadline $by, StreamOptions $options = StreamOptions()) : result<Stream, Error>
     {
-        if ($port <= 0 || $port > 65535) {
-            return .error(.badPort);
+        if ($to->family == Family::unix) {
+            guard unixPath($to) else ($e) {
+                return .error($e);
+            }
+        } else if ($to->port == 0) {
+            return .error(.invalid('a connect needs a port: 1..65535'));
         }
 
-        string $name = cstrOf($host);
-        int64 $h = tcp_connect($name->cstr(), $port, $timeoutMs);
-        if ($h == TCP_TIMEOUT) {
+        tcp_addr $raw = $to->raw();
+        tcp_err $err = tcp_err();
+        int64 $fd = tcp_connect(&$raw, $by->ms(), &$err);
+        if ($fd == TCP_TIMEOUT) {
             return .error(.timeout);
         }
-
-        if ($h < 0) {
-            return .error(.connect(lastError()));
+        if ($fd < 0) {
+            return .error(failure(.connect, $err));
         }
 
-        return .ok(Stream($h));
-    }
-
-    public const function open() : bool
-    {
-        return $this->handle >= 0;
+        return Stream::adopt($fd, $to, $options, .connect);
     }
 
     /**
-     * The local port, or -1 once closed.
+     * Start connecting to `$to` without waiting: register the `Connecting` with a `Poller` for
+     * `.write`, and call `tryFinish` when it reports.
      */
-    public const function port() : int32
+    public static function start(const Address& $to, StreamOptions $options = StreamOptions()) : result<Connecting, Error>
     {
-        if ($this->handle < 0) {
-            return -1;
+        if ($to->family == Family::unix) {
+            guard unixPath($to) else ($e) {
+                return .error($e);
+            }
+        } else if ($to->port == 0) {
+            return .error(.invalid('a connect needs a port: 1..65535'));
         }
 
-        return tcp_port($this->handle);
+        tcp_addr $raw = $to->raw();
+        tcp_err $err = tcp_err();
+        int32 $done = 0;
+        int64 $fd = tcp_connect_start(&$raw, &$done, &$err);
+        if ($fd < 0) {
+            return .error(failure(.connect, $err));
+        }
+        return .ok(Connecting($fd, $to, $options, $done != 0));
     }
 
     /**
-     * Read at most `$n` bytes into `$buf`. At least one byte on success; `.timeout` when nothing
-     * arrived in `$timeoutMs`, `.closed` at the end of the stream.
+     * Resolve `$host` and connect to whichever of its addresses answers first, all before the
+     * one deadline. The lookup is bounded by the deadline too (`tcp::resolve`). The addresses
+     * race Happy Eyeballs style (RFC 8305): the families take turns, a new attempt starts every
+     * `$stagger` (or as soon as the latest fails) while the earlier ones keep going, so one
+     * address that drops packets cannot use up the deadline. A failure is the last attempt's.
      */
-    public function recv(ptr<uint8> $buf, usize $n, int32 $timeoutMs) : result<usize, Error>
+    public static function connect(host: const string& $host, uint16 $port, Deadline $by, StreamOptions $options = StreamOptions(), stagger: time::duration $stagger = time::duration::millis(250)) : result<Stream, Error>
     {
-        if ($this->handle < 0) {
-            return .error(.closed);
+        if ($port == 0) {
+            return .error(.invalid('a connect needs a port: 1..65535'));
         }
 
-        int64 $got = tcp_recv($this->handle, $buf, $n as int64, $timeoutMs);
-        if ($got > 0) {
-            return .ok($got as usize);
-        }
-
-        return .error(codeError($got));
-    }
-
-    /**
-     * Read whatever arrives within `$timeoutMs` onto the end of `$into`, at most `$most` bytes.
-     */
-    public function append(string& $into, usize $most, int32 $timeoutMs) : result<usize, Error>
-    {
-        if ($into->room() < $most) {
-            $into->reserve($into->size() + $most);
-        }
-
-        usize $got = guard $this->recv($into->spare(), $most, $timeoutMs) else ($e) {
+        array<Address> $addrs = guard resolve($host, $port, $by) else ($e) {
             return .error($e);
         }
-        $into->commit($got);
-        return .ok($got);
+        return connectAll($addrs, $by, $options, $stagger);
     }
 
     /**
-     * Send every byte of `$bytes` within `$timeoutMs` in all (-1 forever), so a peer that reads
-     * a byte at a time cannot hold the writer past it. `.timeout` leaves an unknown part sent:
-     * the stream is no use after it.
+     * Two streams connected to each other over loopback, both set up before the deadline: for
+     * tests, and for two parts of one process that talk TCP. The listener in between is closed
+     * before this returns.
      */
-    public function writeAll(const string& $bytes, int32 $timeoutMs) : status<Error>
+    public static function pair(Deadline $by) : result<StreamPair, Error>
     {
-        if ($this->handle < 0) {
-            return .error(.closed);
+        Listener $l = guard Listener::bind(Address(loopback: 0)) else ($e) {
+            return .error($e);
+        }
+        Stream $client = guard Stream::connect($l->local, $by) else ($e) {
+            $l->close();
+            return .error($e);
         }
 
-        time::instant $start = time::instant::now();
-        usize $off = 0;
-        usize $n = $bytes->size();
-        $p = $bytes->data();
-        while ($off < $n) {
-            int32 $left = remainingMs($start, $timeoutMs);
-            if ($left == 0 && $timeoutMs != 0) {
+        while (true) {
+            Stream? $maybe = guard $l->accept($by) else ($e) {
+                $l->close();
+                $client->close();
+                return .error($e);
+            }
+            Stream $server = guard $maybe else {
+                $l->close();
+                $client->close();
                 return .error(.timeout);
             }
-
-            int64 $put = tcp_send($this->handle, $p:$ + $off, ($n - $off) as int64, $left);
-            if ($put < 0) {
-                return .error(codeError($put));
+            // another process may have raced to the port: only the client's own connection pairs
+            if ($server->peer == $client->local) {
+                $l->close();
+                return .ok(StreamPair($client, $server));
             }
+            $server->close();
+        }
+    }
 
-            $off = $off + ($put as usize);
+    /**
+     * A stream around a connected descriptor, its options applied. The local endpoint is read
+     * from the OS unless the caller already knows it (an accept on a listener bound to one
+     * address). `$op` names the call that produced the descriptor, for a failure here.
+     */
+    internal static function adopt(int64 $fd, const Address& $peer, const StreamOptions& $options, Op $op, Address? $local = null) : result<Stream, Error>
+    {
+        Address? $known = $local;
+        if ($known == null) {
+            tcp_addr $raw = tcp_addr();
+            tcp_err $err = tcp_err();
+            if (tcp_local($fd, &$raw, &$err) < 0) {
+                tcp_close($fd);
+                return .error(failure($op, $err));
+            }
+            $known = Address(raw: $raw);
         }
 
+        Address $at = guard $known;
+        Stream $s = Stream($fd, $at, $peer);
+        guard $s->apply($options) else ($e) {
+            $s->close();
+            return .error($e);
+        }
+        return .ok($s);
+    }
+
+    internal function apply(const StreamOptions& $options) : status<Error>
+    {
+        // no-delay and keepalive are TCP's: a unix socket has neither, and skips them
+        bool $tcp = $this->peer->family != Family::unix;
+        // off is how the OS hands a socket over: only on costs a call
+        if ($tcp && $options->noDelay) {
+            guard $this->noDelay(true) else ($e) {
+                return .error($e);
+            }
+        }
+        time::duration? $idle = $options->keepAlive;
+        if ($tcp && $idle != null) {
+            guard $this->keepAlive($idle) else ($e) {
+                return .error($e);
+            }
+        }
+        if ($options->sendBuffer > 0 || $options->receiveBuffer > 0) {
+            guard $this->buffers(send: $options->sendBuffer, receive: $options->receiveBuffer) else ($e) {
+                return .error($e);
+            }
+        }
         return .ok;
     }
 
     /**
-     * Half-close: the peer reads the end of the stream, and this side can still read.
+     * Read at most `$most` bytes onto the end of `$into`: how many arrived, or null when the
+     * deadline passed with nothing (nothing lost; call again). `.eof` once the peer has closed.
      */
-    public function shutdownWrite() : void
+    public function read(string& $into, usize $most, Deadline $by) : result<usize?, Error>
     {
-        if ($this->handle >= 0) {
-            int32 $ignored = tcp_shutdown_write($this->handle);
+        if ($this->gate->has(GATE_READ_SHUT)) {
+            return .error(.closed);
+        }
+        return $this->receive($into, $most, $by);
+    }
+
+    /**
+     * Read whatever is already here without waiting: how many bytes, or null when there is
+     * nothing yet. For a reactor that waits on a `Poller` instead.
+     */
+    public function tryRead(string& $into, usize $most) : result<usize?, Error>
+    {
+        if ($this->gate->has(GATE_READ_SHUT)) {
+            return .error(.closed);
+        }
+        return $this->receive($into, $most, null);
+    }
+
+    /**
+     * Send every byte of `$bytes` before the deadline, so a peer that reads a byte at a time
+     * cannot hold the writer past it. A `.timeout` leaves an unknown part sent and breaks the
+     * write side: every later write is `.broken`.
+     */
+    public function write(const string& $bytes, Deadline $by) : status<Error>
+    {
+        string $none = '';
+        return $this->gather($bytes, $none, $by);
+    }
+
+    /**
+     * Send `$head` then `$body` in one gathered write (one packet when they fit), before the
+     * deadline. Neither is copied.
+     */
+    public function write(const string& $head, const string& $body, Deadline $by) : status<Error>
+    {
+        return $this->gather($head, $body, $by);
+    }
+
+    /**
+     * Send what fits without waiting, from `$from` on in `$bytes`: how many bytes went, or null
+     * when nothing could. A partial send is normal; the reactor keeps the offset.
+     */
+    public function tryWrite(const string& $bytes, usize $from = 0) : result<usize?, Error>
+    {
+        string $none = '';
+        return $this->tryGather($bytes, $none, $from);
+    }
+
+    /**
+     * Send what fits of `$head` then `$body` without waiting, as one gathered write, neither
+     * copied. `$from` counts across both, so a reactor keeps one offset for the pair: how many
+     * bytes went, or null when nothing could.
+     */
+    public function tryWrite(const string& $head, const string& $body, usize $from = 0) : result<usize?, Error>
+    {
+        return $this->tryGather($head, $body, $from);
+    }
+
+    /**
+     * A socket keeps nothing of its own back: there is never anything to flush.
+     */
+    public function tryFlush() : result<bool, Error>
+    {
+        return .ok(true);
+    }
+
+    /**
+     * A plain socket needs exactly what the caller wants.
+     */
+    public const function needs(Interest? $want) : Interest?
+    {
+        return $want;
+    }
+
+    /**
+     * Shut one direction or both. After `.write` the peer reads the end of the stream while
+     * this side can still read. A read after `.read` or `.both` answers `.closed`, and so does a
+     * write after `.write` or `.both`. The read side is this stream's alone: the peer is not
+     * told, and bytes it still sends wait unread (a `close` with them there is a reset). A
+     * direction shut already stays shut: asking again is not an error.
+     */
+    public function shutdown(Direction $which) : status<Error>
+    {
+        if (!$this->gate->enter()) {
+            return .error(.closed);
+        }
+
+        // only what is still open is shut: macOS refuses a second shutdown of one direction
+        // (ENOTCONN), which would read as the peer gone
+        bool $read = $which != Direction::write && !$this->gate->has(GATE_READ_SHUT);
+        bool $write = $which != Direction::read && !$this->gate->has(GATE_WRITE_SHUT);
+        if (!$read && !$write) {
+            bool $gone = $this->leave();
+            if ($gone) {
+                return .error(.closed);
+            }
+            return .ok;
+        }
+
+        // the read side is shut here, not in the OS: after an OS read shutdown, bytes the peer
+        // still sends make macOS and Windows reset the connection, which takes the write side
+        // down with it, and Linux goes on handing them out
+        tcp_err $err = tcp_err();
+        int32 $rc = 0;
+        if ($write) {
+            $rc = tcp_shutdown($this->fd, Direction::write->wire(), &$err);
+        }
+        // only a shutdown that happened makes later calls `.closed`; a failed one leaves them to
+        // find the real state
+        if ($rc == 0 && $write) {
+            $this->gate->mark(GATE_WRITE_SHUT);
+        }
+        if ($rc == 0 && $read) {
+            $this->gate->mark(GATE_READ_SHUT);
+        }
+        bool $closed = $this->leave();
+
+        if ($rc < 0) {
+            return .error(outcome(.shutdown, TCP_ERR, $err, $closed));
+        }
+        return .ok;
+    }
+
+    /**
+     * Close gracefully: shut the write side, then read and drop whatever the peer still sends
+     * until it closes too or the deadline passes, then close. A plain `close` with unread bytes
+     * waiting makes the OS reset the connection, and a reset can destroy the reply the peer has
+     * not read yet; `finish` does not.
+     */
+    public function finish(Deadline $by) : status<Error>
+    {
+        if ($this->gate->has(GATE_CLOSED)) {
+            return .error(.closed);
+        }
+        status<Error> $shut = $this->shutdown(.write);
+        if (!$shut->has_value()) {
+            // the peer is gone already (a reset): nothing is left to drain
+            $this->close();
+            return .ok;
+        }
+
+        // `receive`, not `read`: a read side this stream shut still has to be drained
+        string $drop = '';
+        while (true) {
+            $drop->clear();
+            result<usize?, Error> $got = $this->receive($drop, 65536, $by);
+            if (!$got->has_value()) {
+                // the end of the stream, or a reset: either way the peer is done
+                $this->close();
+                return .ok;
+            }
+            if ($got->unwrap() == null) {
+                $this->close();
+                return .error(.timeout);
+            }
         }
     }
 
+    /**
+     * Close the stream, from any thread. Calls blocked on it wake and answer `.closed`, and so
+     * does every call after. The descriptor is released at once when no call is inside, else
+     * by the last one out.
+     */
     public function close() : void
     {
-        if ($this->handle >= 0) {
-            tcp_close($this->handle);
-            $this->handle = -1;
+        int32 $inside = $this->gate->shut();
+        if ($inside < 0) {
+            return;
         }
-    }
-}
-
-/**
- * What is left of `$timeoutMs` since `$start`: -1 for forever, 0 once it has passed.
- */
-internal function remainingMs(time::instant $start, int32 $timeoutMs) : int32
-{
-    if ($timeoutMs < 0) {
-        return -1;
+        if ($inside > 0) {
+            tcp_cancel($this->fd);
+        }
+        $this->leave();
     }
 
-    int64 $spent = $start->elapsed()->as_millis() as int64;
-    int64 $left = ($timeoutMs as int64) - $spent;
-    if ($left <= 0) {
-        return 0;
+    public const function closed() : bool
+    {
+        return $this->gate->has(GATE_CLOSED);
     }
 
-    return $left as int32;
-}
-
-/**
- * A negative return code as an `Error`. Reads the OS text on this thread, so call it right after
- * the C call that failed.
- */
-internal function codeError(int64 $code) : Error
-{
-    if ($code == TCP_TIMEOUT) {
-        return .timeout;
+    /**
+     * Send small writes at once (TCP_NODELAY). `.invalid` on a unix socket, which has no Nagle
+     * delay to turn off.
+     */
+    public function noDelay(bool $on) : status<Error>
+    {
+        if ($this->peer->family == Family::unix) {
+            return .error(.invalid('no-delay is a TCP option, not for a unix socket'));
+        }
+        int64 $v = 0;
+        if ($on) {
+            $v = 1;
+        }
+        return $this->option(TCP_OPT_NODELAY, $v);
     }
 
-    if ($code == TCP_CLOSED) {
-        return .closed;
+    /**
+     * Probe the connection after `$idle` without traffic; null turns probing off. `.invalid` on a
+     * unix socket, whose peer cannot vanish without the kernel knowing.
+     */
+    public function keepAlive(time::duration? $idle) : status<Error>
+    {
+        if ($this->peer->family == Family::unix) {
+            return .error(.invalid('keepalive is a TCP option, not for a unix socket'));
+        }
+        int64 $secs = 0;
+        if ($idle != null) {
+            time::duration $d = guard $idle;
+            $secs = $d->as_secs() as int64;
+            if ($secs < 1) {
+                $secs = 1;
+            }
+        }
+        return $this->option(TCP_OPT_KEEPALIVE, $secs);
     }
 
-    return .io(lastError());
+    /**
+     * Kernel buffer sizes in bytes; 0 leaves that one as it is.
+     */
+    public function buffers(send: usize $send, receive: usize $receive) : status<Error>
+    {
+        if ($send > 0) {
+            guard $this->option(TCP_OPT_SEND_BUFFER, $send as int64) else ($e) {
+                return .error($e);
+            }
+        }
+        if ($receive > 0) {
+            guard $this->option(TCP_OPT_RECV_BUFFER, $receive as int64) else ($e) {
+                return .error($e);
+            }
+        }
+        return .ok;
+    }
+
+    /**
+     * The OS descriptor, for a `Poller` or another event loop. Valid while the stream is open.
+     */
+    public const function handle() : int64
+    {
+        return $this->fd;
+    }
+
+    /**
+     * Counts a call out of the gate, and releases the descriptor when it was the last one in after
+     * a close. True when the stream was closed by the time the call left.
+     */
+    private function leave() : bool
+    {
+        Exit $exit = $this->gate->leave();
+        if ($exit->last) {
+            tcp_close($this->fd);
+        }
+        return $exit->closed;
+    }
+
+    private function option(int32 $opt, int64 $value) : status<Error>
+    {
+        if (!$this->gate->enter()) {
+            return .error(.closed);
+        }
+
+        tcp_err $err = tcp_err();
+        int32 $rc = tcp_set_option($this->fd, $opt, $value, &$err);
+        bool $closed = $this->leave();
+
+        if ($rc < 0) {
+            return .error(outcome(.option, TCP_ERR, $err, $closed));
+        }
+        return .ok;
+    }
+
+    private function writable() : status<Error>
+    {
+        if ($this->gate->has(GATE_CLOSED | GATE_WRITE_SHUT)) {
+            return .error(.closed);
+        }
+        if ($this->gate->has(GATE_BROKEN)) {
+            return .error(.broken);
+        }
+        return .ok;
+    }
+
+    private function tryGather(const string& $head, const string& $body, usize $from) : result<usize?, Error>
+    {
+        usize? $none = null;
+        guard $this->writable() else ($e) {
+            return .error($e);
+        }
+        usize $headSize = $head->size();
+        usize $total = $headSize + $body->size();
+        if ($from >= $total) {
+            usize $zero = 0;
+            usize? $nothing = $zero;
+            return .ok($nothing);
+        }
+        if (!$this->gate->enter()) {
+            return .error(.closed);
+        }
+
+        $h = $head->data();
+        $b = $body->data();
+        usize $inHead = $this->clip($from, $headSize);
+        usize $inBody = $from - $inHead;
+        tcp_err $err = tcp_err();
+        int64 $put = tcp_try_sendv($this->fd, $h:$ + $inHead, ($headSize - $inHead) as int64, $b:$ + $inBody, ($body->size() - $inBody) as int64, &$err);
+        bool $closed = $this->leave();
+
+        if ($put >= 0) {
+            usize? $n = $put as usize;
+            return .ok($n);
+        }
+        if ($put == TCP_AGAIN && !$closed) {
+            return .ok($none);
+        }
+        return .error(outcome(.write, $put, $err, $closed));
+    }
+
+    private function gather(const string& $head, const string& $body, Deadline $by) : status<Error>
+    {
+        guard $this->writable() else ($e) {
+            return .error($e);
+        }
+        usize $headSize = $head->size();
+        usize $total = $headSize + $body->size();
+        if ($total == 0) {
+            return .ok;
+        }
+        if (!$this->gate->enter()) {
+            return .error(.closed);
+        }
+
+        $h = $head->data();
+        $b = $body->data();
+        usize $off = 0;
+        bool $first = true;
+        tcp_err $err = tcp_err();
+        int64 $put = 0;
+        while ($off < $total) {
+            int32 $ms = $by->ms();
+            // the first send always runs, so a deadline that has passed still sends what fits
+            if ($ms == 0 && !$first) {
+                $put = TCP_TIMEOUT;
+                break;
+            }
+            $first = false;
+
+            usize $inHead = $this->clip($off, $headSize);
+            usize $inBody = $off - $inHead;
+            $put = tcp_sendv($this->fd, $h:$ + $inHead, ($headSize - $inHead) as int64, $b:$ + $inBody, ($body->size() - $inBody) as int64, $ms, &$err);
+            if ($put < 0) {
+                break;
+            }
+            $off = $off + ($put as usize);
+        }
+        bool $closed = $this->leave();
+
+        if ($off == $total) {
+            return .ok;
+        }
+        $this->gate->mark(GATE_BROKEN);
+        return .error(outcome(.write, $put, $err, $closed));
+    }
+
+    /**
+     * Both reads: wait up to `$by` for bytes, or not at all when there is no deadline.
+     */
+    private function receive(string& $into, usize $most, Deadline? $by) : result<usize?, Error>
+    {
+        if ($most == 0) {
+            usize $zero = 0;
+            usize? $nothing = $zero;
+            return .ok($nothing);
+        }
+        if (!$this->gate->enter()) {
+            return .error(.closed);
+        }
+
+        if ($into->room() < $most) {
+            $into->reserve($into->size() + $most);
+        }
+        tcp_err $err = tcp_err();
+        Deadline $until = guard $by else {
+            int64 $now = tcp_try_recv($this->fd, $into->spare(), $most as int64, &$err);
+            bool $shut = $this->leave();
+            return $this->received($into, $now, $err, TCP_AGAIN, $shut);
+        }
+
+        int64 $got = TCP_AGAIN;
+        bool $more = $this->gate->has(GATE_MORE);
+        // the last read filled its request, so bytes are likely waiting: take them without the
+        // poll a blocking read starts with. Most reads come after a request sent, when nothing is
+        // there yet, and for those the poll first is the cheaper order
+        if ($more) {
+            $got = tcp_try_recv($this->fd, $into->spare(), $most as int64, &$err);
+        }
+        if ($got == TCP_AGAIN) {
+            $got = tcp_recv($this->fd, $into->spare(), $most as int64, $until->ms(), &$err);
+        }
+        bool $full = $got == ($most as int64);
+        if ($full != $more) {
+            if ($full) {
+                $this->gate->mark(GATE_MORE);
+            } else {
+                $this->gate->unmark(GATE_MORE);
+            }
+        }
+        bool $closed = $this->leave();
+        return $this->received($into, $got, $err, TCP_TIMEOUT, $closed);
+    }
+
+    /**
+     * A read's outcome: the bytes it put on the end of `$into` (even when a close raced it), null
+     * when `$quiet` (nothing yet) came back on a stream still open, else the failure.
+     */
+    private function received(string& $into, int64 $got, const tcp_err& $err, int64 $quiet, bool $closed) : result<usize?, Error>
+    {
+        if ($got > 0) {
+            $into->commit($got as usize);
+            usize? $n = $got as usize;
+            return .ok($n);
+        }
+        if ($got == $quiet && !$closed) {
+            usize? $none = null;
+            return .ok($none);
+        }
+        return .error(outcome(.read, $got, $err, $closed));
+    }
+
+    /**
+     * How much of an offset across a head and body falls in the head.
+     */
+    private const function clip(usize $off, usize $headSize) : usize
+    {
+        if ($off < $headSize) {
+            return $off;
+        }
+        return $headSize;
+    }
 }

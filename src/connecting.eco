@@ -1,0 +1,237 @@
+/**
+ * A connect that does not wait, for a reactor or a game's frame loop: `Stream::start` begins it,
+ * a `Poller` reports the handle writable when it is over, and `tryFinish` turns it into the
+ * `Stream`, or says why it failed.
+ */
+
+namespace tcp;
+
+use std::time;
+
+public class Connecting : Pollable
+{
+    /**
+     * Where it connects to.
+     */
+    public const Address $to;
+    // the socket while this owns it; -1 once handed to the stream or closed
+    private int64 $fd;
+    private const StreamOptions $options;
+    // the connect finished in the call that started it (loopback, a unix socket)
+    private bool $done;
+
+    internal constructor(int64 $fd, Address $to, StreamOptions $options, bool $done)
+    {
+        $this->fd = $fd;
+        $this->to = $to;
+        $this->options = $options;
+        $this->done = $done;
+    }
+
+    destructor()
+    {
+        if ($this->fd >= 0) {
+            tcp_close($this->fd);
+        }
+    }
+
+    /**
+     * The stream once the connect is over, or null while it is still in progress: call it when
+     * the poller reports the handle writable. A failure (`.refused`, `.unreachable`, ...) leaves
+     * the handle here for `close`, after the poller has let go of it. On success the handle
+     * belongs to the stream, and a registration with a poller carries over: `modify` it with the
+     * stream from here on.
+     */
+    public function tryFinish() : result<Stream?, Error>
+    {
+        Stream? $none = null;
+        if ($this->fd < 0) {
+            return .error(.closed);
+        }
+        if (!$this->done) {
+            tcp_err $err = tcp_err();
+            int32 $rc = tcp_connect_finish($this->fd, &$err);
+            if (($rc as int64) == TCP_AGAIN) {
+                return .ok($none);
+            }
+            if ($rc < 0) {
+                return .error(failure(.connect, $err));
+            }
+            $this->done = true;
+        }
+
+        int64 $fd = $this->fd;
+        $this->fd = -1;
+        Stream $s = guard Stream::adopt($fd, $this->to, $this->options, .connect) else ($e) {
+            return .error($e);
+        }
+        Stream? $made = $s;
+        return .ok($made);
+    }
+
+    /**
+     * Give up on the connect. Remove it from a poller first.
+     */
+    public function close() : void
+    {
+        if ($this->fd >= 0) {
+            tcp_close($this->fd);
+            $this->fd = -1;
+        }
+    }
+
+    /**
+     * True once closed, or once `tryFinish` handed the handle to the stream.
+     */
+    public const function closed() : bool
+    {
+        return $this->fd < 0;
+    }
+
+    /**
+     * The OS handle, for a `Poller`: register it for `.write`.
+     */
+    public const function handle() : int64
+    {
+        return $this->fd;
+    }
+
+    public const function needs(Interest? $want) : Interest?
+    {
+        return $want;
+    }
+}
+
+/**
+ * Connect to whichever of `$addrs` answers first, all before the deadline: Happy Eyeballs (RFC
+ * 8305). The families take turns, starting with the one the system put first, so a host whose
+ * IPv6 silently drops packets still connects over IPv4. One attempt starts every `$stagger`, or
+ * at once when the latest one fails, and the earlier ones keep racing. The first to connect wins
+ * and the others are closed. When every one fails, the failure is the last one's.
+ */
+internal function connectAll(const array<Address>& $addrs, Deadline $by, StreamOptions $options, time::duration $stagger) : result<Stream, Error>
+{
+    if ($addrs->count() == 1) {
+        return Stream::connect($addrs[0], $by, $options);
+    }
+
+    array<Address> $order = interleave($addrs);
+    Poller $poller = guard Poller::open() else ($e) {
+        return .error($e);
+    }
+    // an attempt's token is its index here
+    array<Connecting> $racing = array<Connecting>();
+    array<Event> $events = array<Event>();
+    usize $alive = 0;
+    usize $next = 0;
+    Error $last = .timeout;
+    time::instant $nextStart = time::instant::now();
+
+    while (true) {
+        // the next attempt starts on its turn, or at once when nothing else is racing
+        if ($next < $order->count() && ($alive == 0 || time::instant::now() >= $nextStart)) {
+            Address $to = $order[$next];
+            $next = $next + 1;
+            $nextStart = time::instant::now() + $stagger;
+            Connecting $c = guard Stream::start($to, $options) else ($e) {
+                $last = $e;
+                continue;
+            }
+            uint64 $token = $racing->count() as uint64;
+            $racing[] = $c;
+            status<Error> $added = $poller->add($c, $token, .write, .oneshot);
+            if (!$added->has_value()) {
+                $last = $added->failure();
+                $c->close();
+                continue;
+            }
+            $alive = $alive + 1;
+            continue;
+        }
+        if ($alive == 0) {
+            return .error($last);
+        }
+        if ($by->passed()) {
+            abandon($poller, $racing);
+            return .error(.timeout);
+        }
+
+        Deadline $until = $by;
+        if ($next < $order->count()) {
+            $until = $by->earlier(Deadline(at: $nextStart));
+        }
+        status<Error> $waited = $poller->wait($events, $until);
+        if (!$waited->has_value()) {
+            abandon($poller, $racing);
+            return .error($waited->failure());
+        }
+
+        foreach ($events as $ev) {
+            Connecting $c = $racing[$ev->token as usize];
+            if ($c->closed()) {
+                continue;
+            }
+            result<Stream?, Error> $outcome = $c->tryFinish();
+            if (!$outcome->has_value()) {
+                $last = $outcome->failure();
+                status<Error> $removed = $poller->remove($c);
+                $c->close();
+                $alive = $alive - 1;
+                // a failure starts the next attempt now, not on its turn
+                $nextStart = time::instant::now();
+                continue;
+            }
+            Stream? $won = $outcome->unwrap();
+            if ($won == null) {
+                status<Error> $rearmed = $poller->modify($c, $ev->token, .write, .oneshot);
+                continue;
+            }
+            Stream $s = guard $won;
+            status<Error> $left = $poller->remove($s);
+            abandon($poller, $racing);
+            return .ok($s);
+        }
+    }
+}
+
+/**
+ * Close every attempt still racing, each out of the poller first.
+ */
+internal function abandon(Poller $poller, array<Connecting>& $racing) : void
+{
+    foreach ($racing as $c) {
+        if (!$c->closed()) {
+            status<Error> $removed = $poller->remove($c);
+            $c->close();
+        }
+    }
+}
+
+/**
+ * `$addrs` with the families taking turns, starting with the family of the first.
+ */
+internal function interleave(const array<Address>& $addrs) : array<Address>
+{
+    Family $first = $addrs[0]->family;
+    array<Address> $mine = array<Address>();
+    array<Address> $other = array<Address>();
+    foreach ($addrs as $a) {
+        if ($a->family == $first) {
+            $mine[] = $a;
+        } else {
+            $other[] = $a;
+        }
+    }
+    array<Address> $out = arr::room<Address>($addrs->count());
+    usize $i = 0;
+    while ($i < $mine->count() || $i < $other->count()) {
+        if ($i < $mine->count()) {
+            $out[] = $mine[$i];
+        }
+        if ($i < $other->count()) {
+            $out[] = $other[$i];
+        }
+        $i = $i + 1;
+    }
+    return $out;
+}

@@ -1,0 +1,233 @@
+/**
+ * A frame echo server that serves every connection from one thread. The listener and each stream
+ * sit in one `Poller`; when it reports something ready, the loop pulls whole frames off the
+ * stream with `frame::Reader::pull` (which never waits), queues each echo on the connection's
+ * `Outbox`, and flushes what the socket takes. Whatever does not fit waits for the stream to
+ * report writable.
+ *
+ * It runs for `SECONDS`, then the main thread stops it with `Poller::wake`, which is how any other
+ * thread asks a reactor to wind down. Meanwhile a few client threads talk to it.
+ */
+
+use std::thread;
+use std::time;
+
+internal const uint64 LISTENER = 0;
+internal const int64 SECONDS = 2;
+
+/**
+ * One connection the reactor holds: its stream, its frames so far, the echoes not sent yet, what
+ * the poller watches it for, and whether the peer is still sending.
+ */
+internal class Conn
+{
+    public tcp::Stream $stream;
+    public tcp::frame::Reader $reader;
+    public tcp::Outbox $out;
+    public tcp::Interest $watching;
+    public bool $reading;
+
+    public constructor(tcp::Stream $stream)
+    {
+        $this->stream = $stream;
+        $this->reader = tcp::frame::Reader(max: 65536, idle: time::duration::secs(30));
+        $this->out = tcp::Outbox();
+        $this->watching = .read;
+        $this->reading = true;
+    }
+}
+
+/**
+ * Take what `$c` has: echo every whole frame, send what fits, and watch for what is left. False
+ * when the connection is over: closed, broken, not frames, idle past its limit, or the peer
+ * finished and every echo went out.
+ */
+internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echoed) : bool
+{
+    while ($c->reading) {
+        result<string?, tcp::frame::Error> $frame = $c->reader->pull($c->stream);
+        if (!$frame->has_value()) {
+            // the peer finished sending: the echoes for what it sent still go out. Anything
+            // else (a reset, not frames, idle) ends the connection here
+            bool $finished = match ($frame->failure()) {
+                tcp::frame::Error::end => true,
+                else => false,
+            };
+            if (!$finished) {
+                return false;
+            }
+            $c->reading = false;
+            break;
+        }
+        string? $whole = $frame->unwrap();
+        string $body = guard $whole else {
+            break;
+        }
+        // the reader's max keeps every body inside what a prefix can announce
+        guard tcp::frame::push($c->out, $body) else ($e) {
+            return false;
+        }
+        $echoed = $echoed + 1;
+    }
+    guard $c->out->flush($c->stream) else ($e) {
+        return false;
+    }
+
+    // a level registration stays armed as it is: only tell the poller when the interest changes
+    tcp::Interest $want = guard $c->out->interest($c->stream, reading: $c->reading) else {
+        return false;
+    }
+    if ($want != $c->watching) {
+        guard $poller->modify($c->stream, $token, $want) else ($e) {
+            std::io::eprintln("rearm {$c->stream->peer}: {$e}");
+            return false;
+        }
+        $c->watching = $want;
+    }
+    return true;
+}
+
+/**
+ * Serve until another thread calls `$poller->wake()`. Returns how many frames were echoed.
+ */
+internal function serve(tcp::Listener $listener, tcp::Poller $poller) : int64
+{
+    guard $poller->add($listener, LISTENER, .read) else ($e) {
+        die("watch listener: {$e}");
+    }
+
+    map<uint64, Conn> $conns = map<uint64, Conn>();
+    uint64 $next = 1;
+    int64 $echoed = 0;
+    array<tcp::Event> $events = array<tcp::Event>();
+    array<uint64> $over = array<uint64>();
+    while (true) {
+        // the wait ends by the time the first connection goes idle. One that has (no event since
+        // its last frame) gets a last pump, and `pull` gives up on it only once its socket is
+        // empty, so a frame already there still counts. A connection the peer finished is only
+        // owed writes, which its own events drive. A scan per wait is fine for an example; a
+        // server with many connections keeps a timer wheel or a heap
+        tcp::Deadline $until = tcp::Deadline::never();
+        foreach ($conns as $token => $c) {
+            if (!$c->reading) {
+                continue;
+            }
+            if ($c->reader->idleAt()->passed() && !pump($poller, $c, $token, $echoed)) {
+                $over[] = $token;
+                continue;
+            }
+            $until = $until->earlier($c->reader->idleAt());
+        }
+
+        if ($over->empty()) {
+            guard $poller->wait($events, $until) else ($e) {
+                die("wait: {$e}");
+            }
+        } else {
+            $events->clear();
+        }
+        foreach ($events as $ev) {
+            if ($ev->woken()) {
+                return $echoed;
+            }
+
+            if ($ev->token == LISTENER) {
+                // a level-triggered listener stays ready while connections wait: take them all
+                while (true) {
+                    result<tcp::Stream?, tcp::Error> $taken = $listener->tryAccept();
+                    if (!$taken->has_value()) {
+                        // out of descriptors, most likely; the next wait tries again
+                        std::io::eprintln("accept: {$taken->failure()}");
+                        break;
+                    }
+                    tcp::Stream? $waiting = $taken->unwrap();
+                    tcp::Stream $s = guard $waiting else {
+                        break;
+                    }
+                    guard $poller->add($s, $next, .read) else ($e) {
+                        std::io::eprintln("watch {$s->peer}: {$e}");
+                        continue;
+                    }
+                    $conns[$next] = Conn($s);
+                    $next = $next + 1;
+                }
+                continue;
+            }
+
+            if (!$conns->has($ev->token)) {
+                continue;
+            }
+            if (!pump($poller, $conns->get($ev->token), $ev->token, $echoed)) {
+                $over[] = $ev->token;
+            }
+        }
+
+        foreach ($over as $token) {
+            Conn $gone = $conns->get($token);
+            status<tcp::Error> $removed = $poller->remove($gone->stream);
+            $gone->stream->close();
+            $conns->remove($token);
+        }
+        $over->clear();
+    }
+}
+
+tcp::Listener $listener = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+    die("bind: {$e}");
+}
+tcp::Poller $poller = guard tcp::Poller::open() else ($e) {
+    die("poller: {$e}");
+}
+echo "serving frames on {$listener->local}";
+uint16 $port = $listener->local->port;
+
+thread::task<int64> $server = guard thread::spawn(function() : int64 {
+    return serve($listener, $poller);
+}) else ($e) {
+    die('spawn the reactor');
+}
+
+// a few clients ping until the server stops
+array<thread::handle> $clients = array<thread::handle>();
+int32 $i = 0;
+while ($i < 4) {
+    int32 $id = $i;
+    thread::handle $client = guard thread::spawn(function() : void {
+        tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), time::duration::secs(2)) else ($e) {
+            std::io::eprintln("client {$id}: {$e}");
+            return;
+        }
+        tcp::frame::Reader $r = tcp::frame::Reader(max: 65536);
+        int32 $k = 0;
+        while ($k < 100) {
+            guard tcp::frame::write($c, "client {$id} says {$k}", time::duration::secs(1)) else ($e) {
+                return;
+            }
+            result<string?, tcp::frame::Error> $back = $r->read($c, time::duration::secs(1));
+            if (!$back->has_value()) {
+                return;
+            }
+            $k = $k + 1;
+        }
+        // a last frame with the end of the stream right behind it: its echo still comes back
+        guard tcp::frame::write($c, "client {$id} is done", time::duration::secs(1)) else ($e) {
+            return;
+        }
+        guard $c->shutdown(.write) else ($e) {
+            return;
+        }
+        result<string?, tcp::frame::Error> $last = $r->read($c, time::duration::secs(1));
+        if (!$last->has_value() || $last->unwrap() == null) {
+            std::io::eprintln("client {$id}: no echo for the last frame");
+        }
+    }) else ($e) {
+        die('spawn a client');
+    }
+    $clients[] = $client;
+    $i = $i + 1;
+}
+
+thread::sleep((SECONDS * 1000) as usize);
+$poller->wake();
+int64 $echoed = $server->wait();
+echo "echoed {$echoed} frames";

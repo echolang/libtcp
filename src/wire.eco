@@ -1,0 +1,111 @@
+/**
+ * Fixed-width integers as wire protocols lay them out: big-endian (network order: frames,
+ * Postgres) and little-endian (MySQL, most game protocols), read at an offset of a string and
+ * appended onto one. A read expects the bytes to be there; check `size()` (or a reader's
+ * `buffered()`) first.
+ */
+
+namespace tcp::wire;
+
+public function be16(const string& $b, usize $at = 0) : uint16
+{
+    uint16 $hi = $b->byte($at) as uint16;
+    uint16 $lo = $b->byte($at + 1) as uint16;
+    return ($hi << 8) | $lo;
+}
+
+public function be32(const string& $b, usize $at = 0) : uint32
+{
+    uint32 $b0 = $b->byte($at) as uint32;
+    uint32 $b1 = $b->byte($at + 1) as uint32;
+    uint32 $b2 = $b->byte($at + 2) as uint32;
+    uint32 $b3 = $b->byte($at + 3) as uint32;
+    return ($b0 << 24) | ($b1 << 16) | ($b2 << 8) | $b3;
+}
+
+public function be64(const string& $b, usize $at = 0) : uint64
+{
+    uint64 $hi = be32($b, $at) as uint64;
+    uint64 $lo = be32($b, $at + 4) as uint64;
+    return ($hi << 32) | $lo;
+}
+
+public function le16(const string& $b, usize $at = 0) : uint16
+{
+    uint16 $lo = $b->byte($at) as uint16;
+    uint16 $hi = $b->byte($at + 1) as uint16;
+    return ($hi << 8) | $lo;
+}
+
+/**
+ * Three bytes, low first: MySQL's packet length.
+ */
+public function le24(const string& $b, usize $at = 0) : uint32
+{
+    uint32 $b0 = $b->byte($at) as uint32;
+    uint32 $b1 = $b->byte($at + 1) as uint32;
+    uint32 $b2 = $b->byte($at + 2) as uint32;
+    return ($b2 << 16) | ($b1 << 8) | $b0;
+}
+
+public function le32(const string& $b, usize $at = 0) : uint32
+{
+    uint32 $low = le24($b, $at);
+    uint32 $b3 = $b->byte($at + 3) as uint32;
+    return ($b3 << 24) | $low;
+}
+
+public function le64(const string& $b, usize $at = 0) : uint64
+{
+    uint64 $lo = le32($b, $at) as uint64;
+    uint64 $hi = le32($b, $at + 4) as uint64;
+    return ($hi << 32) | $lo;
+}
+
+public function putBe16(string& $into, uint16 $v) : void
+{
+    $into->push(($v >> 8) as uint8);
+    $into->push(($v & 0xFF) as uint8);
+}
+
+public function putBe32(string& $into, uint32 $v) : void
+{
+    $into->push(($v >> 24) as uint8);
+    $into->push((($v >> 16) & 0xFF) as uint8);
+    $into->push((($v >> 8) & 0xFF) as uint8);
+    $into->push(($v & 0xFF) as uint8);
+}
+
+public function putBe64(string& $into, uint64 $v) : void
+{
+    putBe32($into, ($v >> 32) as uint32);
+    putBe32($into, ($v & 0xFFFFFFFF) as uint32);
+}
+
+public function putLe16(string& $into, uint16 $v) : void
+{
+    $into->push(($v & 0xFF) as uint8);
+    $into->push(($v >> 8) as uint8);
+}
+
+/**
+ * The low three bytes of `$v`, low first. Bits above 24 are dropped: check the size first.
+ */
+public function putLe24(string& $into, uint32 $v) : void
+{
+    $into->push(($v & 0xFF) as uint8);
+    $into->push((($v >> 8) & 0xFF) as uint8);
+    $into->push((($v >> 16) & 0xFF) as uint8);
+}
+
+public function putLe32(string& $into, uint32 $v) : void
+{
+    putLe24($into, $v);
+    $into->push(($v >> 24) as uint8);
+}
+
+public function putLe64(string& $into, uint64 $v) : void
+{
+    putLe32($into, ($v & 0xFFFFFFFF) as uint32);
+    putLe32($into, ($v >> 32) as uint32);
+}

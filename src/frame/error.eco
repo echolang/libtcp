@@ -1,0 +1,98 @@
+/**
+ * Why a frame could not be read or written.
+ */
+
+namespace tcp::frame;
+
+public enum Error
+{
+    /**
+     * The peer closed between frames: the clean end of a conversation. Not `tcp::Error::closed`,
+     * which is this side closing.
+     */
+    case end;
+
+    /**
+     * The peer closed partway through a frame.
+     */
+    case truncated;
+
+    /**
+     * A body over the limit: a prefix over the reader's cap (text that is not a frame lands
+     * here, `GET ` reads as over a gigabyte), or a body to write over `MAX`.
+     */
+    case tooLarge(uint64 $size);
+
+    /**
+     * No whole frame arrived within the reader's idle limit. Bytes trickling in do not count,
+     * so a peer that sends one byte a minute is still idle.
+     */
+    case idle;
+
+    /**
+     * The connection under the frames failed; the cause is kept whole.
+     */
+    case transport(tcp::Error $cause);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::end => 'the peer ended the conversation',
+            Error::truncated => 'connection closed in the middle of a frame',
+            Error::tooLarge($size) => "a frame of {$size} bytes is over the limit",
+            Error::idle => 'no frame arrived within the idle limit',
+            Error::transport($cause) => $cause->message(),
+        };
+    }
+
+    /**
+     * The case's name, `end` or `idle` and so on; a transport error is `transport:` and the
+     * cause's name, `transport:reset`.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::end => 'end',
+            Error::truncated => 'truncated',
+            Error::tooLarge($size) => 'tooLarge',
+            Error::idle => 'idle',
+            Error::transport($cause) => "transport:{$cause->name()}",
+        };
+    }
+
+    /**
+     * True when the peer is gone: it ended the conversation, closed partway through a frame, or
+     * the connection under the frames found it gone.
+     */
+    public const function gone() : bool
+    {
+        return match ($this) {
+            Error::end => true,
+            Error::truncated => true,
+            Error::transport($cause) => $cause->gone(),
+            else => false,
+        };
+    }
+
+    /**
+     * The connection's error behind a `transport`, or null for any other case.
+     */
+    public const function cause() : tcp::Error?
+    {
+        tcp::Error? $none = null;
+        // two matches, never a payload into a nullable inside one: echoc 0.8 miscompiles that
+        bool $has = match ($this) {
+            Error::transport($c) => true,
+            else => false,
+        };
+        if (!$has) {
+            return $none;
+        }
+        tcp::Error $cause = match ($this) {
+            Error::transport($c) => $c,
+            else => tcp::Error::closed,
+        };
+        tcp::Error? $found = $cause;
+        return $found;
+    }
+}

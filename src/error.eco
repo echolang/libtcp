@@ -1,90 +1,322 @@
 /**
- * Why a socket call did not do what was asked. `timeout` and `closed` are states a caller loops
- * on or ends with; the others carry the OS sentence.
+ * Why a socket call did not do what was asked. The cases are what a caller branches on: the
+ * peer went away (`eof`, `reset`), nobody answered (`refused`, `unreachable`), the process ran
+ * out of descriptors (`tooManyFiles`), and so on. Everything else carries the OS sentence in
+ * `os`.
+ *
+ * "Nothing yet" is never an error. A read or an accept that ran out of time hands back null, and
+ * so does a try call that would have had to wait.
  */
 
 namespace tcp;
 
-public enum Error
+/**
+ * The call a system error came from.
+ */
+public enum Op
 {
-    case bind(string $message);
-    case connect(string $message);
-    case accept(string $message);
-    case io(string $message);
+    case resolve;
+    case bind;
+    case accept;
+    case connect;
+    case read;
+    case write;
+    case shutdown;
+    case option;
+    case poll;
+    case wake;
 
-    /**
-     * The peer closed the connection, or it was reset.
-     */
-    case closed;
-
-    /**
-     * The timeout passed with no progress. Nothing was lost: call again.
-     */
-    case timeout;
-    case badPort;
-
-    /**
-     * Listening needs a host: `0.0.0.0` for every interface, so a bind never widens by accident.
-     */
-    case badHost;
-
-    /**
-     * A frame body over `FRAME_MAX` bytes: its length does not fit the prefix.
-     */
-    case tooLarge(uint64 $size);
-
-    public const function message() : string
+    public const function name() : string
     {
         return match ($this) {
-            Error::bind($m) => "bind: {$m}",
-            Error::connect($m) => "connect: {$m}",
-            Error::accept($m) => "accept: {$m}",
-            Error::io($m) => $m,
-            Error::closed => 'connection closed',
-            Error::timeout => 'timed out',
-            Error::badPort => 'port must be 0..65535',
-            Error::badHost => 'a listener needs a host: 0.0.0.0 for every interface',
-            Error::tooLarge($size) => "a frame body of {$size} bytes does not fit the 4-byte length",
+            Op::resolve => 'resolve',
+            Op::bind => 'bind',
+            Op::accept => 'accept',
+            Op::connect => 'connect',
+            Op::read => 'read',
+            Op::write => 'write',
+            Op::shutdown => 'shutdown',
+            Op::option => 'option',
+            Op::poll => 'poll',
+            Op::wake => 'wake',
         };
     }
 }
 
 /**
- * Why a frame could not be read.
+ * One failed system call: which, the OS code (errno, or a WSA code on Windows), and the OS
+ * sentence for it.
  */
-public enum FrameError
+public struct SysError
+{
+    public const Op $op;
+    public const int32 $code;
+    public const string $message;
+}
+
+public enum Error
 {
     /**
-     * The peer closed between frames: the clean end of a conversation.
+     * The peer closed its side cleanly, and more was wanted. A read of a connection's last byte
+     * is not this; the read after it is.
+     */
+    case eof;
+
+    /**
+     * A connect or a write ran out of time. A write that times out leaves an unknown part sent,
+     * so the stream's write side is broken after it.
+     */
+    case timeout;
+
+    /**
+     * This side closed the handle, or shut the direction down, before or during the call.
      */
     case closed;
 
     /**
-     * The peer closed partway through a frame.
+     * An earlier write failed partway, so whatever this write sends would follow a gap.
      */
-    case truncated;
+    case broken;
 
     /**
-     * The length prefix is over the reader's cap. Text that is not a frame (an HTTP request
-     * line) lands here: `GET ` reads as over a gigabyte.
+     * Nothing listens at the address.
+     */
+    case refused(SysError $sys);
+
+    /**
+     * The peer reset the connection, or it died another way (a broken pipe, a dead keepalive).
+     */
+    case reset(SysError $sys);
+
+    /**
+     * No route to the host or its network.
+     */
+    case unreachable(SysError $sys);
+
+    /**
+     * The address is already taken, by another listener or by connections a closed one left.
+     */
+    case addressInUse(SysError $sys);
+
+    /**
+     * The process or the system is out of descriptors. An accept loop backs off and retries.
+     */
+    case tooManyFiles(SysError $sys);
+
+    /**
+     * The host name did not resolve. The message is the resolver's own.
+     */
+    case resolve(string $host, string $message);
+
+    /**
+     * Arguments no call could accept: a port out of range, an empty host, an address that does
+     * not parse.
+     */
+    case invalid(string $why);
+
+    /**
+     * Any other failure, with the OS sentence.
+     */
+    case os(SysError $sys);
+
+    /**
+     * A message over a reader's `max`: a length that announces more, or that many bytes without
+     * the delimiter. Refused before it is buffered, so a peer cannot make a reader grow without
+     * end.
      */
     case tooLarge(uint64 $size);
-
-    /**
-     * No whole frame arrived within the reader's idle limit. Bytes trickling in do not count,
-     * so a peer that sends one byte a minute is still idle.
-     */
-    case idle;
-    case io(string $message);
 
     public const function message() : string
     {
         return match ($this) {
-            FrameError::closed => 'connection closed',
-            FrameError::idle => 'no frame arrived within the idle limit',
-            FrameError::truncated => 'connection closed in the middle of a frame',
-            FrameError::tooLarge($size) => "frame of {$size} bytes is over the limit",
-            FrameError::io($m) => $m,
+            Error::eof => 'the peer closed the connection',
+            Error::timeout => 'timed out',
+            Error::closed => 'closed',
+            Error::broken => 'an earlier write failed partway, so the stream cannot be written',
+            Error::refused($s) => sysText($s),
+            Error::reset($s) => sysText($s),
+            Error::unreachable($s) => sysText($s),
+            Error::addressInUse($s) => sysText($s),
+            Error::tooManyFiles($s) => sysText($s),
+            Error::resolve($host, $m) => "resolve {$host}: {$m}",
+            Error::invalid($why) => $why,
+            Error::os($s) => sysText($s),
+            Error::tooLarge($size) => "a message of {$size} bytes is over the reader's limit",
         };
     }
+
+    /**
+     * The case's name, `eof` or `reset` and so on: what a log line or a test compares, without a
+     * match.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::eof => 'eof',
+            Error::timeout => 'timeout',
+            Error::closed => 'closed',
+            Error::broken => 'broken',
+            Error::refused($s) => 'refused',
+            Error::reset($s) => 'reset',
+            Error::unreachable($s) => 'unreachable',
+            Error::addressInUse($s) => 'addressInUse',
+            Error::tooManyFiles($s) => 'tooManyFiles',
+            Error::resolve($host, $m) => 'resolve',
+            Error::invalid($why) => 'invalid',
+            Error::os($s) => 'os',
+            Error::tooLarge($size) => 'tooLarge',
+        };
+    }
+
+    /**
+     * True when the peer is gone: it closed (`eof`) or the connection was reset. Nothing more
+     * will come from it, and nothing sent will reach it.
+     */
+    public const function gone() : bool
+    {
+        return match ($this) {
+            Error::eof => true,
+            Error::reset($s) => true,
+            else => false,
+        };
+    }
+
+    /**
+     * The failed system call behind the error, or null for a case that carries none.
+     */
+    public const function sys() : SysError?
+    {
+        SysError? $none = null;
+        // two matches, never a payload into a nullable inside one: echoc 0.8 miscompiles that
+        bool $has = match ($this) {
+            Error::refused($s) => true,
+            Error::reset($s) => true,
+            Error::unreachable($s) => true,
+            Error::addressInUse($s) => true,
+            Error::tooManyFiles($s) => true,
+            Error::os($s) => true,
+            else => false,
+        };
+        if (!$has) {
+            return $none;
+        }
+        SysError $sys = match ($this) {
+            Error::refused($s) => $s,
+            Error::reset($s) => $s,
+            Error::unreachable($s) => $s,
+            Error::addressInUse($s) => $s,
+            Error::tooManyFiles($s) => $s,
+            Error::os($s) => $s,
+            else => SysError(.read, 0, ''),
+        };
+        SysError? $found = $sys;
+        return $found;
+    }
+}
+
+internal function sysText(const SysError& $s) : string
+{
+    return "{$s->op->name()}: {$s->message}";
+}
+
+/**
+ * The portable kinds c/tcp.h sorts a failure into.
+ */
+internal enum Kind
+{
+    case other;
+    case refused;
+    case reset;
+    case unreachable;
+    case addrInUse;
+    case addrNotAvailable;
+    case noFiles;
+    case resolve;
+    case invalid;
+    case denied;
+    case timedOut;
+    case shutdown;
+
+    map code : int32
+    {
+        .other = 0;
+        .refused = 1;
+        .reset = 2;
+        .unreachable = 3;
+        .addrInUse = 4;
+        .addrNotAvailable = 5;
+        .noFiles = 6;
+        .resolve = 7;
+        .invalid = 8;
+        .denied = 9;
+        .timedOut = 10;
+        .shutdown = 11;
+    }
+}
+
+/**
+ * The OS text for one failure.
+ */
+internal function errorText(const tcp_err& $err) : string
+{
+    string $text = '';
+    $text->reserve(512);
+    int32 $n = tcp_error_text($err->kind, $err->code, $text->spare(), 512);
+    if ($n <= 0) {
+        return "error {$err->code}";
+    }
+
+    $text->commit($n as usize);
+    return $text;
+}
+
+/**
+ * A failure the backend reported for `$op`, as the case a caller branches on.
+ */
+internal function failure(Op $op, const tcp_err& $err) : Error
+{
+    Kind $kind = Kind::from(code: $err->kind) ?? .other;
+    if ($kind == Kind::shutdown) {
+        return .closed;
+    }
+
+    SysError $sys = SysError($op, $err->code, errorText($err));
+    return match ($kind) {
+        Kind::refused => .refused($sys),
+        Kind::reset => .reset($sys),
+        Kind::unreachable => .unreachable($sys),
+        Kind::addrInUse => .addressInUse($sys),
+        Kind::noFiles => .tooManyFiles($sys),
+        Kind::invalid => .invalid(sysText($sys)),
+        // an OS timeout on a live connection (keepalive, retransmits) means the peer is gone
+        Kind::timedOut => timedOut($op, $sys),
+        else => .os($sys),
+    };
+}
+
+/**
+ * A failed call's code as an `Error`. A call that ran into a close (`Gate::leave` says so) is
+ * `.closed`, whatever it returned: c/tcp.h leaves a cancelled call's result to the backend.
+ */
+internal function outcome(Op $op, int64 $code, const tcp_err& $err, bool $closed) : Error
+{
+    if ($closed) {
+        return .closed;
+    }
+    if ($code == TCP_EOF) {
+        return .eof;
+    }
+    if ($code == TCP_TIMEOUT) {
+        return .timeout;
+    }
+    return failure($op, $err);
+}
+
+internal function timedOut(Op $op, SysError $sys) : Error
+{
+    if ($op == Op::connect) {
+        return .timeout;
+    }
+
+    return .reset($sys);
 }

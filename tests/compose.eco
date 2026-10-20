@@ -1,0 +1,86 @@
+/**
+ * The reads composed from `Source::read` (`readExactly`, `readAll`), and `Stream::pair`.
+ */
+
+test tcp_a_pair_is_connected_both_ways
+{
+    tcp::StreamPair $pair = connectedPair();
+    assert($pair->client->local == $pair->server->peer, 'the two ends of one connection');
+    assert($pair->server->local == $pair->client->peer, 'seen from both sides');
+    send($pair->client, 'ping');
+    send($pair->server, 'pong');
+    string $atServer = '';
+    string $atClient = '';
+    guard tcp::readExactly($pair->server, $atServer, 4, ms(5000)) else ($e) {
+        die("server read: {$e}");
+    }
+    guard tcp::readExactly($pair->client, $atClient, 4, ms(5000)) else ($e) {
+        die("client read: {$e}");
+    }
+    assert($atServer == 'ping', 'client to server');
+    assert($atClient == 'pong', 'server to client');
+}
+
+test tcp_read_exactly_waits_for_every_byte
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, '01234');
+    send($pair->client, '56789');
+    send($pair->client, 'rest');
+    string $got = '>';
+    guard tcp::readExactly($pair->server, $got, 10, ms(5000)) else ($e) {
+        die("read exactly: {$e}");
+    }
+    expect($got == '>0123456789', "appends exactly ten bytes: {$got}");
+    string $after = '';
+    guard tcp::readExactly($pair->server, $after, 4, ms(5000)) else ($e) {
+        die("read the rest: {$e}");
+    }
+    assert($after == 'rest', 'and leaves what follows for the next read');
+}
+
+test tcp_read_exactly_keeps_what_came_before_the_end
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'abc');
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    string $got = '';
+    string $why = failedStatus(tcp::readExactly($pair->server, $got, 10, ms(5000)));
+    expect($why == 'eof', "a peer that closes early is eof: {$why}");
+    assert($got == 'abc', 'with what it sent kept');
+}
+
+test tcp_read_exactly_keeps_what_came_before_the_deadline
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'abc');
+    string $got = '';
+    string $why = failedStatus(tcp::readExactly($pair->server, $got, 10, ms(200)));
+    expect($why == 'timeout', "a deadline that passes is a timeout: {$why}");
+    assert($got == 'abc', 'with what arrived kept');
+}
+
+test tcp_read_all_reads_until_the_peer_closes
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'hello ');
+    send($pair->client, 'world');
+    $pair->client->close();
+    string $got = '';
+    guard tcp::readAll($pair->server, $got, ms(5000)) else ($e) {
+        die("read all: {$e}");
+    }
+    assert($got == 'hello world', 'everything, and the end is not an error');
+}
+
+test tcp_read_all_gives_up_at_its_deadline
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'x');
+    string $got = '';
+    string $why = failedStatus(tcp::readAll($pair->server, $got, ms(200)));
+    expect($why == 'timeout', "a peer that never closes is a timeout: {$why}");
+    assert($got == 'x', 'with what arrived kept');
+}

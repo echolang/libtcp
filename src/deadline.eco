@@ -1,0 +1,134 @@
+/**
+ * When a call has to give up. One deadline flows through every step of a composed call (each
+ * resolved address of a connect, the prefix and body of a frame), so the whole call is bounded,
+ * not each step.
+ */
+
+namespace tcp;
+
+use std::time;
+
+public struct Deadline
+{
+    // null never passes
+    private time::instant? $at;
+
+    /**
+     * The deadline `$span` from now.
+     */
+    public constructor(after: time::duration $span)
+    {
+        $this->at = time::instant::now() + $span;
+    }
+
+    /**
+     * A deadline at a moment on the monotonic clock.
+     */
+    public constructor(at: time::instant $when)
+    {
+        $this->at = $when;
+    }
+
+    /**
+     * The deadline `$ms` milliseconds from now; zero or less has already passed.
+     */
+    public constructor(ms: int64 $ms)
+    {
+        $this->at = time::instant::now() + time::duration::millis($ms);
+    }
+
+    /**
+     * A deadline that never passes: the call waits as long as it takes.
+     */
+    public static function never() : Deadline
+    {
+        Deadline $d = Deadline(at: time::instant::now());
+        $d->at = null;
+        return $d;
+    }
+
+    /**
+     * A deadline that has already passed: the call looks once and does not wait.
+     */
+    public static function now() : Deadline
+    {
+        return Deadline(at: time::instant::now());
+    }
+
+    #[implicit]
+    public static function from(time::duration $span) : Deadline
+    {
+        return Deadline(after: $span);
+    }
+
+    public const function passed() : bool
+    {
+        time::instant $at = guard $this->at else {
+            return false;
+        }
+
+        return $at <= time::instant::now();
+    }
+
+    /**
+     * The time left, zero once passed, or null for a deadline that never passes.
+     */
+    public const function remaining() : time::duration?
+    {
+        time::duration? $none = null;
+        time::instant $at = guard $this->at else {
+            return $none;
+        }
+
+        time::instant $now = time::instant::now();
+        if ($at <= $now) {
+            time::duration? $zero = time::duration::zero();
+            return $zero;
+        }
+
+        time::duration? $left = $at - $now;
+        return $left;
+    }
+
+    /**
+     * What a C call waits: -1 forever, 0 once passed, else the milliseconds left, rounded up so
+     * a wait never ends just short of the deadline.
+     */
+    internal const function ms() : int32
+    {
+        time::duration? $rest = $this->remaining();
+        if ($rest == null) {
+            return -1;
+        }
+
+        time::duration $left = guard $rest;
+        int64 $ms = $left->as_millis() as int64;
+        if (time::duration::millis($ms) < $left) {
+            $ms = $ms + 1;
+        }
+
+        if ($ms > 2147483647) {
+            return 2147483647;
+        }
+
+        return $ms as int32;
+    }
+
+    /**
+     * Whichever of the two passes first.
+     */
+    public const function earlier(Deadline $other) : Deadline
+    {
+        time::instant $mine = guard $this->at else {
+            return $other;
+        }
+        time::instant $theirs = guard $other->at else {
+            return Deadline(at: $mine);
+        }
+        if ($theirs < $mine) {
+            return $other;
+        }
+
+        return Deadline(at: $mine);
+    }
+}

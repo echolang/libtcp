@@ -1,0 +1,105 @@
+/**
+ * IPv6 over ::1, and a dual-stack listener taking IPv4 too. A machine without IPv6 loopback
+ * (some containers) skips these: the test says so and passes.
+ */
+
+/**
+ * A listener on ::1, or null where the machine has no IPv6 loopback.
+ */
+internal function listenLocal6() : tcp::Listener?
+{
+    tcp::Listener? $none = null;
+    result<tcp::Listener, tcp::Error> $l = tcp::Listener::bind(tcp::Address(loopback: 0, .v6));
+    if (!$l->has_value()) {
+        string $why = kind($l->failure());
+        std::io::eprintln("no IPv6 loopback here ({$why}), skipped");
+        return $none;
+    }
+    tcp::Listener? $got = $l->unwrap();
+    return $got;
+}
+
+test tcp_ipv6_loopback_carries_bytes
+{
+    tcp::Listener? $maybe = listenLocal6();
+    tcp::Listener $l = guard $maybe else {
+        return;
+    }
+    tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $l->local->port, .v6), ms(5000)) else ($e) {
+        die("connect over ::1: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    assert($s->peer->family == tcp::Family::v6, 'the peer is IPv6');
+    assert($s->peer->host() == '::1', 'and it is ::1');
+    string $text = "{$c->peer}";
+    expect($text->starts('[::1]:'), "an IPv6 peer prints in brackets: {$text}");
+    sendFrame($c, 'over six');
+    tcp::frame::Reader $r = tcp::frame::Reader(max: 64);
+    expect(readFrame($s, $r, 5000) == 'over six', 'a frame over IPv6');
+}
+
+test tcp_localhost_finds_whichever_family_listens
+{
+    tcp::Listener? $maybe = listenLocal6();
+    tcp::Listener $six = guard $maybe else {
+        return;
+    }
+    // localhost may resolve to 127.0.0.1 first: the connect moves on to ::1
+    tcp::Stream $c = guard tcp::Stream::connect(host: 'localhost', $six->local->port, ms(5000)) else ($e) {
+        die("localhost to an IPv6-only listener: {$e}");
+    }
+    assert($c->peer->family == tcp::Family::v6, 'it reached the IPv6 listener');
+}
+
+test tcp_a_dual_stack_listener_takes_ipv4_too
+{
+    tcp::ListenOptions $opts = tcp::ListenOptions();
+    $opts->dualStack = true;
+    result<tcp::Listener, tcp::Error> $bound = tcp::Listener::bind(tcp::Address(any: 0, .v6), $opts);
+    if (!$bound->has_value()) {
+        string $why = kind($bound->failure());
+        std::io::eprintln("no IPv6 here ({$why}), skipped");
+        return;
+    }
+    tcp::Listener $l = $bound->unwrap();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    assert($s->peer->family == tcp::Family::v6, 'an IPv4 peer arrives as a mapped IPv6 address');
+    string $host = $s->peer->host();
+    expect($host->ends('127.0.0.1'), "::ffff:127.0.0.1: {$host}");
+}
+
+test tcp_a_plain_ipv6_listener_refuses_ipv4
+{
+    tcp::Listener? $maybe = listenLocal6();
+    tcp::Listener $l = guard $maybe else {
+        return;
+    }
+    string $why = failed(tcp::Stream::connect(tcp::Address(loopback: $l->local->port), ms(5000)));
+    expect($why != 'ok', 'a listener on ::1 does not take 127.0.0.1');
+}
+
+test tcp_an_ipv4_mapped_address_reaches_an_ipv4_listener
+{
+    // an IPv6 socket that is not v6-only reaches IPv4 through ::ffff:a.b.c.d: Windows makes
+    // one v6-only unless told otherwise
+    if (listenLocal6() == null) {
+        return;
+    }
+    tcp::Listener $l = listenLocal();
+    tcp::Address $mapped = guard tcp::Address::parse('::ffff:127.0.0.1', $l->local->port) else ($e) {
+        die("parse: {$e}");
+    }
+    assert($mapped->family == tcp::Family::v6, 'the mapped address is IPv6');
+    tcp::Stream $c = guard tcp::Stream::connect($mapped, ms(5000)) else ($e) {
+        die("connect to the mapped address: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    assert($s->peer->family == tcp::Family::v4, 'the listener sees plain IPv4');
+    send($c, 'mapped');
+    string $got = '';
+    guard tcp::readExactly($s, $got, 6, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'mapped', 'and the bytes arrive');
+}

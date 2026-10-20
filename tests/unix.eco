@@ -1,0 +1,229 @@
+/**
+ * Unix domain sockets: a listener and a stream on a path instead of a port. Bytes both ways, the
+ * socket file's life (made by bind, removed by close, a stale one replaced, a live one or a plain
+ * file never touched), the paths a platform takes, the TCP options a unix socket has not, and a
+ * poller over one.
+ */
+
+use std::time;
+
+/**
+ * A socket path in the system's temp directory, unique to this process and `$tag`.
+ */
+internal function sockPath(const string& $tag) : string
+{
+    string $dir = string::from(std::env::tmp());
+    // Windows names its temp directory in TEMP; TMPDIR is a POSIX habit
+    string::view? $win = std::env::var('TEMP');
+    if ($win != null) {
+        string::view $w = guard $win;
+        $dir = string::from($w);
+    }
+    int32 $pid = std::env::pid();
+    // join borrows its parts: a temporary built in the call would be gone before it is read
+    string $name = "ltcp-{$pid}-{$tag}.sock";
+    string $path = std::env::join($dir, $name);
+    return $path;
+}
+
+/**
+ * True when `$path` names something in its directory.
+ */
+internal function present(const string& $path) : bool
+{
+    string $dir = string::from(std::env::tmp());
+    string::view? $win = std::env::var('TEMP');
+    if ($win != null) {
+        string::view $w = guard $win;
+        $dir = string::from($w);
+    }
+    std::io::dir $d = guard std::io::opendir($dir) else ($e) {
+        die("opendir {$dir}: {$e}");
+    }
+    foreach ($d as $entry) {
+        if ($entry->path() == $path) {
+            return true;
+        }
+    }
+    return false;
+}
+
+internal function bindUnix(const string& $path) : tcp::Listener
+{
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: $path)) else ($e) {
+        die("bind {$path}: {$e}");
+    }
+    return $l;
+}
+
+internal function connectUnix(const string& $path) : tcp::Stream
+{
+    tcp::Stream $s = guard tcp::Stream::connect(tcp::Address(unix: $path), ms(5000)) else ($e) {
+        die("connect {$path}: {$e}");
+    }
+    return $s;
+}
+
+test tcp_unix_sockets_carry_bytes_both_ways
+{
+    string $path = sockPath('bytes');
+    tcp::Listener $l = bindUnix($path);
+    assert($l->local->family == tcp::Family::unix, 'a unix listener');
+    expect($l->local->path == $path, "bound at {$l->local->path}");
+    expect("{$l->local}" == "unix:{$path}", "prints as {$l->local}");
+
+    tcp::Stream $c = connectUnix($path);
+    tcp::Stream $s = acceptOne($l);
+    assert($c->peer == $l->local, 'the client knows where it connected');
+    assert($s->local == $l->local, 'the accepted end is at the listener path');
+    // the client never bound: its end has no name
+    assert($s->peer->family == tcp::Family::unix && $s->peer->path->empty(), 'an unnamed peer');
+
+    send($c, 'ping');
+    string $got = '';
+    guard tcp::readExactly($s, $got, 4, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'ping', 'client to server');
+    send($s, 'pong');
+    $got->clear();
+    guard tcp::readExactly($c, $got, 4, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'pong', 'server to client');
+    $l->close();
+}
+
+test tcp_a_unix_listener_removes_its_file_on_close
+{
+    string $path = sockPath('remove');
+    tcp::Listener $l = bindUnix($path);
+    assert(present($path), 'bind makes the file');
+    $l->close();
+    assert(!present($path), 'close removes it');
+}
+
+test tcp_a_stale_unix_file_is_replaced
+{
+    string $path = sockPath('stale');
+    // a listener that died: its socket closed, its file left behind
+    tcp::tcp_addr $raw = tcp::Address(unix: $path)->raw();
+    tcp::tcp_err $err = tcp::tcp_err();
+    int64 $dead = tcp::tcp_listen(&$raw, 16, 0, &$err);
+    assert($dead >= 0, 'the first listener');
+    tcp::tcp_listener_close($dead);
+    assert(present($path), 'its file outlives it');
+
+    tcp::Listener $l = bindUnix($path);
+    tcp::Stream $c = connectUnix($path);
+    tcp::Stream $s = acceptOne($l);
+    send($c, 'x');
+    string $got = '';
+    guard tcp::readExactly($s, $got, 1, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'x', 'the new listener serves');
+    $l->close();
+}
+
+test tcp_a_live_unix_listener_is_never_replaced
+{
+    string $path = sockPath('live');
+    tcp::Listener $first = bindUnix($path);
+    result<tcp::Listener, tcp::Error> $second = tcp::Listener::bind(tcp::Address(unix: $path));
+    string $why = failed($second);
+    expect($why == 'addressInUse', "a second bind: {$why}");
+
+    // the second bind's probe connected and closed again: the first listener skips that one
+    tcp::Stream $c = connectUnix($path);
+    tcp::Stream $s = acceptOne($first);
+    assert($s->local == $first->local, 'the first listener still serves');
+    $first->close();
+}
+
+test tcp_a_plain_file_is_never_replaced
+{
+    string $path = sockPath('plain');
+    usize $n = guard std::io::writefile($path, 'keep me') else ($e) {
+        die("writefile: {$e}");
+    }
+    result<tcp::Listener, tcp::Error> $bound = tcp::Listener::bind(tcp::Address(unix: $path));
+    expect(!$bound->has_value(), 'a bind over a plain file fails');
+    string $kept = guard std::io::readfile($path) else ($e) {
+        die("readfile: {$e}");
+    }
+    assert($kept == 'keep me', 'and the file is untouched');
+    bool $gone = guard std::io::remove($path) else ($e) {
+        die("remove: {$e}");
+    }
+}
+
+test tcp_unix_paths_are_checked
+{
+    string $empty = failed(tcp::Stream::connect(tcp::Address(unix: ''), ms(1000)));
+    expect($empty == 'invalid', "an empty path: {$empty}");
+
+    string $long = '/tmp/';
+    while ($long->size() < 200) {
+        $long->append('x');
+    }
+    string $tooLong = failed(tcp::Listener::bind(tcp::Address(unix: $long)));
+    expect($tooLong == 'invalid', "a path past the platform's limit: {$tooLong}");
+
+    tcp::Address $a = guard tcp::Address::parse('unix:/var/run/redis.sock') else ($e) {
+        die("parse: {$e}");
+    }
+    assert($a->family == tcp::Family::unix, 'unix: parses as a unix socket');
+    assert($a->path == '/var/run/redis.sock', 'its path');
+    tcp::Address $again = guard tcp::Address::parse("{$a}");
+    assert($again == $a, 'it prints the way it parses');
+    assert($a != tcp::Address(unix: '/var/run/other.sock'), 'paths tell addresses apart');
+    string $bad = failed(tcp::Address::parse('unix:'));
+    expect($bad == 'invalid', "unix: with no path: {$bad}");
+}
+
+test tcp_options_tcp_alone_has_are_refused_on_a_unix_stream
+{
+    string $path = sockPath('options');
+    tcp::Listener $l = bindUnix($path);
+    // the default options (no-delay on) are skipped for a unix socket, so this connects
+    tcp::Stream $c = connectUnix($path);
+    tcp::Stream $s = acceptOne($l);
+    string $nodelay = failedStatus($c->noDelay(true));
+    expect($nodelay == 'invalid', "no-delay: {$nodelay}");
+    string $keep = failedStatus($s->keepAlive(time::duration::secs(30)));
+    expect($keep == 'invalid', "keepalive: {$keep}");
+    guard $c->buffers(send: 65536, receive: 65536) else ($e) {
+        die("buffers are a socket option, not a TCP one: {$e}");
+    }
+    $l->close();
+}
+
+test tcp_a_unix_stream_polls
+{
+    string $path = sockPath('poll');
+    tcp::Listener $l = bindUnix($path);
+    tcp::Stream $c = connectUnix($path);
+    tcp::Stream $s = acceptOne($l);
+    tcp::Poller $p = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    guard $p->add($s, 7, .read) else ($e) {
+        die("add: {$e}");
+    }
+    send($c, 'ready');
+    array<tcp::Event> $events = array<tcp::Event>();
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    assert($events->count() == 1 && $events[0]->token == 7 && $events[0]->readable(), 'readable');
+    string $got = '';
+    usize? $n = guard $s->tryRead($got, 64) else ($e) {
+        die("tryRead: {$e}");
+    }
+    assert($got == 'ready', 'the bytes');
+    guard $p->remove($s) else ($e) {
+        die("remove: {$e}");
+    }
+    $l->close();
+}

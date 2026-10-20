@@ -1,0 +1,636 @@
+/**
+ * Readiness: a `Poller` reporting listeners and streams, `wake` stopping a wait from another
+ * thread, and a whole reactor (one thread, many connections, try calls only) serving frames.
+ */
+
+use std::thread;
+use std::time;
+
+internal function openPoller() : tcp::Poller
+{
+    tcp::Poller $p = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    return $p;
+}
+
+/**
+ * The events of one wait that are for `$token`, merged.
+ */
+internal function waitFor(tcp::Poller $p, uint64 $token, int64 $timeoutMs) : tcp::Event?
+{
+    tcp::Event? $none = null;
+    array<tcp::Event> $events = array<tcp::Event>();
+    tcp::Deadline $by = ms($timeoutMs);
+    while (!$by->passed()) {
+        guard $p->wait($events, $by) else ($e) {
+            die("wait: {$e}");
+        }
+        foreach ($events as $ev) {
+            if ($ev->token == $token) {
+                tcp::Event? $got = $ev;
+                return $got;
+            }
+        }
+    }
+    return $none;
+}
+
+test tcp_a_poller_reports_a_waiting_connection
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    guard $p->add($l, 7, .read) else ($e) {
+        die("add: {$e}");
+    }
+    tcp::Event? $quiet = waitFor($p, 7, 50);
+    assert($quiet == null, 'nobody connected: nothing to report');
+
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Event? $ready = waitFor($p, 7, 5000);
+    tcp::Event $ev = guard $ready else {
+        die('a connection never made the listener readable');
+    }
+    assert($ev->readable(), 'readable');
+    tcp::Stream? $s = guard $l->tryAccept() else ($e) {
+        die("try accept: {$e}");
+    }
+    assert($s != null, 'and a try accept takes it');
+}
+
+test tcp_a_poller_reports_bytes_and_the_end
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    guard $p->add($s, 1, .read) else ($e) {
+        die("add: {$e}");
+    }
+    send($c, 'hello');
+    tcp::Event $ev = guard waitFor($p, 1, 5000) else {
+        die('bytes never made the stream readable');
+    }
+    assert($ev->readable(), 'readable');
+    string $buf = '';
+    usize? $got = guard $s->tryRead($buf, 64) else ($e) {
+        die("try read: {$e}");
+    }
+    assert($buf == 'hello', 'what arrived');
+
+    $c->close();
+    tcp::Event $end = guard waitFor($p, 1, 5000) else {
+        die('the peer closing never made the stream readable');
+    }
+    assert($end->readable() || $end->hangup(), 'the end of the stream wakes the poller');
+    expect(failed($s->tryRead($buf, 64)) == 'eof', 'and a try read says it was the end');
+    guard $p->remove($s) else ($e) {
+        die("remove: {$e}");
+    }
+}
+
+test tcp_a_fresh_stream_is_writable
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    guard $p->add($c, 3, .write) else ($e) {
+        die("add: {$e}");
+    }
+    tcp::Event $ev = guard waitFor($p, 3, 5000) else {
+        die('an empty send buffer never reported writable');
+    }
+    assert($ev->writable() && !$ev->readable(), 'writable, and only that was asked');
+    guard $p->modify($c, 3, .read) else ($e) {
+        die("modify: {$e}");
+    }
+    expect(waitFor($p, 3, 50) == null, 'asked for reads instead: quiet until bytes come');
+}
+
+test tcp_oneshot_reports_once_until_armed_again
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    guard $p->add($s, 9, .read, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    send($c, 'x');
+    expect(waitFor($p, 9, 5000) != null, 'reported once');
+    // the byte is still unread, so a level registration would report it again; oneshot does not
+    expect(waitFor($p, 9, 50) == null, 'then quiet');
+    guard $p->modify($s, 9, .read, .oneshot) else ($e) {
+        die("modify: {$e}");
+    }
+    expect(waitFor($p, 9, 5000) != null, 'armed again, reported again');
+}
+
+test tcp_oneshot_both_reports_once_for_both_directions
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    // writable at once, and readable once the byte lands: on kqueue those are two filters, and
+    // the first one to fire must silence the other
+    send($c, 'x');
+    thread::sleep(50);
+    guard $p->add($s, 11, .both, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    expect(waitFor($p, 11, 5000) != null, 'reported once');
+    expect(waitFor($p, 11, 100) == null, 'then quiet in both directions');
+    guard $p->modify($s, 11, .both, .oneshot) else ($e) {
+        die("modify: {$e}");
+    }
+    expect(waitFor($p, 11, 5000) != null, 'armed again, reported again');
+}
+
+test tcp_oneshot_modified_to_level_reports_every_wait
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    guard $p->add($s, 12, .read, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    send($c, 'x');
+    expect(waitFor($p, 12, 5000) != null, 'oneshot reported');
+    guard $p->modify($s, 12, .read, .level) else ($e) {
+        die("modify: {$e}");
+    }
+    expect(waitFor($p, 12, 5000) != null, 'level now');
+    expect(waitFor($p, 12, 5000) != null, 'and still level on the next wait');
+}
+
+test tcp_a_poller_refuses_add_twice_and_unknown_handles
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    expect(!$p->modify($s, 13, .read)->has_value(), 'a modify before any add is refused');
+    expect(!$p->remove($s)->has_value(), 'so is a remove');
+    expect(waitFor($p, 13, 50) == null, 'and the refused modify left nothing behind');
+
+    guard $p->add($s, 13, .read) else ($e) {
+        die("add: {$e}");
+    }
+    expect(!$p->add($s, 14, .write)->has_value(), 'a second add is refused');
+    send($c, 'x');
+    tcp::Event $ev = guard waitFor($p, 13, 5000) else {
+        die('the first registration stopped reporting');
+    }
+    expect($ev->readable() && !$ev->writable(), 'the first registration is left as it was');
+
+    guard $p->remove($s) else ($e) {
+        die("remove: {$e}");
+    }
+    expect(!$p->remove($s)->has_value(), 'a second remove is refused');
+    guard $p->add($s, 15, .read) else ($e) {
+        die("add after remove: {$e}");
+    }
+}
+
+test tcp_a_wake_stops_a_wait_from_another_thread
+{
+    tcp::Poller $p = openPoller();
+    thread::task<int64> $waiter = guard thread::spawn(function() : int64 {
+        time::instant $t = time::instant::now();
+        array<tcp::Event> $events = array<tcp::Event>();
+        guard $p->wait($events, ms(10000)) else ($e) {
+            return -2;
+        }
+        if ($events->count() != 1 || !$events[0]->woken()) {
+            return -1;
+        }
+        return elapsedMs($t);
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(100);
+    $p->wake();
+    $p->wake();
+    int64 $waited = $waiter->wait();
+    expect($waited >= 0 && $waited < 2000, "the wake ended a 10 s wait after {$waited} ms");
+
+    // the wait that reported the wake used it up: nobody has to reset anything
+    array<tcp::Event> $after = array<tcp::Event>();
+    guard $p->wait($after, ms(50)) else ($e) {
+        die("wait: {$e}");
+    }
+    assert($after->empty(), 'two wakes are one, and the wait that saw it used it up');
+}
+
+test tcp_the_wake_token_is_reserved
+{
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    uint64 $reserved = 0xFFFFFFFFFFFFFFFF;
+    string $added = failedStatus($p->add($pair->client, $reserved, .read));
+    expect($added == 'invalid', "add with the wake token: {$added}");
+    guard $p->add($pair->client, 7, .read) else ($e) {
+        die("add: {$e}");
+    }
+    string $modified = failedStatus($p->modify($pair->client, $reserved, .read));
+    expect($modified == 'invalid', "modify with the wake token: {$modified}");
+}
+
+test tcp_a_passed_deadline_does_not_wait
+{
+    tcp::Poller $p = openPoller();
+    array<tcp::Event> $events = array<tcp::Event>();
+    time::instant $t = time::instant::now();
+    guard $p->wait($events, tcp::Deadline::now()) else ($e) {
+        die("wait: {$e}");
+    }
+    assert($events->empty(), 'nothing registered, nothing ready');
+    expect(elapsedMs($t) < 100, 'and no wait');
+}
+
+/**
+ * One connection a reactor holds: its stream, its frame reader, and what is still to send.
+ */
+internal class Conn
+{
+    public tcp::Stream $stream;
+    public tcp::frame::Reader $reader;
+    public string $out;
+    public usize $sent;
+
+    public constructor(tcp::Stream $stream)
+    {
+        $this->stream = $stream;
+        $this->reader = tcp::frame::Reader(max: 4096);
+        $this->out = '';
+        $this->sent = 0;
+    }
+}
+
+/**
+ * An echo server on one thread: accept, read and write with try calls only, and wait on the
+ * poller between. Returns how many frames it echoed, after `$expect` connections closed.
+ */
+internal function reactor(tcp::Listener $l, tcp::Poller $p) : string
+{
+    guard $p->add($l, 0, .read) else ($e) {
+        return "add listener: {$e}";
+    }
+    map<uint64, Conn> $conns = map<uint64, Conn>();
+    uint64 $next = 2;
+    int32 $echoed = 0;
+    array<tcp::Event> $events = array<tcp::Event>();
+    while (true) {
+        guard $p->wait($events, ms(10000)) else ($e) {
+            return "wait: {$e}";
+        }
+        if ($events->empty()) {
+            return 'the reactor sat idle for 10 s';
+        }
+        foreach ($events as $ev) {
+            if ($ev->woken()) {
+                return "echoed {$echoed}";
+            }
+            if ($ev->token == 0) {
+                // take every waiting connection, not just one
+                while (true) {
+                    tcp::Stream? $maybe = guard $l->tryAccept() else ($e) {
+                        return "accept: {$e}";
+                    }
+                    tcp::Stream $s = guard $maybe else {
+                        break;
+                    }
+                    guard $p->add($s, $next, .read) else ($e) {
+                        return "add stream: {$e}";
+                    }
+                    $conns[$next] = Conn($s);
+                    $next = $next + 1;
+                }
+                continue;
+            }
+            if (!$conns->has($ev->token)) {
+                continue;
+            }
+            Conn $c = $conns->get($ev->token);
+            bool $done = false;
+            if ($ev->readable() || $ev->hangup()) {
+                // drain what is here, then echo every whole frame
+                string $in = '';
+                while (true) {
+                    result<usize?, tcp::Error> $got = $c->stream->tryRead($in, 65536);
+                    if (!$got->has_value()) {
+                        $done = true;
+                        break;
+                    }
+                    if ($got->unwrap() == null) {
+                        break;
+                    }
+                }
+                $c->reader->feed($in);
+                while (true) {
+                    string? $frame = guard $c->reader->take() else ($e) {
+                        return "take: {$e}";
+                    }
+                    string $body = guard $frame else {
+                        break;
+                    }
+                    string $framed = guard tcp::frame::encode($body) else ($e) {
+                        return "encode: {$e}";
+                    }
+                    $c->out->append($framed);
+                    $echoed = $echoed + 1;
+                }
+            }
+            if ($c->sent < $c->out->size()) {
+                result<usize?, tcp::Error> $wrote = $c->stream->tryWrite($c->out, $c->sent);
+                usize? $put = null;
+                if ($wrote->has_value()) {
+                    $put = $wrote->unwrap();
+                } else {
+                    $done = true;
+                }
+                $c->sent = $c->sent + ($put ?? 0);
+                tcp::Interest $want = .read;
+                if ($c->sent < $c->out->size()) {
+                    $want = .both;
+                } else {
+                    $c->out = '';
+                    $c->sent = 0;
+                }
+                if (!$done) {
+                    guard $p->modify($c->stream, $ev->token, $want) else ($e) {
+                        return "modify: {$e}";
+                    }
+                }
+            }
+            if ($done) {
+                guard $p->remove($c->stream) else ($e) {
+                    return "remove: {$e}";
+                }
+                $c->stream->close();
+                $conns->remove($ev->token);
+            }
+        }
+    }
+}
+
+test tcp_a_reactor_serves_many_clients_from_one_thread
+{
+    tcp::Listener $l = listenLocal();
+    uint16 $port = $l->local->port;
+    tcp::Poller $p = openPoller();
+    thread::task<string> $server = guard thread::spawn(function() : string {
+        return reactor($l, $p);
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    int32 $clients = 40;
+    int32 $rounds = 25;
+    array<thread::task<string>> $tasks = array<thread::task<string>>();
+    int32 $i = 0;
+    while ($i < $clients) {
+        int32 $id = $i;
+        thread::task<string> $t = guard thread::spawn(function() : string {
+            tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+                return "connect: {$e}";
+            }
+            tcp::frame::Reader $r = tcp::frame::Reader(max: 4096);
+            int32 $k = 0;
+            while ($k < $rounds) {
+                string $body = "client {$id} round {$k}";
+                guard tcp::frame::write($c, $body, ms(5000)) else ($e) {
+                    return "write: {$e}";
+                }
+                string? $got = guard $r->read($c, ms(5000)) else ($e) {
+                    return "read: {$e}";
+                }
+                string $back = guard $got else {
+                    return "client {$id}: no echo in round {$k}";
+                }
+                if ($back != $body) {
+                    return "client {$id}: got {$back}";
+                }
+                $k = $k + 1;
+            }
+            return 'ok';
+        }) else ($e) {
+            die('spawn failed');
+        }
+        $tasks[] = $t;
+        $i = $i + 1;
+    }
+
+    usize $j = 0;
+    while ($j < $tasks->count()) {
+        string $result = $tasks[$j]->wait();
+        expect($result == 'ok', $result);
+        $j = $j + 1;
+    }
+    $p->wake();
+    string $done = $server->wait();
+    int32 $all = $clients * $rounds;
+    expect($done == "echoed {$all}", "the reactor: {$done}");
+}
+
+test tcp_a_handle_ready_both_ways_is_one_event
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    array<tcp::Stream> $clients = array<tcp::Stream>();
+    array<tcp::Stream> $servers = array<tcp::Stream>();
+    uint64 $count = 40;
+    uint64 $i = 0;
+    while ($i < $count) {
+        tcp::Stream $c = connectLocal($l->local->port);
+        tcp::Stream $s = acceptOne($l);
+        send($c, 'hello');
+        guard $p->add($s, 100 + $i, .both) else ($e) {
+            die("add: {$e}");
+        }
+        $clients[] = $c;
+        $servers[] = $s;
+        $i = $i + 1;
+    }
+
+    // kqueue reports a handle ready both ways as two kevents; the poller hands back one event
+    map<uint64, bool> $both = map<uint64, bool>();
+    array<tcp::Event> $events = array<tcp::Event>();
+    tcp::Deadline $by = ms(5000);
+    while (($both->count() as uint64) < $count && !$by->passed()) {
+        guard $p->wait($events, $by) else ($e) {
+            die("wait: {$e}");
+        }
+        map<uint64, bool> $seen = map<uint64, bool>();
+        foreach ($events as $ev) {
+            expect(!$seen->has($ev->token), "token {$ev->token} came back twice in one wait");
+            $seen->set($ev->token, true);
+            if ($ev->readable() && $ev->writable()) {
+                $both->set($ev->token, true);
+            }
+        }
+    }
+    expect(($both->count() as uint64) == $count, "{$both->count()} of {$count} streams came back readable and writable at once");
+}
+
+test tcp_a_poller_refuses_a_closed_source
+{
+    // a closed stream's number may be another socket's by now: touching it would change that
+    // socket's registration
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    guard $p->add($pair->server, 21, .read) else ($e) {
+        die("add: {$e}");
+    }
+    $pair->server->close();
+    string $removed = failedStatus($p->remove($pair->server));
+    expect($removed == 'closed', "remove after close: {$removed}");
+    string $modified = failedStatus($p->modify($pair->server, 21, .both));
+    expect($modified == 'closed', "modify after close: {$modified}");
+    string $added = failedStatus($p->add($pair->client, 22, .read));
+    expect($added == 'ok', "an open one is still taken: {$added}");
+    $pair->client->close();
+    tcp::Listener $l = listenLocal();
+    $l->close();
+    string $listener = failedStatus($p->add($l, 23, .read));
+    expect($listener == 'closed', "a closed listener: {$listener}");
+}
+
+test tcp_a_wake_before_the_wait_is_kept_for_it
+{
+    tcp::Poller $p = openPoller();
+    $p->wake();
+    array<tcp::Event> $events = array<tcp::Event>();
+    time::instant $t = time::instant::now();
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    expect($events->count() == 1 && $events[0]->woken(), 'the wake waited for the wait');
+    expect(elapsedMs($t) < 1000, 'and ended it at once');
+    guard $p->wait($events, ms(50)) else ($e) {
+        die("wait: {$e}");
+    }
+    assert($events->empty(), 'used up by the wait that saw it');
+    $p->wake();
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    expect($events->count() == 1 && $events[0]->woken(), 'and a poller wakes more than once');
+}
+
+test tcp_a_wake_comes_with_the_events_of_its_wait
+{
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    guard $p->add($pair->server, 31, .read) else ($e) {
+        die("add: {$e}");
+    }
+    send($pair->client, 'x');
+    thread::sleep(50);
+    $p->wake();
+    array<tcp::Event> $events = array<tcp::Event>();
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    bool $woken = false;
+    bool $readable = false;
+    foreach ($events as $ev) {
+        if ($ev->woken()) {
+            $woken = true;
+        } else if ($ev->token == 31 && $ev->readable()) {
+            $readable = true;
+        }
+    }
+    expect($woken && $readable, "one wait reports both, of {$events->count()} events");
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    expect($events->count() == 1 && $events[0]->token == 31, 'level: the bytes again, the wake not');
+}
+
+test tcp_a_removed_handle_is_not_reported
+{
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    guard $p->add($pair->server, 41, .read) else ($e) {
+        die("add: {$e}");
+    }
+    send($pair->client, 'x');
+    expect(waitFor($p, 41, 5000) != null, 'reported while added');
+    guard $p->remove($pair->server) else ($e) {
+        die("remove: {$e}");
+    }
+    expect(waitFor($p, 41, 100) == null, 'quiet once removed, bytes or not');
+}
+
+test tcp_a_peer_close_reads_as_a_hangup
+{
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    guard $p->add($pair->server, 51, .read) else ($e) {
+        die("add: {$e}");
+    }
+    $pair->client->close();
+    tcp::Event $ev = guard waitFor($p, 51, 5000) else {
+        die('a peer close is never reported');
+    }
+    expect($ev->readable() && $ev->hangup(), 'readable, and a hangup');
+    expect(!$ev->error(), 'a clean close is not an error');
+    string $got = '';
+    string $why = failed($pair->server->tryRead($got, 16));
+    expect($why == 'eof', "and the read says how it ended: {$why}");
+}
+
+test tcp_a_oneshot_listener_hands_one_connection_per_arm
+{
+    tcp::Poller $p = openPoller();
+    tcp::Listener $l = listenLocal();
+    guard $p->add($l, 61, .read, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    tcp::Stream $a = connectLocal($l->local->port);
+    tcp::Stream $b = connectLocal($l->local->port);
+    expect(waitFor($p, 61, 5000) != null, 'the first wait reports it');
+    expect(waitFor($p, 61, 100) == null, 'then it stays quiet with connections waiting');
+    guard $p->modify($l, 61, .read, .oneshot) else ($e) {
+        die("modify: {$e}");
+    }
+    expect(waitFor($p, 61, 5000) != null, 'until it is armed again');
+    int32 $accepted = 0;
+    while (true) {
+        tcp::Stream? $s = guard $l->tryAccept() else ($e) {
+            die("try accept: {$e}");
+        }
+        if ($s == null) {
+            break;
+        }
+        $accepted = $accepted + 1;
+    }
+    expect($accepted == 2, "both connections were waiting: {$accepted}");
+}
+
+test tcp_a_peer_reset_reads_as_readable_and_an_error
+{
+    // every backend reports a reset the way Linux does, so a reactor that reads on readable
+    // finds it (Windows once reported a bare hangup, which a level wait reports forever)
+    tcp::Poller $p = openPoller();
+    tcp::StreamPair $pair = connectedPair();
+    guard $p->add($pair->client, 52, .read) else ($e) {
+        die("add: {$e}");
+    }
+    // unread bytes make the server's close a reset
+    send($pair->client, 'unread');
+    thread::sleep(50);
+    $pair->server->close();
+    tcp::Event $ev = guard waitFor($p, 52, 5000) else {
+        die('a reset is never reported');
+    }
+    expect($ev->readable(), 'readable');
+    expect($ev->hangup(), 'a hangup');
+    expect($ev->error(), 'and an error');
+    string $got = '';
+    string $why = failed($pair->client->tryRead($got, 16));
+    expect($why == 'reset', "the read says it was a reset: {$why}");
+}

@@ -1,0 +1,8 @@
+/*
+ * A frame echo server on one thread: libtcp's Poller, frame::Reader::pull and
+ * Outbox. `echoc run` here, then connect with any frame client.
+ */
+
+#[module: "reactor"]
+#[depends: "../.."]
+#[sources: "main.eco"]

@@ -1,0 +1,187 @@
+/**
+ * Asking an error what it is without a match: its case's name, whether the peer is gone, and the
+ * system call or cause behind it.
+ */
+
+internal function refusedSys() : tcp::SysError
+{
+    return tcp::SysError(.connect, 61, 'Connection refused');
+}
+
+internal function named(tcp::Error $e, const string& $want) : void
+{
+    string $got = $e->name();
+    expect($got == $want, "expected {$want}, the name is {$got}");
+}
+
+test tcp_every_error_case_has_its_name
+{
+    tcp::SysError $s = refusedSys();
+    named(.eof, 'eof');
+    named(.timeout, 'timeout');
+    named(.closed, 'closed');
+    named(.broken, 'broken');
+    named(.refused($s), 'refused');
+    named(.reset($s), 'reset');
+    named(.unreachable($s), 'unreachable');
+    named(.addressInUse($s), 'addressInUse');
+    named(.tooManyFiles($s), 'tooManyFiles');
+    named(.resolve('nowhere.invalid', 'not known'), 'resolve');
+    named(.invalid('no'), 'invalid');
+    named(.os($s), 'os');
+}
+
+test tcp_an_error_says_when_the_peer_is_gone
+{
+    tcp::SysError $s = refusedSys();
+    tcp::Error $eof = .eof;
+    tcp::Error $reset = .reset($s);
+    tcp::Error $refused = .refused($s);
+    tcp::Error $timeout = .timeout;
+    tcp::Error $closed = .closed;
+    assert($eof->gone(), 'eof: the peer closed');
+    assert($reset->gone(), 'reset: the peer is gone');
+    assert(!$refused->gone(), 'refused: there never was a peer');
+    assert(!$timeout->gone(), 'a timeout says nothing about the peer');
+    assert(!$closed->gone(), 'closed is this side');
+}
+
+test tcp_an_error_hands_out_its_system_call
+{
+    tcp::Error $refused = .refused(refusedSys());
+    tcp::SysError? $maybe = $refused->sys();
+    tcp::SysError $s = guard $maybe else {
+        die('refused carries its system call');
+    }
+    assert($s->op == tcp::Op::connect, 'the call');
+    assert($s->code == 61, 'the code');
+    tcp::Error $timeout = .timeout;
+    assert($timeout->sys() == null, 'a timeout carries none');
+}
+
+test tcp_every_frame_error_case_has_its_name
+{
+    tcp::frame::Error $end = .end;
+    tcp::frame::Error $truncated = .truncated;
+    tcp::frame::Error $tooLarge = .tooLarge(5);
+    tcp::frame::Error $idle = .idle;
+    tcp::frame::Error $transport = .transport(.reset(refusedSys()));
+    assert($end->name() == 'end', 'end');
+    assert($truncated->name() == 'truncated', 'truncated');
+    assert($tooLarge->name() == 'tooLarge', 'tooLarge');
+    assert($idle->name() == 'idle', 'idle');
+    expect($transport->name() == 'transport:reset', "transport names its cause: {$transport->name()}");
+}
+
+test tcp_a_frame_error_says_when_the_peer_is_gone
+{
+    tcp::frame::Error $end = .end;
+    tcp::frame::Error $truncated = .truncated;
+    tcp::frame::Error $idle = .idle;
+    tcp::frame::Error $tooLarge = .tooLarge(5);
+    tcp::frame::Error $reset = .transport(.reset(refusedSys()));
+    tcp::frame::Error $timeout = .transport(.timeout);
+    assert($end->gone(), 'end');
+    assert($truncated->gone(), 'truncated');
+    assert($reset->gone(), 'a transport reset');
+    assert(!$timeout->gone(), 'a transport timeout is not');
+    assert(!$idle->gone(), 'idle is the peer still there, saying nothing');
+    assert(!$tooLarge->gone(), 'too large is a bad peer, not a gone one');
+}
+
+test tcp_a_frame_error_hands_out_its_cause
+{
+    tcp::frame::Error $transport = .transport(.timeout);
+    tcp::Error? $maybe = $transport->cause();
+    tcp::Error $cause = guard $maybe else {
+        die('a transport error carries its cause');
+    }
+    assert($cause->name() == 'timeout', 'kept whole');
+    tcp::frame::Error $end = .end;
+    assert($end->cause() == null, 'end has no cause');
+}
+
+/**
+ * The code `sys()` hands back, or -1 for none: a wrong case or garbage shows up as another
+ * number.
+ */
+internal function sysCode(tcp::Error $e) : int32
+{
+    tcp::SysError? $maybe = $e->sys();
+    tcp::SysError $s = guard $maybe else {
+        return -1;
+    }
+    return $s->code;
+}
+
+test tcp_every_error_case_answers_sys
+{
+    // `sys` works around an echoc miscompile (a payload matched into a nullable), so every case
+    // is asked, each with its own code
+    expect(sysCode(.refused(tcp::SysError(.connect, 1, 'a'))) == 1, 'refused');
+    expect(sysCode(.reset(tcp::SysError(.read, 2, 'b'))) == 2, 'reset');
+    expect(sysCode(.unreachable(tcp::SysError(.connect, 3, 'c'))) == 3, 'unreachable');
+    expect(sysCode(.addressInUse(tcp::SysError(.bind, 4, 'd'))) == 4, 'addressInUse');
+    expect(sysCode(.tooManyFiles(tcp::SysError(.accept, 5, 'e'))) == 5, 'tooManyFiles');
+    expect(sysCode(.os(tcp::SysError(.poll, 6, 'f'))) == 6, 'os');
+    expect(sysCode(.eof) == -1, 'eof carries none');
+    expect(sysCode(.timeout) == -1, 'timeout carries none');
+    expect(sysCode(.closed) == -1, 'closed carries none');
+    expect(sysCode(.broken) == -1, 'broken carries none');
+    expect(sysCode(.resolve('h', 'm')) == -1, 'resolve carries none');
+    expect(sysCode(.invalid('w')) == -1, 'invalid carries none');
+
+    tcp::Error $os = .os(tcp::SysError(.wake, 7, 'the text'));
+    tcp::SysError $s = guard $os->sys() else {
+        die('os carries its call');
+    }
+    expect($s->op == tcp::Op::wake && $s->message == 'the text', 'kept whole');
+}
+
+test tcp_every_frame_error_case_answers_cause
+{
+    tcp::frame::Error $reset = .transport(.reset(refusedSys()));
+    tcp::Error $cause = guard $reset->cause() else {
+        die('a transport error carries its cause');
+    }
+    expect(sysCode($cause) == 61, 'the cause keeps its own payload');
+    tcp::frame::Error $truncated = .truncated;
+    tcp::frame::Error $tooLarge = .tooLarge(9);
+    tcp::frame::Error $idle = .idle;
+    assert($truncated->cause() == null, 'truncated has none');
+    assert($tooLarge->cause() == null, 'tooLarge has none');
+    assert($idle->cause() == null, 'idle has none');
+}
+
+test tcp_every_error_reads_as_a_sentence
+{
+    tcp::Error $eof = .eof;
+    tcp::Error $timeout = .timeout;
+    tcp::Error $closed = .closed;
+    tcp::Error $broken = .broken;
+    tcp::Error $refused = .refused(refusedSys());
+    tcp::Error $resolve = .resolve('nowhere.invalid', 'not known');
+    tcp::Error $invalid = .invalid('a port is needed');
+    expect("{$eof}" == 'the peer closed the connection', 'eof');
+    expect("{$timeout}" == 'timed out', 'timeout');
+    expect("{$closed}" == 'closed', 'closed');
+    expect($broken->message()->starts('an earlier write failed'), 'broken');
+    expect("{$refused}" == 'connect: Connection refused', "a system error names its call: {$refused}");
+    expect("{$resolve}" == 'resolve nowhere.invalid: not known', "resolve names the host: {$resolve}");
+    expect("{$invalid}" == 'a port is needed', 'invalid is its reason');
+    tcp::frame::Error $transport = .transport(.timeout);
+    tcp::frame::Error $big = .tooLarge(70000);
+    expect("{$transport}" == 'timed out', 'a transport error reads as its cause');
+    expect("{$big}" == 'a frame of 70000 bytes is over the limit', "tooLarge: {$big}");
+}
+
+test tcp_every_op_has_its_name
+{
+    array<tcp::Op> $ops = [tcp::Op::resolve, tcp::Op::bind, tcp::Op::accept, tcp::Op::connect, tcp::Op::read, tcp::Op::write, tcp::Op::shutdown, tcp::Op::option, tcp::Op::poll, tcp::Op::wake];
+    array<string> $names = ['resolve', 'bind', 'accept', 'connect', 'read', 'write', 'shutdown', 'option', 'poll', 'wake'];
+    usize $i = 0;
+    while ($i < $ops->count()) {
+        expect($ops[$i]->name() == $names[$i], "op {$i} is {$names[$i]}");
+        $i = $i + 1;
+    }
+}

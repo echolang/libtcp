@@ -1,0 +1,214 @@
+/**
+ * Connecting without waiting (`Stream::start`, `Connecting::tryFinish` under a poller), name
+ * lookups a deadline bounds (`Lookup`, `resolve` with a deadline), and Happy Eyeballs: an address
+ * that never answers costs one stagger, not the whole deadline.
+ */
+
+use std::time;
+
+/**
+ * A port nothing listens on: bound once, then closed.
+ */
+internal function closedPort() : uint16
+{
+    tcp::Listener $l = listenLocal();
+    uint16 $port = $l->local->port;
+    $l->close();
+    return $port;
+}
+
+/**
+ * Wait on `$p` until `$c` is over: the stream, or the failure's name.
+ */
+internal function finish(tcp::Poller $p, tcp::Connecting $c, uint64 $token) : result<tcp::Stream, tcp::Error>
+{
+    array<tcp::Event> $events = array<tcp::Event>();
+    tcp::Deadline $by = ms(10000);
+    while (!$by->passed()) {
+        tcp::Stream? $done = guard $c->tryFinish() else ($e) {
+            return .error($e);
+        }
+        if ($done != null) {
+            tcp::Stream $s = guard $done;
+            return .ok($s);
+        }
+        guard $p->wait($events, $by) else ($e) {
+            return .error($e);
+        }
+        guard $p->modify($c, $token, .write, .oneshot) else ($e) {
+            return .error($e);
+        }
+    }
+    return .error(.timeout);
+}
+
+test tcp_a_started_connect_finishes_under_a_poller
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Poller $p = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    tcp::Connecting $c = guard tcp::Stream::start($l->local) else ($e) {
+        die("start: {$e}");
+    }
+    assert($c->to == $l->local, 'it knows where it goes');
+    guard $p->add($c, 3, .write, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    tcp::Stream $s = guard finish($p, $c, 3) else ($e) {
+        die("finish: {$e}");
+    }
+    assert($c->closed(), 'the handle went to the stream');
+    assert($s->peer == $l->local, 'connected where it was sent');
+
+    // the registration carried over to the stream: watch it for reading now
+    guard $p->modify($s, 3, .read) else ($e) {
+        die("modify the stream: {$e}");
+    }
+    tcp::Stream $server = acceptOne($l);
+    send($server, 'hi');
+    array<tcp::Event> $events = array<tcp::Event>();
+    guard $p->wait($events, ms(5000)) else ($e) {
+        die("wait: {$e}");
+    }
+    assert($events->count() == 1 && $events[0]->readable(), 'the stream reports through the same registration');
+    guard $p->remove($s) else ($e) {
+        die("remove: {$e}");
+    }
+}
+
+test tcp_a_refused_start_fails_in_try_finish
+{
+    uint16 $port = closedPort();
+    tcp::Poller $p = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    result<tcp::Connecting, tcp::Error> $started = tcp::Stream::start(tcp::Address(loopback: $port));
+    if (!$started->has_value()) {
+        // some systems refuse a loopback connect in the call itself
+        string $now = failed($started);
+        expect($now == 'refused', "start: {$now}");
+        return;
+    }
+    tcp::Connecting $c = $started->unwrap();
+    guard $p->add($c, 1, .write, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    string $why = failed(finish($p, $c, 1));
+    expect($why == 'refused', "finish: {$why}");
+    assert(!$c->closed(), 'a failed connect stays for the owner to close');
+    guard $p->remove($c) else ($e) {
+        die("remove: {$e}");
+    }
+    $c->close();
+    assert($c->closed(), 'closed');
+}
+
+test tcp_a_numeric_lookup_answers_at_once
+{
+    tcp::Lookup $l = guard tcp::Lookup::start('127.0.0.1', 80) else ($e) {
+        die("lookup: {$e}");
+    }
+    array<tcp::Address>? $got = guard $l->tryResult() else ($e) {
+        die("result: {$e}");
+    }
+    array<tcp::Address> $addrs = guard $got else {
+        die('a numeric host needs no wait');
+    }
+    assert($addrs->count() == 1 && $addrs[0] == tcp::Address(loopback: 80), 'itself');
+}
+
+test tcp_a_lookup_wakes_a_poller
+{
+    tcp::Poller $p = guard tcp::Poller::open() else ($e) {
+        die("poller: {$e}");
+    }
+    tcp::Lookup $l = guard tcp::Lookup::start('localhost', 80, notify: $p) else ($e) {
+        die("lookup: {$e}");
+    }
+    array<tcp::Event> $events = array<tcp::Event>();
+    tcp::Deadline $by = ms(10000);
+    array<tcp::Address>? $got = null;
+    while ($got == null && !$by->passed()) {
+        guard $p->wait($events, $by) else ($e) {
+            die("wait: {$e}");
+        }
+        array<tcp::Address>? $now = guard $l->tryResult() else ($e) {
+            die("result: {$e}");
+        }
+        $got = $now;
+    }
+    array<tcp::Address> $addrs = guard $got else {
+        die('no answer within 10 s');
+    }
+    assert($events->count() == 1 && $events[0]->woken(), 'the poller was woken for it');
+    assert($addrs->count() >= 1, 'localhost has an address');
+    assert($l->host == 'localhost' && $l->port == 80, 'it knows what it looked up');
+}
+
+test tcp_resolve_answers_within_its_deadline
+{
+    array<tcp::Address> $local = guard tcp::resolve('localhost', 80, ms(10000)) else ($e) {
+        die("resolve localhost: {$e}");
+    }
+    assert($local->count() >= 1, 'localhost resolves');
+
+    // .invalid never exists (RFC 6761): the lookup fails, it does not hang
+    string $why = failed(tcp::resolve('nowhere.invalid', 80, ms(10000)));
+    expect($why == 'resolve' || $why == 'timeout', "a name that does not exist: {$why}");
+}
+
+test tcp_interleave_takes_turns_between_families
+{
+    array<tcp::Address> $in = array<tcp::Address>();
+    $in[] = tcp::Address(loopback: 1);
+    $in[] = tcp::Address(loopback: 2);
+    $in[] = tcp::Address(loopback: 3, .v6);
+    $in[] = tcp::Address(loopback: 4);
+    array<tcp::Address> $out = tcp::interleave($in);
+    assert($out->count() == 4, 'nothing lost');
+    assert($out[0]->port == 1 && $out[1]->port == 3 && $out[2]->port == 2 && $out[3]->port == 4, 'v4, v6, then the rest');
+}
+
+test tcp_happy_eyeballs_skips_an_address_that_never_answers
+{
+    tcp::Listener $l = listenLocal();
+    array<tcp::Address> $addrs = array<tcp::Address>();
+    // TEST-NET-1 (RFC 5737) routes nowhere: a connect there hangs, or fails, but never connects
+    tcp::Address $nowhere = guard tcp::Address::parse('192.0.2.1', 9);
+    $addrs[] = $nowhere;
+    $addrs[] = $l->local;
+
+    time::instant $start = time::instant::now();
+    tcp::Stream $s = guard tcp::connectAll($addrs, ms(10000), tcp::StreamOptions(), time::duration::millis(100)) else ($e) {
+        die("connect: {$e}");
+    }
+    int64 $took = elapsedMs($start);
+    assert($s->peer == $l->local, 'the address that answers wins');
+    expect($took < 3000, "one stagger, not the deadline: {$took} ms");
+    tcp::Stream $server = acceptOne($l);
+    send($s, 'x');
+    string $got = '';
+    guard tcp::readExactly($server, $got, 1, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+}
+
+test tcp_happy_eyeballs_reports_the_last_failure
+{
+    array<tcp::Address> $addrs = array<tcp::Address>();
+    $addrs[] = tcp::Address(loopback: closedPort());
+    $addrs[] = tcp::Address(loopback: closedPort());
+    string $why = failed(tcp::connectAll($addrs, ms(10000), tcp::StreamOptions(), time::duration::millis(100)));
+    expect($why == 'refused', "every address refused: {$why}");
+}
+
+test tcp_connect_by_name_finds_a_listener
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = guard tcp::Stream::connect(host: 'localhost', $l->local->port, ms(10000)) else ($e) {
+        die("connect: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    assert($c->peer == $s->local, 'connected to the listener');
+}

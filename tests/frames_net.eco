@@ -1,21 +1,22 @@
 /**
- * FrameReader over real sockets: frames bigger than one read, frames back to back, and the idle
- * limit against a timeout.
+ * frame::Reader and frame::write over real sockets: frames bigger than one read, frames back to
+ * back, the idle limit against a deadline, and the ends of a conversation.
  */
 
 use std::thread;
+use std::time;
 
 test tcp_a_large_frame_comes_back_from_one_read
 {
     tcp::Listener $l = listenLocal();
-    int32 $port = $l->port();
+    uint16 $port = $l->local->port;
     usize $size = 1024 * 1024;
     thread::task<string> $sender = guard thread::spawn(function() : string {
-        tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
-            return "connect: {$e->message()}";
+        tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+            return "connect: {$e}";
         }
-        guard tcp::writeFrame($c, pattern($size), 10000) else ($e) {
-            return "write: {$e->message()}";
+        guard tcp::frame::write($c, pattern($size), ms(10000)) else ($e) {
+            return "write: {$e}";
         }
         return 'ok';
     }) else ($e) {
@@ -23,10 +24,10 @@ test tcp_a_large_frame_comes_back_from_one_read
     }
 
     tcp::Stream $s = acceptOne($l);
-    tcp::FrameReader $reader = tcp::FrameReader(2 * 1024 * 1024);
-    // one call: null means the timeout passed, and five seconds is plenty for a megabyte
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 2 * 1024 * 1024);
+    // one call: null means the deadline passed, and five seconds is plenty for a megabyte
     string $body = readFrame($s, $reader, 5000);
-    assert($sender->wait() == 'ok', 'sent');
+    expect($sender->wait() == 'ok', 'sent');
     expect($body->size() == $size, "{$body->size()} of {$size} bytes");
     assert(firstDiff($body, pattern($size)) == -1, 'byte for byte');
 }
@@ -34,21 +35,19 @@ test tcp_a_large_frame_comes_back_from_one_read
 test tcp_frames_back_to_back_come_out_in_order
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
     string $wire = '';
     usize $i = 0;
     while ($i < 1000) {
-        string $body = guard tcp::frame(pattern($i % 301)) else ($e) {
-            die($e->message());
+        string $one = guard tcp::frame::encode(pattern($i % 301)) else ($e) {
+            die("encode: {$e}");
         }
-        $wire->append($body);
+        $wire->append($one);
         $i = $i + 1;
     }
-    guard $c->writeAll($wire, 5000) else ($e) {
-        die($e->message());
-    }
-    tcp::FrameReader $reader = tcp::FrameReader(1024);
+    send($c, $wire);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024);
     $i = 0;
     while ($i < 1000) {
         string $got = readFrame($s, $reader, 5000);
@@ -59,76 +58,235 @@ test tcp_frames_back_to_back_come_out_in_order
     assert($reader->buffered() == 0, 'nothing left over');
 }
 
+test tcp_frames_both_ways
+{
+    tcp::Listener $l = listenLocal();
+    uint16 $port = $l->local->port;
+    thread::task<string> $client = guard thread::spawn(function() : string {
+        tcp::Stream $s = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+            return "connect: {$e}";
+        }
+        guard tcp::frame::write($s, 'ping', ms(5000)) else ($e) {
+            return "write: {$e}";
+        }
+        tcp::frame::Reader $r = tcp::frame::Reader(max: 1024);
+        int32 $tries = 0;
+        // short waits in a loop, as a thread that checks a stop flag would
+        while ($tries < 200) {
+            string? $got = guard $r->read($s, ms(25)) else ($e) {
+                return "read: {$e}";
+            }
+            if ($got != null) {
+                string $body = guard $got;
+                return $body;
+            }
+            $tries = $tries + 1;
+        }
+        return 'no reply';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Stream $conn = acceptOne($l);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024);
+    expect(readFrame($conn, $reader, 5000) == 'ping', 'the client frame arrived whole');
+    sendFrame($conn, 'pong');
+    expect($client->wait() == 'pong', 'the reply arrived whole');
+}
+
 test tcp_idle_cuts_a_long_read_short
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    tcp::FrameReader $reader = tcp::FrameReader(1024, 80);
-    std::time::instant $t = std::time::instant::now();
-    bool $idle = match ($reader->read($s, 5000)) {
-        .error($e) => match ($e) {
-            tcp::FrameError::idle => true,
-            else => false,
-        },
-        else => false,
-    };
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024, idle: time::duration::millis(80));
+    time::instant $t = time::instant::now();
+    string $why = frameFailed($reader->read($s, ms(5000)));
     int64 $waited = elapsedMs($t);
-    assert($idle, 'a silent peer is idle');
+    expect($why == 'idle', "a silent peer is idle, not {$why}");
     expect($waited < 1000, "an 80 ms idle limit ended a 5 s read after {$waited} ms");
+}
+
+test tcp_idle_reader_ends_a_trickling_peer
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $client = connectLocal($l->local->port);
+    tcp::Stream $conn = acceptOne($l);
+    // a prefix and one byte of body: bytes arrive, no frame completes
+    string $start = tcp::frame::header(10);
+    $start->push(120);
+    send($client, $start);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024, idle: time::duration::millis(80));
+    bool $idle = false;
+    int32 $tries = 0;
+    while (!$idle && $tries < 100) {
+        $idle = frameFailed($reader->read($conn, ms(20))) == 'idle';
+        if (!$idle && $tries % 2 == 0) {
+            // keep trickling: bytes are not frames, the limit still runs
+            send($client, 'y');
+        }
+        $tries = $tries + 1;
+    }
+    assert($idle, 'a trickle that never completes a frame is idle');
 }
 
 test tcp_a_frame_already_here_beats_the_idle_limit
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    tcp::FrameReader $reader = tcp::FrameReader(1024, 50);
-    guard tcp::writeFrame($c, 'late but here', 1000) else ($e) {
-        die($e->message());
-    }
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024, idle: time::duration::millis(50));
+    sendFrame($c, 'late but here');
     thread::sleep(150);
-    string? $got = guard $reader->read($s, 1000) else ($e) {
-        die("the frame was waiting in the socket: {$e->message()}");
+    string? $got = guard $reader->read($s, ms(1000)) else ($e) {
+        die("the frame was waiting in the socket: {$e}");
     }
     assert(($got ?? '-') == 'late but here', 'the frame, not idle');
 }
 
-test tcp_a_zero_timeout_read_does_not_wait
+test tcp_a_passed_deadline_reads_once_and_does_not_wait
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    tcp::FrameReader $reader = tcp::FrameReader(1024);
-    std::time::instant $t = std::time::instant::now();
-    string? $none = guard $reader->read($s, 0) else ($e) {
-        die($e->message());
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024);
+    time::instant $t = time::instant::now();
+    string? $none = guard $reader->read($s, tcp::Deadline::now()) else ($e) {
+        die("read: {$e}");
     }
     int64 $waited = elapsedMs($t);
     assert($none == null, 'nothing sent: null');
-    expect($waited < 100, "read(0) took {$waited} ms");
+    expect($waited < 100, "a read that may not wait took {$waited} ms");
 }
 
 test tcp_http_on_the_wire_is_too_large
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    guard $c->writeAll('GET / HTTP/1.1\r\nHost: x\r\n\r\n', 1000) else ($e) {
-        die($e->message());
-    }
-    tcp::FrameReader $reader = tcp::FrameReader(65536);
-    bool $refused = false;
+    send($c, 'GET / HTTP/1.1\r\nHost: x\r\n\r\n');
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 65536);
+    string $why = 'ok';
     int32 $tries = 0;
-    while (!$refused && $tries < 100) {
-        $refused = match ($reader->read($s, 50)) {
-            .error($e) => match ($e) {
-                tcp::FrameError::tooLarge($size) => true,
-                else => false,
-            },
-            else => false,
-        };
+    while ($why == 'ok' && $tries < 100) {
+        $why = frameFailed($reader->read($s, ms(50)));
         $tries = $tries + 1;
     }
-    assert($refused, 'a request line is refused before anything is allocated for it');
+    expect($why == 'tooLarge', "a request line is refused before anything is allocated for it, not {$why}");
+}
+
+test tcp_a_peer_close_between_frames_is_closed
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $client = connectLocal($l->local->port);
+    tcp::Stream $conn = acceptOne($l);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024);
+    string? $idle = guard $reader->read($conn, ms(20)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($idle == null, 'nothing sent: null, not an error');
+
+    sendFrame($client, 'last');
+    $client->close();
+    expect(readFrame($conn, $reader, 5000) == 'last', 'the last frame first');
+    string $why = frameFailed($reader->read($conn, ms(5000)));
+    expect($why == 'end', "then a peer close between frames is the end, not {$why}");
+}
+
+test tcp_close_mid_frame_is_truncated
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $client = connectLocal($l->local->port);
+    tcp::Stream $conn = acceptOne($l);
+    string $half = tcp::frame::header(100);
+    $half->append('only part');
+    send($client, $half);
+    $client->close();
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1024);
+    string $why = frameFailed($reader->read($conn, ms(5000)));
+    expect($why == 'truncated', "a close inside a frame is truncated, not {$why}");
+}
+
+test tcp_a_frame_write_on_a_closed_stream_says_why
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    $c->close();
+    status<tcp::frame::Error> $sent = tcp::frame::write($c, 'x', ms(100));
+    string $why = 'ok';
+    if (!$sent->has_value()) {
+        $why = frameKind($sent->failure());
+    }
+    expect($why == 'transport:closed', "the transport cause is kept whole, not {$why}");
+}
+
+test tcp_one_reader_serves_many_requests
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    tcp::frame::Reader $server = tcp::frame::Reader(max: 65536, idle: time::duration::secs(30));
+    tcp::frame::Reader $client = tcp::frame::Reader(max: 65536);
+    usize $i = 0;
+    while ($i < 10000) {
+        string $ask = pattern($i % 997);
+        sendFrame($c, $ask);
+        string $got = readFrame($s, $server, 5000);
+        expect(firstDiff($got, $ask) == -1, "request {$i} is intact");
+        sendFrame($s, $got);
+        string $back = readFrame($c, $client, 5000);
+        expect(firstDiff($back, $ask) == -1, "reply {$i} is intact");
+        $i = $i + 1;
+    }
+    assert($server->buffered() == 0 && $client->buffered() == 0, 'nothing left over');
+}
+
+test tcp_large_and_small_frames_mix_back_to_back
+{
+    tcp::Listener $l = listenLocal();
+    uint16 $port = $l->local->port;
+    array<usize> $sizes = [300000, 5, 70000, 3, 0, 150000, 1, 65536];
+    thread::task<string> $sender = guard thread::spawn(function() : string {
+        tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+            return "connect: {$e}";
+        }
+        string $wire = '';
+        int32 $round = 0;
+        while ($round < 5) {
+            foreach ($sizes as $n) {
+                string $one = guard tcp::frame::encode(pattern($n)) else ($e) {
+                    return "encode: {$e}";
+                }
+                $wire->append($one);
+            }
+            $round = $round + 1;
+        }
+        guard $c->write($wire, ms(10000)) else ($e) {
+            return "write: {$e}";
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Stream $s = acceptOne($l);
+    tcp::frame::Reader $reader = tcp::frame::Reader(max: 1048576);
+    array<string> $kept = array<string>();
+    int32 $round = 0;
+    while ($round < 5) {
+        foreach ($sizes as $n) {
+            string $got = readFrame($s, $reader, 5000);
+            expect(firstDiff($got, pattern($n)) == -1, "a frame of {$n} bytes in round {$round} is intact");
+            $kept[] = $got;
+        }
+        $round = $round + 1;
+    }
+    expect($sender->wait() == 'ok', 'sent');
+    // bodies the caller keeps stay intact while the reader goes on reusing its buffer
+    usize $k = 0;
+    foreach ($kept as $body) {
+        expect(firstDiff($body, pattern($sizes[$k % $sizes->count()])) == -1, "kept frame {$k} is unchanged");
+        $k = $k + 1;
+    }
+    assert($reader->buffered() == 0, 'nothing left over');
 }

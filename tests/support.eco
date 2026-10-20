@@ -3,20 +3,38 @@
  * so a test reads as the behaviour it checks.
  */
 
+use std::time;
+
+internal function ms(int64 $n) : tcp::Deadline
+{
+    return tcp::Deadline(ms: $n);
+}
+
 internal function listenLocal() : tcp::Listener
 {
-    tcp::Listener $l = guard tcp::Listener::open('127.0.0.1', 0) else ($e) {
-        die("listen: {$e->message()}");
+    tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+        die("listen: {$e}");
     }
     return $l;
 }
 
-internal function connectLocal(int32 $port) : tcp::Stream
+internal function connectLocal(uint16 $port) : tcp::Stream
 {
-    tcp::Stream $s = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
-        die("connect: {$e->message()}");
+    tcp::Stream $s = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+        die("connect: {$e}");
     }
     return $s;
+}
+
+/**
+ * Two connected streams, for a test that needs no listener of its own.
+ */
+internal function connectedPair() : tcp::StreamPair
+{
+    tcp::StreamPair $pair = guard tcp::Stream::pair(ms(5000)) else ($e) {
+        die("pair: {$e}");
+    }
+    return $pair;
 }
 
 /**
@@ -24,13 +42,61 @@ internal function connectLocal(int32 $port) : tcp::Stream
  */
 internal function acceptOne(tcp::Listener $l) : tcp::Stream
 {
-    tcp::Stream? $maybe = guard $l->accept(5000) else ($e) {
-        die("accept: {$e->message()}");
+    tcp::Stream? $maybe = guard $l->accept(ms(5000)) else ($e) {
+        die("accept: {$e}");
     }
     tcp::Stream $s = guard $maybe else {
         die('no client connected within 5 s');
     }
     return $s;
+}
+
+/**
+ * The name of an error's case, so a test can say which one it expects in one line.
+ */
+internal function kind(const tcp::Error& $e) : string
+{
+    return $e->name();
+}
+
+/**
+ * The case a failed result carries, or 'ok'.
+ */
+internal function failed<T>(result<T, tcp::Error> $r) : string
+{
+    if ($r->has_value()) {
+        return 'ok';
+    }
+    return kind($r->failure());
+}
+
+internal function failedStatus(status<tcp::Error> $r) : string
+{
+    if ($r->has_value()) {
+        return 'ok';
+    }
+    return kind($r->failure());
+}
+
+internal function frameKind(const tcp::frame::Error& $e) : string
+{
+    return $e->name();
+}
+
+internal function frameFailed<T>(result<T, tcp::frame::Error> $r) : string
+{
+    if ($r->has_value()) {
+        return 'ok';
+    }
+    return frameKind($r->failure());
+}
+
+internal function frameFailedStatus(status<tcp::frame::Error> $r) : string
+{
+    if ($r->has_value()) {
+        return 'ok';
+    }
+    return frameKind($r->failure());
 }
 
 /**
@@ -72,12 +138,12 @@ internal function firstDiff(const string& $a, const string& $b) : int64
 }
 
 /**
- * One frame off `$s` in one call, as `FrameReader::read` promises within its timeout.
+ * One frame off `$s` in one call, as `frame::Reader::read` promises before its deadline.
  */
-internal function readFrame(tcp::Stream $s, tcp::FrameReader $r, int32 $timeoutMs) : string
+internal function readFrame(tcp::Stream $s, tcp::frame::Reader $r, int64 $timeoutMs) : string
 {
-    string? $got = guard $r->read($s, $timeoutMs) else ($e) {
-        die("read: {$e->message()}");
+    string? $got = guard $r->read($s, ms($timeoutMs)) else ($e) {
+        die("read: {$e}");
     }
     string $body = guard $got else {
         die("no frame within {$timeoutMs} ms");
@@ -85,32 +151,35 @@ internal function readFrame(tcp::Stream $s, tcp::FrameReader $r, int32 $timeoutM
     return $body;
 }
 
-/**
- * Everything `$s` delivers until the peer closes, giving up after `$timeoutMs` in all.
- */
-internal function readToEnd(tcp::Stream $s, int32 $timeoutMs) : string
+internal function sendFrame(tcp::Stream $s, const string& $body) : void
 {
-    string $all = '';
-    std::time::instant $start = std::time::instant::now();
-    while (true) {
-        if ($start->elapsed()->as_millis() > ($timeoutMs as int64)) {
-            die("the peer did not close within {$timeoutMs} ms ({$all->size()} bytes read)");
-        }
-        bool $done = match ($s->append($all, 65536, 100)) {
-            .error($e) => match ($e) {
-                tcp::Error::closed => true,
-                tcp::Error::timeout => false,
-                else => die("read: {$e->message()}"),
-            },
-            else => false,
-        };
-        if ($done) {
-            return $all;
-        }
+    guard tcp::frame::write($s, $body, ms(5000)) else ($e) {
+        die("write frame: {$e}");
     }
 }
 
-internal function elapsedMs(std::time::instant $since) : int64
+internal function send(tcp::Stream $s, const string& $bytes) : void
+{
+    guard $s->write($bytes, ms(5000)) else ($e) {
+        die("write: {$e}");
+    }
+}
+
+/**
+ * Everything `$s` delivers until the peer closes, giving up after `$timeoutMs` in all.
+ */
+internal function readToEnd(tcp::Stream $s, int64 $timeoutMs) : string
+{
+    string $all = '';
+    status<tcp::Error> $read = tcp::readAll($s, $all, ms($timeoutMs));
+    if (!$read->has_value()) {
+        string $why = kind($read->failure());
+        die("read: {$why} after {$all->size()} bytes");
+    }
+    return $all;
+}
+
+internal function elapsedMs(time::instant $since) : int64
 {
     return $since->elapsed()->as_millis() as int64;
 }

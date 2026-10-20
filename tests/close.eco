@@ -1,0 +1,168 @@
+/**
+ * Closing from another thread: a call blocked on a stream or a listener wakes at once with
+ * `.closed`, and the handle's number is never reused under a call that still holds it. Then the
+ * graceful close, which lets a reply survive bytes the server never read.
+ */
+
+use std::thread;
+use std::time;
+
+test tcp_close_wakes_a_blocked_read
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    thread::task<string> $reader = guard thread::spawn(function() : string {
+        string $buf = '';
+        time::instant $t = time::instant::now();
+        string $why = failed($s->read($buf, 16, ms(10000)));
+        int64 $waited = elapsedMs($t);
+        return "{$why} after {$waited}";
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(100);
+    $s->close();
+    string $got = $reader->wait();
+    expect($got->starts('closed after '), "a blocked read wakes as closed: {$got}");
+    int64? $waited = str::int($got->sub(13, $got->size() - 13));
+    expect(($waited ?? 99999) < 2000, "and at once, not at its deadline: {$got}");
+}
+
+test tcp_close_wakes_a_blocked_write
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    thread::task<string> $writer = guard thread::spawn(function() : string {
+        // the peer never reads, so this fills the buffers and blocks
+        return failedStatus($c->write(pattern(64 * 1024 * 1024), ms(10000)));
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(200);
+    time::instant $t = time::instant::now();
+    $c->close();
+    string $why = $writer->wait();
+    int64 $waited = elapsedMs($t);
+    expect($why == 'closed', "a blocked write wakes as closed: {$why}");
+    expect($waited < 2000, "and at once, not at its deadline: {$waited} ms");
+}
+
+test tcp_close_wakes_a_blocked_accept
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Address $at = $l->local;
+    thread::task<string> $acceptor = guard thread::spawn(function() : string {
+        return failed($l->accept(ms(10000)));
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(100);
+    time::instant $t = time::instant::now();
+    $l->close();
+    string $why = $acceptor->wait();
+    int64 $waited = elapsedMs($t);
+    expect($why == 'closed', "a blocked accept wakes as closed: {$why}");
+    expect($waited < 2000, "and at once, not at its deadline: {$waited} ms");
+    tcp::Listener $again = guard tcp::Listener::bind($at) else ($e) {
+        die("the port is free once the accept has left: {$e}");
+    }
+}
+
+test tcp_closing_under_busy_threads_never_touches_a_reused_handle
+{
+    tcp::Listener $l = listenLocal();
+    uint16 $port = $l->local->port;
+    int32 $round = 0;
+    while ($round < 50) {
+        tcp::Stream $c = connectLocal($port);
+        tcp::Stream $s = acceptOne($l);
+        array<thread::task<string>> $users = array<thread::task<string>>();
+        int32 $i = 0;
+        while ($i < 4) {
+            thread::task<string> $user = guard thread::spawn(function() : string {
+                string $buf = '';
+                int32 $n = 0;
+                while ($n < 1000) {
+                    string $why = failed($s->read($buf, 16, ms(1)));
+                    if ($why == 'closed') {
+                        return 'ok';
+                    }
+                    if ($why != 'ok') {
+                        return $why;
+                    }
+                    $n = $n + 1;
+                }
+                return 'never saw the close';
+            }) else ($e) {
+                die('spawn failed');
+            }
+            $users[] = $user;
+            $i = $i + 1;
+        }
+        thread::sleep(2);
+        $s->close();
+        // a socket opened right after the close may take the old number; the users must not see it
+        tcp::Stream $fresh = connectLocal($port);
+        tcp::Stream $other = acceptOne($l);
+        send($fresh, 'not yours');
+        usize $k = 0;
+        while ($k < $users->count()) {
+            string $got = $users[$k]->wait();
+            expect($got == 'ok', "round {$round}: a reader after close got {$got}");
+            $k = $k + 1;
+        }
+        tcp::frame::Reader $unused = tcp::frame::Reader(max: 16);
+        string $left = '';
+        usize? $n = guard $other->read($left, 64, ms(2000)) else ($e) {
+            die("the fresh connection lost its bytes: {$e}");
+        }
+        expect($left == 'not yours', "round {$round}: the bytes went to their own reader: {$left}");
+        $round = $round + 1;
+    }
+}
+
+test tcp_finish_lets_the_reply_survive_unread_bytes
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    // the client sends more than the server will ever read, then waits for the reply
+    send($c, pattern(200000));
+    string $reply = pattern(1024 * 1024);
+    thread::task<string> $server = guard thread::spawn(function() : string {
+        guard $s->write($reply, ms(10000)) else ($e) {
+            return "write: {$e}";
+        }
+        guard $s->finish(ms(5000)) else ($e) {
+            return "finish: {$e}";
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(100);
+    string $got = readToEnd($c, 10000);
+    $c->close();
+    string $done = $server->wait();
+    expect($done == 'ok', "the server finished: {$done}");
+    expect($got->size() == $reply->size(), "the whole reply arrived, then a clean end: {$got->size()} bytes");
+    assert($s->closed(), 'finish closes the stream');
+}
+
+test tcp_finish_gives_up_at_its_deadline
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    // the client never closes, so the drain can only end at the deadline
+    time::instant $t = time::instant::now();
+    string $why = failedStatus($s->finish(ms(200)));
+    int64 $waited = elapsedMs($t);
+    expect($why == 'timeout', "a peer that never closes runs out the deadline: {$why}");
+    expect($waited < 2000, "and no longer: {$waited} ms");
+    assert($s->closed(), 'closed all the same');
+    string $buf = '';
+    expect(failed($c->read($buf, 16, ms(2000))) == 'eof', 'the client saw the end of the stream');
+}

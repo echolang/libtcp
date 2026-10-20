@@ -1,0 +1,184 @@
+/**
+ * Name lookups a deadline can bound. The system resolver (`getaddrinfo`) waits as long as DNS
+ * takes, so a `Lookup` runs it on a thread of its own: the caller waits for the answer up to its
+ * deadline, polls for it from a frame loop, or has a reactor's `Poller` woken when it is in. A
+ * lookup that outlives its deadline finishes on its thread and its answer is dropped. A numeric
+ * host needs no lookup and starts no thread.
+ */
+
+namespace tcp;
+
+use std::thread;
+
+/**
+ * What a lookup thread hands back: the addresses, or why there are none.
+ */
+internal struct Answer
+{
+    public bool $ok;
+    public array<Address> $addrs;
+    public Error $error;
+}
+
+#[atomic]
+public class Lookup
+{
+    public const string $host;
+    public const uint16 $port;
+    // signalled once the answer is in, so a wait can end on it before its deadline
+    private Waker $done;
+    private thread::receiver<Answer> $answers;
+    private bool $have;
+    private Answer $answer;
+
+    internal constructor(string $host, uint16 $port, Waker $done, thread::receiver<Answer> $answers)
+    {
+        $this->host = $host;
+        $this->port = $port;
+        $this->done = $done;
+        $this->answers = $answers;
+        $this->have = false;
+        $this->answer = Answer(false, array<Address>(), Error::closed);
+    }
+
+    /**
+     * Start looking `$host` up for `$port`.
+     */
+    public static function start(const string& $host, uint16 $port) : result<Lookup, Error>
+    {
+        Poller? $none = null;
+        return Lookup::begin($host, $port, $none);
+    }
+
+    /**
+     * Start looking `$host` up, and wake `$poller` when the answer is in: a reactor sees a
+     * `woken()` event and calls `tryResult`.
+     */
+    public static function start(const string& $host, uint16 $port, notify: Poller $poller) : result<Lookup, Error>
+    {
+        Poller? $p = $poller;
+        return Lookup::begin($host, $port, $p);
+    }
+
+    /**
+     * The addresses in the order the system prefers them, or null while the lookup is still
+     * running. Never waits.
+     */
+    public function tryResult() : result<array<Address>?, Error>
+    {
+        array<Address>? $none = null;
+        if (!$this->have) {
+            thread::poll<Answer> $next = $this->answers->try_recv();
+            bool $arrived = match ($next) {
+                thread::poll<Answer>::item($a) => true,
+                else => false,
+            };
+            if (!$arrived) {
+                bool $lost = match ($next) {
+                    thread::poll<Answer>::closed => true,
+                    else => false,
+                };
+                if ($lost) {
+                    return .error(.os(SysError(.resolve, 0, 'the lookup thread ended without an answer')));
+                }
+                return .ok($none);
+            }
+            $this->answer = match ($next) {
+                thread::poll<Answer>::item($a) => $a,
+                else => Answer(false, array<Address>(), Error::closed),
+            };
+            $this->have = true;
+        }
+
+        if (!$this->answer->ok) {
+            return .error($this->answer->error);
+        }
+        array<Address>? $addrs = $this->answer->addrs;
+        return .ok($addrs);
+    }
+
+    /**
+     * The addresses, waiting until the deadline for them: null when it passed first. The lookup
+     * goes on, and a later call can still collect it.
+     */
+    public function result(Deadline $by) : result<array<Address>?, Error>
+    {
+        while (true) {
+            array<Address>? $got = guard $this->tryResult() else ($e) {
+                return .error($e);
+            }
+            if ($got != null || $by->passed()) {
+                return .ok($got);
+            }
+            $this->done->wait($by);
+        }
+    }
+
+    private static function begin(const string& $host, uint16 $port, Poller? $notify) : result<Lookup, Error>
+    {
+        Waker $done = guard Waker::open() else ($e) {
+            return .error($e);
+        }
+        thread::channel<Answer> $ch = thread::channel<Answer>();
+        thread::sender<Answer> $tx = $ch->tx();
+        thread::receiver<Answer> $rx = $ch->rx();
+        Lookup $made = Lookup($host, $port, $done, $rx);
+
+        // a numeric host is its own answer: no lookup, no thread
+        result<Address, Error> $numeric = Address::parse($host, $port);
+        if ($numeric->has_value()) {
+            array<Address> $one = array<Address>();
+            $one[] = $numeric->unwrap();
+            $tx->send(Answer(true, $one, Error::closed));
+            answered($done, $notify);
+            return .ok($made);
+        }
+
+        string $name = $host;
+        thread::handle $worker = guard thread::spawn(function[mv $tx, $name, $port, $done, $notify]() : void {
+            result<array<Address>, Error> $got = lookup($name, $port, passive: false);
+            if ($got->has_value()) {
+                $tx->send(Answer(true, $got->unwrap(), Error::closed));
+            } else {
+                $tx->send(Answer(false, array<Address>(), $got->failure()));
+            }
+            answered($done, $notify);
+        }) else ($e) {
+            return .error(.os(SysError(.resolve, 0, "no thread for the lookup: {$e->message()}")));
+        }
+        // the caller may stop waiting: the thread finishes on its own and nobody joins it
+        $worker->detach();
+        return .ok($made);
+    }
+}
+
+/**
+ * Tell whoever waits that the answer is in.
+ */
+internal function answered(Waker $done, Poller? $notify) : void
+{
+    $done->wake();
+    if ($notify != null) {
+        Poller $p = guard $notify;
+        $p->wake();
+    }
+}
+
+/**
+ * The addresses `$host` resolves to for `$port`, waiting for the lookup until the deadline:
+ * `.timeout` when it passes first. The lookup itself runs on a thread of its own and finishes
+ * there.
+ */
+public function resolve(const string& $host, uint16 $port, Deadline $by) : result<array<Address>, Error>
+{
+    Lookup $l = guard Lookup::start($host, $port) else ($e) {
+        return .error($e);
+    }
+    array<Address>? $got = guard $l->result($by) else ($e) {
+        return .error($e);
+    }
+    array<Address> $addrs = guard $got else {
+        return .error(.timeout);
+    }
+    return .ok($addrs);
+}

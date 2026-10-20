@@ -1,0 +1,54 @@
+/**
+ * Deadlines without a socket: which of two passes first, the time left, and the milliseconds a
+ * C call is handed.
+ */
+
+use std::time;
+
+test tcp_a_deadline_in_the_past_has_passed
+{
+    assert(tcp::Deadline(ms: 0)->passed(), 'zero ms from now has passed');
+    assert(tcp::Deadline(ms: -50)->passed(), 'and so has a moment before now');
+    assert(tcp::Deadline(after: time::duration::zero())->passed(), 'a zero duration too');
+    assert(!tcp::Deadline(ms: 60000)->passed(), 'a minute from now has not');
+    time::duration $left = guard tcp::Deadline(ms: -50)->remaining() else {
+        die('a deadline that passed is not never');
+    }
+    assert($left == time::duration::zero(), 'a passed deadline has nothing left, never less');
+}
+
+test tcp_the_earlier_deadline_wins
+{
+    tcp::Deadline $soon = tcp::Deadline(ms: 1000);
+    tcp::Deadline $late = tcp::Deadline(ms: 60000);
+    tcp::Deadline $never = tcp::Deadline::never();
+    expect($soon->earlier($late)->ms() <= 1000, 'soon before late');
+    expect($late->earlier($soon)->ms() <= 1000, 'whichever is asked');
+    expect($soon->earlier($never)->ms() <= 1000, 'anything before never');
+    expect($never->earlier($soon)->ms() <= 1000, 'from either side');
+    assert($never->earlier($never)->remaining() == null, 'never and never is never');
+    assert($late->earlier(tcp::Deadline::now())->passed(), 'a passed one wins');
+}
+
+test tcp_a_deadline_at_an_instant
+{
+    time::instant $then = time::instant::now() + time::duration::millis(5000);
+    tcp::Deadline $d = tcp::Deadline(at: $then);
+    time::duration $left = guard $d->remaining() else {
+        die('an instant is a deadline that passes');
+    }
+    expect($left <= time::duration::millis(5000) && $left > time::duration::millis(4000), 'about five seconds left');
+}
+
+test tcp_a_c_call_is_handed_whole_milliseconds
+{
+    assert(tcp::Deadline::never()->ms() == -1, 'never waits forever');
+    assert(tcp::Deadline::now()->ms() == 0, 'passed waits not at all');
+    int32 $ms = tcp::Deadline(ms: 250)->ms();
+    expect($ms > 200 && $ms <= 250, "the time left, rounded up: {$ms}");
+    // a fraction of a millisecond left rounds up, so a wait never ends short of the deadline
+    int32 $sub = tcp::Deadline(after: time::duration::micros(300))->ms();
+    expect($sub == 1 || $sub == 0, "under a millisecond: {$sub}");
+    int32 $far = tcp::Deadline(after: time::duration::secs(100000000))->ms();
+    expect($far == 2147483647, "years away is capped, not wrapped: {$far}");
+}

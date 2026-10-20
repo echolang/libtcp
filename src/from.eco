@@ -1,0 +1,45 @@
+/**
+ * `str::from` for this library's types, so `"{$e}"` and `"{$address}"` work, and `hash::of` so an
+ * `Address` can key a map. A file of its own because a namespace is a property of the file.
+ */
+
+namespace str;
+
+/**
+ * The error's sentence, the same as `Error::message`.
+ */
+public function from(const tcp::Error& $e) : string
+{
+    return $e->message();
+}
+
+/**
+ * The frame error's sentence, the same as `frame::Error::message`.
+ */
+public function from(const tcp::frame::Error& $e) : string
+{
+    return $e->message();
+}
+
+/**
+ * `127.0.0.1:80`, `[::1]:80` for IPv6, or `unix:/path` for a unix socket (`unix:` alone for an
+ * unnamed one). `Address::parse` reads each of them back.
+ */
+public function from(const tcp::Address& $a) : string
+{
+    if ($a->family == tcp::Family::unix) {
+        return "unix:{$a->path}";
+    }
+    string $host = $a->host();
+    if ($a->family == tcp::Family::v6) {
+        return "[{$host}]:{$a->port}";
+    }
+    return "{$host}:{$a->port}";
+}
+
+namespace hash;
+
+public function of(const tcp::Address& $a) : uint64
+{
+    return $a->digest();
+}

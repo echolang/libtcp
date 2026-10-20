@@ -1,52 +1,79 @@
 /**
- * Bytes over a connection: partial reads, bulk transfers both ways, and the half-close.
+ * Bytes over a connection: partial reads, bulk transfers both ways, gathered writes, the
+ * half-close, the try calls, and how a connection ends (eof against reset).
  */
 
 use std::thread;
 
-test tcp_recv_takes_what_fits_and_keeps_the_rest
+test tcp_read_takes_what_fits_and_keeps_the_rest
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    guard $c->writeAll('0123456789', 1000) else ($e) {
-        die($e->message());
-    }
+    send($c, '0123456789');
     string $got = '';
     int32 $reads = 0;
     while ($got->size() < 10 && $reads < 100) {
         usize $before = $got->size();
-        usize $n = guard $s->append($got, 4, 1000) else ($e) {
-            die($e->message());
+        usize? $read = guard $s->read($got, 4, ms(1000)) else ($e) {
+            die("read: {$e}");
         }
+        usize $n = $read ?? 0;
         expect($n >= 1 && $n <= 4, "a read of at most 4 got {$n}");
-        assert($got->size() == $before + $n, 'append adds what it reports');
+        assert($got->size() == $before + $n, 'read appends what it reports');
         $reads = $reads + 1;
     }
     assert($got == '0123456789', 'every byte, in order');
     assert($reads >= 3, 'at most four bytes a read');
 }
 
-test tcp_write_all_of_nothing_is_done
+test tcp_a_write_of_nothing_is_done
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
-    guard $c->writeAll('', 0) else ($e) {
-        die("an empty write: {$e->message()}");
+    tcp::Stream $c = connectLocal($l->local->port);
+    guard $c->write('', ms(0)) else ($e) {
+        die("an empty write: {$e}");
     }
+    guard $c->write('', '', ms(0)) else ($e) {
+        die("an empty gathered write: {$e}");
+    }
+}
+
+test tcp_a_gathered_write_sends_head_then_body
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    guard $c->write('head:', pattern(300000), ms(5000)) else ($e) {
+        die("gathered write: {$e}");
+    }
+    guard $c->write('', 'body only', ms(5000)) else ($e) {
+        die("body only: {$e}");
+    }
+    guard $c->write('head only', '', ms(5000)) else ($e) {
+        die("head only: {$e}");
+    }
+    $c->close();
+    string $want = 'head:';
+    $want->append(pattern(300000));
+    $want->append('body only');
+    $want->append('head only');
+    string $got = readToEnd($s, 5000);
+    int64 $at = firstDiff($got, $want);
+    expect($at == -1, "the bytes differ at {$at} of {$got->size()}");
 }
 
 test tcp_bulk_transfer_arrives_whole
 {
     tcp::Listener $l = listenLocal();
-    int32 $port = $l->port();
+    uint16 $port = $l->local->port;
     usize $size = 8 * 1024 * 1024;
     thread::task<string> $sender = guard thread::spawn(function() : string {
-        tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
-            return "connect: {$e->message()}";
+        tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+            return "connect: {$e}";
         }
-        guard $c->writeAll(pattern($size), 10000) else ($e) {
-            return "write: {$e->message()}";
+        guard $c->write(pattern($size), ms(10000)) else ($e) {
+            return "write: {$e}";
         }
         $c->close();
         return 'ok';
@@ -56,7 +83,7 @@ test tcp_bulk_transfer_arrives_whole
 
     tcp::Stream $s = acceptOne($l);
     string $got = readToEnd($s, 10000);
-    assert($sender->wait() == 'ok', 'the sender finished');
+    expect($sender->wait() == 'ok', 'the sender finished');
     expect($got->size() == $size, "{$got->size()} of {$size} bytes");
     int64 $at = firstDiff($got, pattern($size));
     expect($at == -1, "the bytes differ at {$at}");
@@ -65,18 +92,20 @@ test tcp_bulk_transfer_arrives_whole
 test tcp_both_directions_at_once
 {
     tcp::Listener $l = listenLocal();
-    int32 $port = $l->port();
+    uint16 $port = $l->local->port;
     usize $size = 2 * 1024 * 1024;
     // each side writes on one thread and reads on another, so neither waits on the other's reads
     thread::task<string> $client = guard thread::spawn(function() : string {
-        tcp::Stream $c = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
-            return "connect: {$e->message()}";
+        tcp::Stream $c = guard tcp::Stream::connect(tcp::Address(loopback: $port), ms(5000)) else ($e) {
+            return "connect: {$e}";
         }
         thread::task<string> $writer = guard thread::spawn(function() : string {
-            guard $c->writeAll(pattern($size), 10000) else ($e) {
-                return "client write: {$e->message()}";
+            guard $c->write(pattern($size), ms(10000)) else ($e) {
+                return "client write: {$e}";
             }
-            $c->shutdownWrite();
+            guard $c->shutdown(.write) else ($e) {
+                return "client shutdown: {$e}";
+            }
             return 'ok';
         }) else ($e) {
             return 'spawn failed';
@@ -96,33 +125,254 @@ test tcp_both_directions_at_once
 
     tcp::Stream $s = acceptOne($l);
     thread::task<string> $writer = guard thread::spawn(function() : string {
-        guard $s->writeAll(pattern($size), 10000) else ($e) {
-            return "server write: {$e->message()}";
+        guard $s->write(pattern($size), ms(10000)) else ($e) {
+            return "server write: {$e}";
         }
-        $s->shutdownWrite();
+        guard $s->shutdown(.write) else ($e) {
+            return "server shutdown: {$e}";
+        }
         return 'ok';
     }) else ($e) {
         die('spawn failed');
     }
     string $got = readToEnd($s, 10000);
-    assert($writer->wait() == 'ok', 'the server wrote everything');
-    assert($client->wait() == 'ok', 'the client wrote and read everything');
+    string $wrote = $writer->wait();
+    expect($wrote == 'ok', "the server wrote everything: {$wrote}");
+    string $other = $client->wait();
+    expect($other == 'ok', "the client wrote and read everything: {$other}");
     assert(firstDiff($got, pattern($size)) == -1, 'the server read every byte in order');
 }
 
 test tcp_half_close_still_reads_the_reply
 {
     tcp::Listener $l = listenLocal();
-    tcp::Stream $c = connectLocal($l->port());
+    tcp::Stream $c = connectLocal($l->local->port);
     tcp::Stream $s = acceptOne($l);
-    guard $c->writeAll('request', 1000) else ($e) {
-        die($e->message());
+    send($c, 'request');
+    guard $c->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
     }
-    $c->shutdownWrite();
+    expect(failedStatus($c->write('more', ms(100))) == 'closed', 'a write after shutting the write side is closed');
     assert(readToEnd($s, 5000) == 'request', 'the server reads the request, then the end of it');
-    guard $s->writeAll('reply', 1000) else ($e) {
-        die("the server can still write: {$e->message()}");
-    }
+    send($s, 'reply');
     $s->close();
     assert(readToEnd($c, 5000) == 'reply', 'the client can still read');
+}
+
+test tcp_a_clean_close_is_eof
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    $c->close();
+    string $buf = '';
+    string $why = failed($s->read($buf, 16, ms(5000)));
+    expect($why == 'eof', "a peer that closed with nothing unread is eof, not {$why}");
+}
+
+test tcp_a_close_with_unread_bytes_is_a_reset
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    send($c, 'never read');
+    thread::sleep(50);
+    // the server drops a connection with bytes waiting in it: the OS answers with a reset
+    $s->close();
+    string $buf = '';
+    string $why = 'ok';
+    int32 $tries = 0;
+    while ($why == 'ok' && $tries < 50) {
+        $why = failed($c->read($buf, 16, ms(100)));
+        $tries = $tries + 1;
+    }
+    expect($why == 'reset', "the client reads a reset, not {$why}");
+}
+
+test tcp_try_calls_never_wait
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream? $nobody = guard $l->tryAccept() else ($e) {
+        die("try accept: {$e}");
+    }
+    assert($nobody == null, 'nobody waiting: null');
+
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream? $waiting = null;
+    int32 $tries = 0;
+    while ($waiting == null && $tries < 500) {
+        tcp::Stream? $next = guard $l->tryAccept() else ($e) {
+            die("try accept: {$e}");
+        }
+        $waiting = $next;
+        if ($waiting == null) {
+            thread::sleep(2);
+        }
+        $tries = $tries + 1;
+    }
+    tcp::Stream $s = guard $waiting else {
+        die('the connection never showed up for a try accept');
+    }
+
+    string $buf = '';
+    usize? $none = guard $s->tryRead($buf, 16) else ($e) {
+        die("try read: {$e}");
+    }
+    assert($none == null, 'nothing sent: null');
+
+    usize? $put = guard $c->tryWrite('abcdef', 2) else ($e) {
+        die("try write: {$e}");
+    }
+    expect(($put ?? 0) == 4, 'a try write sends from the offset on');
+
+    usize $total = 0;
+    $tries = 0;
+    while ($total < 4 && $tries < 500) {
+        usize? $got = guard $s->tryRead($buf, 16) else ($e) {
+            die("try read: {$e}");
+        }
+        $total = $total + ($got ?? 0);
+        if ($got == null) {
+            thread::sleep(2);
+        }
+        $tries = $tries + 1;
+    }
+    assert($buf == 'cdef', 'what was there, without waiting for more');
+
+    $c->close();
+    string $why = 'ok';
+    $tries = 0;
+    while ($why == 'ok' && $tries < 500) {
+        $why = failed($s->tryRead($buf, 16));
+        if ($why == 'ok') {
+            thread::sleep(2);
+        }
+        $tries = $tries + 1;
+    }
+    expect($why == 'eof', "a try read after the peer closed is eof, not {$why}");
+}
+
+test tcp_a_try_write_into_a_full_buffer_is_null
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    string $chunk = pattern(65536);
+    bool $full = false;
+    int32 $tries = 0;
+    // the peer never reads, so the buffers fill and a try write has to say so
+    while (!$full && $tries < 100000) {
+        usize? $put = guard $c->tryWrite($chunk) else ($e) {
+            die("try write: {$e}");
+        }
+        $full = $put == null;
+        $tries = $tries + 1;
+    }
+    assert($full, 'a full buffer is null, not a wait');
+    expect(failedStatus($c->write('x', ms(0))) != 'broken', 'and it does not break the stream');
+}
+
+test tcp_options_apply_to_a_live_stream
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    guard $c->noDelay(false) else ($e) {
+        die("no delay: {$e}");
+    }
+    guard $c->keepAlive(std::time::duration::secs(30)) else ($e) {
+        die("keepalive: {$e}");
+    }
+    guard $c->keepAlive(null) else ($e) {
+        die("keepalive off: {$e}");
+    }
+    guard $c->buffers(send: 65536, receive: 65536) else ($e) {
+        die("buffers: {$e}");
+    }
+    tcp::StreamOptions $opts = tcp::StreamOptions();
+    $opts->keepAlive = std::time::duration::secs(60);
+    $opts->noDelay = false;
+    tcp::Stream $tuned = guard tcp::Stream::connect($l->local, ms(5000), $opts) else ($e) {
+        die("connect with options: {$e}");
+    }
+    $c->close();
+    expect(failedStatus($c->noDelay(true)) == 'closed', 'an option on a closed stream is closed');
+}
+
+test tcp_a_gathered_try_write_counts_across_head_and_body
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    usize? $inHead = guard $c->tryWrite('abc', 'def', 2) else ($e) {
+        die("try write: {$e}");
+    }
+    assert(($inHead ?? 0) == 4, 'from the middle of the head: the rest of it and all the body');
+    usize? $inBody = guard $c->tryWrite('abc', 'def', 4) else ($e) {
+        die("try write: {$e}");
+    }
+    assert(($inBody ?? 0) == 2, 'from the middle of the body: the rest of it');
+    string $got = '';
+    while ($got->size() < 6) {
+        usize? $n = guard $s->read($got, 64, ms(5000)) else ($e) {
+            die("read: {$e}");
+        }
+    }
+    expect($got == 'cdefef', "both sends, in order: {$got}");
+}
+
+test tcp_a_gathered_try_write_resumes_from_its_offset
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    string $head = pattern(1000);
+    string $body = pattern(4 * 1048576);
+    usize $total = $head->size() + $body->size();
+    usize $off = 0;
+    int64 $writes = 0;
+    string $got = '';
+    // one thread: write what fits, drain what came, until all of it is across
+    while ($got->size() < $total) {
+        if ($off < $total) {
+            usize? $put = guard $c->tryWrite($head, $body, $off) else ($e) {
+                die("try write: {$e}");
+            }
+            $off = $off + ($put ?? 0);
+            $writes = $writes + 1;
+        }
+        usize? $n = guard $s->read($got, 1048576, ms(5)) else ($e) {
+            die("read: {$e}");
+        }
+    }
+    string $all = $head->clone();
+    $all->append($body);
+    expect($got->size() == $total, "{$got->size()} of {$total} bytes");
+    assert(firstDiff($got, $all) == -1, 'head then body, byte for byte');
+    expect($writes > 1, 'four megabytes took more than one try write');
+}
+
+test tcp_full_reads_then_a_short_one_lose_nothing
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    send($c, pattern(4096));
+    string $got = '';
+    // reads that fill their request: the stream tries the next one before it polls
+    while ($got->size() < 4096) {
+        usize? $n = guard $s->read($got, 1024, ms(5000)) else ($e) {
+            die("read: {$e}");
+        }
+    }
+    usize? $nothing = guard $s->read($got, 1024, ms(50)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($nothing == null, 'all of it taken: the next read waits out its deadline');
+    send($c, 'tail');
+    usize? $tail = guard $s->read($got, 1024, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    string $all = pattern(4096);
+    $all->append('tail');
+    assert(firstDiff($got, $all) == -1, 'every byte once, in order');
 }

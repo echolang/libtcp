@@ -1,24 +1,24 @@
 /*
- * libtcp: TCP sockets and length-prefixed frames for Echo.
+ * libtcp: TCP sockets, readiness and length-prefixed frames for Echo.
  *
  * The platform layer is C behind one contract (c/tcp.h): c/posix.c on macOS
- * and Linux, c/win32.c (Winsock) on Windows. Frames, read and write loops
- * and everything else are Echo.
- * Threads come from std::thread. No TLS, no HTTP.
+ * and Linux (epoll or kqueue for readiness), c/win32.c on Windows (Winsock,
+ * with readiness from the vendored wepoll). Deadlines, addresses, frames and
+ * everything else are Echo. No TLS, no HTTP.
  */
 
 #[module: "libtcp"]
-#[version: "0.1.0"]
+#[version: "0.2.0"] // x-release-please-version
 #[epm::license: "MIT"]
-#[epm::description: "tcp sockets and length-prefixed frames for echolang"]
+#[epm::description: "tcp sockets, readiness and length-prefixed frames for echolang"]
 
 #[if: os == windows]
-#[cc: sources "c/win32.c"]
+#[cc: sources ["c/win32.c", "c/wepoll/wepoll.c"]]
 #[link: lib "ws2_32"]
 #[else]
 #[cc: sources "c/posix.c"]
 #[end]
-#[sources: "src/*.eco"]
+#[sources: ["src/*.eco", "src/frame/*.eco"]]
 
 #[target: test] {
     #[sources: "tests/*.eco"]

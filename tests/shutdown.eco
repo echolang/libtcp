@@ -1,0 +1,225 @@
+/**
+ * What a stream answers after this side shut a direction down, closed it, or found the peer gone:
+ * every platform the same, whatever the OS would have said.
+ */
+
+use std::thread;
+use std::time;
+
+test tcp_a_read_after_a_read_shutdown_is_closed
+{
+    tcp::StreamPair $pair = connectedPair();
+    guard $pair->server->shutdown(.read) else ($e) {
+        die("shutdown: {$e}");
+    }
+    string $got = '';
+    string $read = failed($pair->server->read($got, 10, ms(100)));
+    expect($read == 'closed', "this side's shutdown is not the peer's end: {$read}");
+    string $try = failed($pair->server->tryRead($got, 10));
+    expect($try == 'closed', "a try read says so too: {$try}");
+
+    // bytes the peer sends after it change nothing: Linux would still hand them out, and macOS
+    // and Windows would answer them with a reset
+    send($pair->client, 'late');
+    thread::sleep(50);
+    $read = failed($pair->server->read($got, 10, ms(100)));
+    expect($read == 'closed', "and stays so when bytes arrive: {$read}");
+    assert($got->empty(), 'nothing was read');
+
+    // the write side is untouched, late bytes or not
+    send($pair->server, 'still');
+    string $atClient = '';
+    guard tcp::readExactly($pair->client, $atClient, 5, ms(5000)) else ($e) {
+        die("client read: {$e}");
+    }
+    assert($atClient == 'still', 'a read shutdown leaves writes working');
+}
+
+test tcp_a_shutdown_of_both_closes_both_ways
+{
+    tcp::StreamPair $pair = connectedPair();
+    guard $pair->server->shutdown(.both) else ($e) {
+        die("shutdown: {$e}");
+    }
+    string $got = '';
+    string $read = failed($pair->server->read($got, 10, ms(100)));
+    expect($read == 'closed', "read: {$read}");
+    string $write = failedStatus($pair->server->write('x', ms(100)));
+    expect($write == 'closed', "write: {$write}");
+    string $try = failed($pair->server->tryWrite('x'));
+    expect($try == 'closed', "try write: {$try}");
+    string $peer = failed($pair->client->read($got, 10, ms(5000)));
+    expect($peer == 'eof', "the peer reads the end: {$peer}");
+    assert(!$pair->server->closed(), 'shut both ways is still not closed');
+}
+
+test tcp_a_write_after_a_write_shutdown_is_closed
+{
+    tcp::StreamPair $pair = connectedPair();
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    string $write = failedStatus($pair->client->write('x', ms(100)));
+    expect($write == 'closed', "write: {$write}");
+    string $gathered = failedStatus($pair->client->write('head', 'body', ms(100)));
+    expect($gathered == 'closed', "gathered write: {$gathered}");
+    string $try = failed($pair->client->tryWrite('x'));
+    expect($try == 'closed', "try write: {$try}");
+}
+
+test tcp_a_direction_shut_twice_stays_shut
+{
+    // macOS answers a second shutdown of one direction with ENOTCONN, which is not the peer gone
+    tcp::StreamPair $pair = connectedPair();
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("a second write shutdown is harmless: {$e}");
+    }
+    guard $pair->client->shutdown(.both) else ($e) {
+        die("both after write shuts the read side only: {$e}");
+    }
+    guard $pair->client->shutdown(.read) else ($e) {
+        die("and read after both is shut already: {$e}");
+    }
+    string $got = '';
+    string $read = failed($pair->client->read($got, 10, ms(100)));
+    expect($read == 'closed', "the read side is shut: {$read}");
+    $pair->client->close();
+    string $after = failedStatus($pair->client->shutdown(.write));
+    expect($after == 'closed', "a shutdown after close: {$after}");
+}
+
+test tcp_finish_after_a_write_shutdown_still_drains
+{
+    // finish once took the failed second shutdown for a peer gone, and closed with bytes unread
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $client = $pair->client;
+    tcp::Stream $server = $pair->server;
+    send($client, 'request');
+    guard $client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+
+    thread::task<int64> $peer = guard thread::spawn(function() : int64 {
+        string $req = readToEnd($server, 5000);
+        if ($req != 'request') {
+            return -1;
+        }
+        thread::sleep(100);
+        send($server, 'reply');
+        $server->close();
+        return 0;
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    time::instant $t = time::instant::now();
+    guard $client->finish(ms(5000)) else ($e) {
+        die("finish: {$e}");
+    }
+    int64 $waited = elapsedMs($t);
+    expect($waited >= 50, "finish waited for the peer to close, not {$waited} ms");
+    assert($client->closed(), 'closed in the end');
+    expect($peer->wait() == 0, 'the peer got the request');
+}
+
+test tcp_a_reset_then_breaks_the_write_side
+{
+    tcp::StreamPair $pair = connectedPair();
+    // unread bytes make the close a reset
+    send($pair->client, 'unread');
+    thread::sleep(50);
+    $pair->server->close();
+    thread::sleep(50);
+
+    string $got = '';
+    string $read = failed($pair->client->read($got, 10, ms(1000)));
+    expect($read == 'reset', "the peer reset: {$read}");
+    string $write = failedStatus($pair->client->write('x', ms(1000)));
+    expect($write == 'reset' || $write == 'broken', "a write finds the reset: {$write}");
+    string $again = failedStatus($pair->client->write('x', ms(1000)));
+    expect($again == 'broken' || $again == 'reset', "and later writes do not pretend: {$again}");
+    guard $pair->client->finish(ms(1000)) else ($e) {
+        die("finish on a reset stream has nothing to wait for: {$e}");
+    }
+    assert($pair->client->closed(), 'finish closed it');
+    string $twice = failedStatus($pair->client->finish(ms(100)));
+    expect($twice == 'closed', "a second finish: {$twice}");
+}
+
+test tcp_every_call_on_a_closed_stream_is_closed
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $s = $pair->server;
+    $s->close();
+    $s->close();
+    assert($s->closed(), 'closed, and a second close is harmless');
+    string $got = '';
+    expect(failed($s->read($got, 10, ms(100))) == 'closed', 'read');
+    expect(failed($s->tryRead($got, 10)) == 'closed', 'try read');
+    expect(failedStatus($s->write('x', ms(100))) == 'closed', 'write');
+    expect(failed($s->tryWrite('x')) == 'closed', 'try write');
+    expect(failed($s->tryWrite('a', 'b')) == 'closed', 'gathered try write');
+    expect(failedStatus($s->shutdown(.write)) == 'closed', 'shutdown');
+    expect(failedStatus($s->finish(ms(100))) == 'closed', 'finish');
+    expect(failedStatus($s->noDelay(true)) == 'closed', 'an option');
+    expect(failedStatus($s->keepAlive(null)) == 'closed', 'keepalive');
+    expect(failedStatus($s->buffers(send: 65536, receive: 0)) == 'closed', 'buffers');
+    expect(failedStatus(tcp::readAll($s, $got, ms(100))) == 'closed', 'read all');
+    expect(failedStatus(tcp::readExactly($s, $got, 1, ms(100))) == 'closed', 'read exactly');
+    expect(frameFailed(tcp::frame::Reader(max: 16)->read($s, ms(100))) == 'transport:closed', 'a frame read');
+    expect(frameFailedStatus(tcp::frame::write($s, 'x', ms(100))) == 'transport:closed', 'a frame write');
+}
+
+test tcp_calls_for_nothing_answer_at_once
+{
+    tcp::StreamPair $pair = connectedPair();
+    string $got = '';
+    usize? $none = guard $pair->server->tryRead($got, 0) else ($e) {
+        die("a read of nothing: {$e}");
+    }
+    assert(($none ?? 1) == 0, 'a read of zero bytes reads zero');
+    guard tcp::readExactly($pair->server, $got, 0, tcp::Deadline::now()) else ($e) {
+        die("read exactly nothing: {$e}");
+    }
+    usize? $past = guard $pair->server->tryWrite('abc', 3) else ($e) {
+        die("a try write past the end: {$e}");
+    }
+    assert(($past ?? 1) == 0, 'an offset at the end sends nothing');
+    usize? $beyond = guard $pair->server->tryWrite('ab', 'cd', 9) else ($e) {
+        die("a gathered try write past the end: {$e}");
+    }
+    assert(($beyond ?? 1) == 0, 'so does one beyond it');
+    assert($got->empty(), 'and none of it touched the buffer');
+}
+
+test tcp_finish_drains_a_read_side_shut_already
+{
+    // the drain is finish's own: a read shutdown keeps the caller from reading, not finish
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $client = $pair->client;
+    tcp::Stream $server = $pair->server;
+    guard $client->shutdown(.read) else ($e) {
+        die("shutdown: {$e}");
+    }
+    thread::task<int64> $peer = guard thread::spawn(function() : int64 {
+        send($server, 'unwanted');
+        thread::sleep(100);
+        send($server, 'more');
+        string $rest = readToEnd($server, 5000);
+        $server->close();
+        return $rest->size() as int64;
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    time::instant $t = time::instant::now();
+    guard $client->finish(ms(5000)) else ($e) {
+        die("finish: {$e}");
+    }
+    int64 $waited = elapsedMs($t);
+    expect($waited >= 50, "finish drained until the peer closed, not {$waited} ms");
+    expect($peer->wait() == 0, 'the peer saw a clean end, not a reset');
+}

@@ -1,0 +1,292 @@
+/**
+ * Readiness, for a reactor that serves many connections from one thread: register streams and
+ * listeners with a `Poller`, wait for some to be ready, then call their try methods until they
+ * answer null. epoll on Linux, kqueue on macOS, wepoll (AFD) on Windows.
+ *
+ * Level or oneshot, never edge-triggered: Windows has no edge mode, so the portable surface does
+ * not either. A handle registered with a poller is driven with the try calls only.
+ */
+
+namespace tcp;
+
+/**
+ * Something a `Poller` can watch.
+ */
+public interface Pollable
+{
+    /**
+     * The OS handle behind it. Valid while the owner is open; once it is closed the number may
+     * belong to something else.
+     */
+    const function handle() : int64;
+
+    /**
+     * True once the owner is closed, and `handle` names nothing of its own any more. A poller
+     * refuses it then instead of touching a number that may be another socket's by now.
+     */
+    const function closed() : bool;
+
+    /**
+     * What to watch the handle for so that what the caller wants (`$want`, null for nothing) can
+     * make progress. A plain socket answers `$want`. A layer over one (TLS) may need more: write
+     * readiness to send a handshake or the ciphertext a read produced, read readiness to finish
+     * a handshake before it can write.
+     */
+    const function needs(Interest? $want) : Interest?;
+}
+
+public enum Interest
+{
+    case read;
+    case write;
+    case both;
+}
+
+public enum Trigger
+{
+    /**
+     * Report the handle on every wait while it stays ready.
+     */
+    case level;
+
+    /**
+     * Report it once, then stay quiet until `modify` arms it again. The way to hand one
+     * connection to one worker at a time.
+     */
+    case oneshot;
+}
+
+/**
+ * One ready handle, by the token it was registered with. Laid out as the C `tcp_event`, so a
+ * wait writes straight into the caller's array: no copy, and no allocation once it has room.
+ */
+public struct Event
+{
+    public const uint64 $token;
+    // written by the C backend, never by Echo: not const, so a read is never folded to the default
+    private uint32 $flags = 0;
+    private uint32 $pad = 0;
+
+    public const function readable() : bool
+    {
+        return ($this->flags & (TCP_EV_READ as uint32)) != 0;
+    }
+
+    public const function writable() : bool
+    {
+        return ($this->flags & (TCP_EV_WRITE as uint32)) != 0;
+    }
+
+    /**
+     * The peer closed or the connection broke; a read will say which.
+     */
+    public const function hangup() : bool
+    {
+        return ($this->flags & (TCP_EV_HANGUP as uint32)) != 0;
+    }
+
+    public const function error() : bool
+    {
+        return ($this->flags & (TCP_EV_ERROR as uint32)) != 0;
+    }
+
+    /**
+     * Another thread called `Poller::wake`. The wake is already used up: the next wait sleeps
+     * again until something else is ready or someone wakes it once more.
+     */
+    public const function woken() : bool
+    {
+        return $this->token == POLL_WAKE;
+    }
+}
+
+// the token the poller's own waker is registered with; `add` refuses it
+internal const uint64 POLL_WAKE = 0xFFFFFFFFFFFFFFFF;
+
+/**
+ * Waits for many handles at once. Every poller carries a waker of its own, so any thread can
+ * end a wait with `wake`.
+ */
+#[atomic]
+public class Poller
+{
+    private const int64 $fd;
+    private Waker $waker;
+
+    internal constructor(int64 $fd, Waker $waker)
+    {
+        $this->fd = $fd;
+        $this->waker = $waker;
+    }
+
+    destructor()
+    {
+        tcp_poll_close($this->fd);
+    }
+
+    public static function open() : result<Poller, Error>
+    {
+        Waker $waker = guard Waker::open() else ($e) {
+            return .error($e);
+        }
+        tcp_err $err = tcp_err();
+        int64 $fd = tcp_poll_open(&$err);
+        if ($fd < 0) {
+            return .error(failure(.poll, $err));
+        }
+
+        Poller $p = Poller($fd, $waker);
+        guard $p->control(TCP_POLL_ADD, $waker->handle(), POLL_WAKE, .read, .level) else ($e) {
+            return .error($e);
+        }
+        return .ok($p);
+    }
+
+    /**
+     * Watch `$source`; its events come back with `$token`. Remove it before closing it. The
+     * largest `uint64` is the poller's own and is refused, and so is a closed source (`.closed`).
+     */
+    public function add<T : Pollable>(const T& $source, uint64 $token, Interest $interest, Trigger $trigger = .level) : status<Error>
+    {
+        if ($token == POLL_WAKE) {
+            return .error(.invalid('token 0xFFFFFFFFFFFFFFFF is reserved for the poller wake'));
+        }
+        if ($source->closed()) {
+            return .error(.closed);
+        }
+        return $this->control(TCP_POLL_ADD, $source->handle(), $token, $interest, $trigger);
+    }
+
+    /**
+     * Change what `$source` is watched for, or arm a oneshot registration again.
+     */
+    public function modify<T : Pollable>(const T& $source, uint64 $token, Interest $interest, Trigger $trigger = .level) : status<Error>
+    {
+        if ($token == POLL_WAKE) {
+            return .error(.invalid('token 0xFFFFFFFFFFFFFFFF is reserved for the poller wake'));
+        }
+        if ($source->closed()) {
+            return .error(.closed);
+        }
+        return $this->control(TCP_POLL_MODIFY, $source->handle(), $token, $interest, $trigger);
+    }
+
+    /**
+     * End a wait from any thread: the wait in progress, or the next one if none is. Several
+     * wakes before a wait sees them are one wake.
+     */
+    public function wake() : void
+    {
+        $this->waker->wake();
+    }
+
+    /**
+     * Stop watching `$source`. `.closed` for a source closed already: the OS dropped its
+     * registration with the handle, and the number may belong to another socket by now, whose
+     * registration this must not take away.
+     */
+    public function remove<T : Pollable>(const T& $source) : status<Error>
+    {
+        if ($source->closed()) {
+            return .error(.closed);
+        }
+        return $this->control(TCP_POLL_REMOVE, $source->handle(), 0, .read, .level);
+    }
+
+    /**
+     * Wait until something is ready, the deadline passes, or another thread calls `wake`, and
+     * put what is ready in `$out` (emptied first). A wake is an event of its own, `woken()`, and
+     * is used up by the wait that reports it. Still empty means the deadline passed. Keep one
+     * `$out` across waits: its room is reused, so a wait allocates nothing after the first.
+     */
+    public function wait(array<Event>& $out, Deadline $by) : status<Error>
+    {
+        $out->clear();
+        if ($out->room() < (TCP_POLL_BATCH as usize)) {
+            $out->reserve(TCP_POLL_BATCH as usize);
+        }
+        tcp_err $err = tcp_err();
+        int32 $n = tcp_poll_wait($this->fd, $out->spare(), TCP_POLL_BATCH, $by->ms(), &$err);
+        if ($n < 0) {
+            return .error(failure(.poll, $err));
+        }
+
+        $out->commit($n as usize);
+        foreach ($out as $ev) {
+            if ($ev->woken()) {
+                $this->waker->reset();
+                break;
+            }
+        }
+        return .ok;
+    }
+
+    private function control(int32 $op, int64 $handle, uint64 $token, Interest $interest, Trigger $trigger) : status<Error>
+    {
+        tcp_err $err = tcp_err();
+        if (tcp_poll_ctl($this->fd, $op, $handle, $token, $interest->wire(), $trigger->wire(), &$err) < 0) {
+            return .error(failure(.poll, $err));
+        }
+        return .ok;
+    }
+}
+
+/**
+ * A handle another thread can make readable, to stop a `Poller` waiting. Each poller owns one,
+ * registered under `POLL_WAKE`, and resets it in the wait that reports it.
+ */
+#[atomic]
+internal class Waker
+{
+    private const int64 $wake;
+
+    internal constructor(int64 $wake)
+    {
+        $this->wake = $wake;
+    }
+
+    destructor()
+    {
+        tcp_wake_close($this->wake);
+    }
+
+    public static function open() : result<Waker, Error>
+    {
+        tcp_err $err = tcp_err();
+        int64 $w = tcp_wake_open(&$err);
+        if ($w == TCP_ERR) {
+            return .error(failure(.wake, $err));
+        }
+        return .ok(Waker($w));
+    }
+
+    /**
+     * Make it readable. Safe from any thread; waking it twice before a reset is one wake.
+     */
+    public function wake() : void
+    {
+        tcp_wake_signal($this->wake);
+    }
+
+    /**
+     * Make it quiet again.
+     */
+    public function reset() : void
+    {
+        tcp_wake_drain($this->wake);
+    }
+
+    /**
+     * Wait until it is signalled or the deadline passes: true when signalled. It stays
+     * signalled; `reset` makes it quiet.
+     */
+    public function wait(Deadline $by) : bool
+    {
+        return tcp_wake_wait($this->wake, $by->ms()) == 1;
+    }
+
+    public const function handle() : int64
+    {
+        return tcp_wake_handle($this->wake);
+    }
+}

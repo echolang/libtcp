@@ -1,0 +1,115 @@
+/**
+ * The bytes a reactor owes one connection. A try write takes what the socket has room for, and
+ * the rest waits here, with its offset, until the stream reports writable again.
+ */
+
+namespace tcp;
+
+public class Outbox
+{
+    private string $queue;
+    // how much of $queue went out already
+    private usize $sent;
+    // the sink still held bytes of its own after the last flush (a TLS layer's ciphertext)
+    private bool $held;
+
+    public constructor()
+    {
+        $this->queue = '';
+        $this->sent = 0;
+        $this->held = false;
+    }
+
+    /**
+     * Queue `$bytes` behind whatever is waiting.
+     */
+    public function push(const string& $bytes) : void
+    {
+        $this->queue->append($bytes);
+    }
+
+    /**
+     * Queue `$head` then `$body`, one after the other.
+     */
+    public function push(const string& $head, const string& $body) : void
+    {
+        $this->queue->append($head);
+        $this->queue->append($body);
+    }
+
+    /**
+     * Send what the socket takes without waiting. What does not fit stays queued for the next
+     * flush, which picks up where this one stopped. A sink that holds bytes of its own (a TLS
+     * layer) is flushed first, and again after.
+     */
+    public function flush<S : Sink>(S $dst) : status<Error>
+    {
+        bool $clear = guard $dst->tryFlush() else ($e) {
+            return .error($e);
+        }
+        if (!$clear) {
+            // what the sink holds goes first: anything written behind it would wait anyway
+            $this->held = true;
+            return .ok;
+        }
+
+        while ($this->sent < $this->queue->size()) {
+            usize? $put = guard $dst->tryWrite($this->queue, $this->sent) else ($e) {
+                return .error($e);
+            }
+            usize $n = guard $put else {
+                break;
+            }
+            $this->sent = $this->sent + $n;
+        }
+
+        if ($this->sent == $this->queue->size()) {
+            // all out: the buffer stays, empty, for the next push
+            $this->queue->clear();
+            $this->sent = 0;
+        } else if ($this->sent > 0 && $this->sent * 2 >= $this->queue->size()) {
+            // most of it went: move the rest to a buffer of its own, so the sent part is freed
+            $this->queue = $this->queue->sub($this->sent, $this->queue->size() - $this->sent)->clone();
+            $this->sent = 0;
+        }
+
+        bool $drained = guard $dst->tryFlush() else ($e) {
+            return .error($e);
+        }
+        $this->held = !$drained;
+        return .ok;
+    }
+
+    /**
+     * Bytes queued and not sent yet.
+     */
+    public const function pending() : usize
+    {
+        return $this->queue->size() - $this->sent;
+    }
+
+    public const function empty() : bool
+    {
+        return $this->sent == $this->queue->size();
+    }
+
+    /**
+     * What to watch `$on` for: `.read` while `$reading` and nothing is owed, `.both` or `.write`
+     * while bytes are owed (queued here, or held by the sink after the last flush), null once
+     * there is nothing left to read or send and the connection is done. `$on` has the last word
+     * (`Pollable::needs`), so a TLS layer mid-handshake gets what it needs too.
+     */
+    public const function interest<T : Pollable>(const T& $on, reading: bool $reading) : Interest?
+    {
+        Interest? $want = null;
+        if (!$this->empty() || $this->held) {
+            $want = Interest::write;
+            if ($reading) {
+                $want = Interest::both;
+            }
+        } else if ($reading) {
+            $want = Interest::read;
+        }
+        return $on->needs($want);
+    }
+}

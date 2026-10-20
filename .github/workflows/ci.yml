@@ -26,3 +26,7 @@ jobs:
 
       - name: Build and test
         run: echoc test
+
+      - name: Run the reactor example
+        working-directory: examples/reactor
+        run: echoc run

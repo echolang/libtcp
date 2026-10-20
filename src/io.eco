@@ -1,0 +1,98 @@
+/**
+ * What a byte stream offers, so the layers above it (frames today, TLS or a test double
+ * tomorrow) take any of them, not one concrete socket. What a `Poller` watches is `Pollable`, in
+ * src/poll.eco. `readExactly` and `readAll` are the reads composed from `Source::read`.
+ */
+
+namespace tcp;
+
+/**
+ * Bytes coming in.
+ */
+public interface Source
+{
+    /**
+     * Append at most `$most` bytes onto `$into`: how many arrived, or null when the deadline
+     * passed first (nothing lost; call again). `.eof` once the peer has closed.
+     */
+    function read(string& $into, usize $most, Deadline $by) : result<usize?, Error>;
+
+    /**
+     * Append whatever is already here, at most `$most` bytes, without waiting: how many, or null
+     * when there is nothing yet. For a reactor.
+     */
+    function tryRead(string& $into, usize $most) : result<usize?, Error>;
+}
+
+/**
+ * Bytes going out.
+ */
+public interface Sink
+{
+    /**
+     * Send every byte of `$bytes` before the deadline.
+     */
+    function write(const string& $bytes, Deadline $by) : status<Error>;
+
+    /**
+     * Send `$head` then `$body` as one gathered write, so a small head never travels alone.
+     */
+    function write(const string& $head, const string& $body, Deadline $by) : status<Error>;
+
+    /**
+     * Send what fits of `$bytes` from `$from` on without waiting: how many bytes went, or null
+     * when nothing could. For a reactor, which keeps the offset.
+     */
+    function tryWrite(const string& $bytes, usize $from) : result<usize?, Error>;
+
+    /**
+     * Send what the sink holds of its own without waiting (a TLS layer: ciphertext its last
+     * `tryWrite` could not hand to the socket): true once it holds nothing. A plain socket holds
+     * nothing and answers true.
+     */
+    function tryFlush() : result<bool, Error>;
+}
+
+/**
+ * Append exactly `$n` bytes from `$src` onto `$into`, all of it before the one deadline.
+ * `.timeout` when the deadline passes first and `.eof` when the peer closes first; either way
+ * the bytes that did arrive stay in `$into`.
+ */
+public function readExactly<S : Source>(S $src, string& $into, usize $n, Deadline $by) : status<Error>
+{
+    usize $want = $into->size() + $n;
+    while ($into->size() < $want) {
+        usize? $got = guard $src->read($into, $want - $into->size(), $by) else ($e) {
+            return .error($e);
+        }
+        if ($got == null) {
+            return .error(.timeout);
+        }
+    }
+    return .ok;
+}
+
+/**
+ * Append everything `$src` sends onto `$into` until the peer closes, before the deadline.
+ * `.timeout` when the deadline passes first, with what did arrive in `$into`.
+ */
+public function readAll<S : Source>(S $src, string& $into, Deadline $by) : status<Error>
+{
+    while (true) {
+        result<usize?, Error> $got = $src->read($into, 65536, $by);
+        if (!$got->has_value()) {
+            Error $e = $got->failure();
+            bool $ended = match ($e) {
+                Error::eof => true,
+                else => false,
+            };
+            if ($ended) {
+                return .ok;
+            }
+            return .error($e);
+        }
+        if ($got->unwrap() == null) {
+            return .error(.timeout);
+        }
+    }
+}

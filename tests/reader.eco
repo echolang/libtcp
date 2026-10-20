@@ -1,0 +1,423 @@
+/**
+ * tcp::Reader and tcp::wire: lines and fixed-size messages without I/O, then over real sockets
+ * (blocking and pulled), the limits and ends of a conversation, and a small RESP exchange with a
+ * fake Redis, the shape a database client takes.
+ */
+
+use std::thread;
+use std::time;
+
+/**
+ * The next message before `$delim` off `$s`, or a death sentence.
+ */
+internal function line(tcp::Reader $r, tcp::Stream $s, const string& $delim) : string
+{
+    string? $got = guard $r->until($s, $delim, ms(5000)) else ($e) {
+        die("until: {$e}");
+    }
+    string $text = guard $got else {
+        die('no line within 5 s');
+    }
+    return $text;
+}
+
+/**
+ * What a `result<string?, tcp::Error>` holds, as a word: the string, `null`, or the error's name.
+ */
+internal function said(result<string?, tcp::Error> $r) : string
+{
+    if (!$r->has_value()) {
+        tcp::Error $e = $r->failure();
+        return $e->name();
+    }
+    string? $maybe = $r->unwrap();
+    string $text = guard $maybe else {
+        return 'null';
+    }
+    return $text;
+}
+
+test tcp_wire_round_trips_every_width
+{
+    string $b = '';
+    tcp::wire::putBe16($b, 0x1234);
+    tcp::wire::putBe32($b, 0xDEADBEEF);
+    tcp::wire::putBe64($b, 0x0102030405060708);
+    tcp::wire::putLe16($b, 0x1234);
+    tcp::wire::putLe24($b, 0xABCDEF);
+    tcp::wire::putLe32($b, 0xDEADBEEF);
+    tcp::wire::putLe64($b, 0x0102030405060708);
+    assert($b->size() == 2 + 4 + 8 + 2 + 3 + 4 + 8, 'every byte written');
+
+    assert(tcp::wire::be16($b, 0) == 0x1234, 'be16');
+    assert(tcp::wire::be32($b, 2) == 0xDEADBEEF, 'be32');
+    assert(tcp::wire::be64($b, 6) == 0x0102030405060708, 'be64');
+    assert(tcp::wire::le16($b, 14) == 0x1234, 'le16');
+    assert(tcp::wire::le24($b, 16) == 0xABCDEF, 'le24');
+    assert(tcp::wire::le32($b, 19) == 0xDEADBEEF, 'le32');
+    assert(tcp::wire::le64($b, 23) == 0x0102030405060708, 'le64');
+
+    // the byte order on the wire, not just a round trip
+    assert($b->byte(0) == 0x12 && $b->byte(1) == 0x34, 'big end first');
+    assert($b->byte(14) == 0x34 && $b->byte(15) == 0x12, 'little end first');
+}
+
+test tcp_a_reader_splits_lines_without_io
+{
+    tcp::Reader $r = tcp::Reader();
+    $r->feed("PING\r\n+OK\r");
+    assert(said($r->until("\r\n")) == 'PING', 'the first line');
+    // the delimiter is half here: not a line yet
+    assert(said($r->until("\r\n")) == 'null', 'half a delimiter is no line');
+    $r->feed("\n\r\n");
+    assert(said($r->until("\r\n")) == '+OK', 'the delimiter completed across feeds');
+    assert(said($r->until("\r\n")) == '', 'an empty line is a line');
+    assert($r->buffered() == 0, 'every byte consumed');
+}
+
+test tcp_a_reader_takes_fixed_sizes_and_peeks
+{
+    tcp::Reader $r = tcp::Reader();
+    $r->feed('abcdef');
+    string? $none = $r->peek(7);
+    assert($none == null, 'no peek past what is buffered');
+    string $head = guard $r->peek(2);
+    assert($head == 'ab', 'peek');
+    assert($r->buffered() == 6, 'peek consumes nothing');
+    assert($r->byte(2) == 99, 'byte');
+    usize $at = guard $r->find('de');
+    assert($at == 3, 'find is relative to the read position');
+    $r->skip(1);
+    string $two = guard $r->take(2);
+    assert($two == 'bc', 'take after skip');
+    string? $nothing = $r->take(4);
+    assert($nothing == null, 'no take past what is buffered');
+    assert($r->rest() == 'def', 'rest hands over everything left');
+    assert($r->buffered() == 0, 'and consumes it');
+}
+
+test tcp_a_reader_refuses_a_message_over_its_max
+{
+    tcp::Reader $r = tcp::Reader(max: 8);
+    $r->feed('0123456789');
+    assert(said($r->until("\r\n")) == 'tooLarge', 'a line longer than max');
+    assert(said($r->exactly(9)) == 'tooLarge', 'an exact size over max');
+    assert(said($r->exactly(8)) == '01234567', 'max itself is fine');
+
+    tcp::Reader $ok = tcp::Reader(max: 4);
+    $ok->feed("abcd\r");
+    // four bytes and half a delimiter: the line may still end at max
+    assert(said($ok->until("\r\n")) == 'null', 'a line of max bytes is still coming');
+    $ok->feed("\n");
+    assert(said($ok->until("\r\n")) == 'abcd', 'and it fits');
+}
+
+test tcp_a_mysql_style_header_parses_with_peek_and_wire
+{
+    // a MySQL packet: a 3-byte little-endian length, a sequence byte, then the payload
+    string $wire = '';
+    tcp::wire::putLe24($wire, 5);
+    $wire->push(0);
+    $wire->append('hello');
+    tcp::wire::putLe24($wire, 3);
+    $wire->push(1);
+    $wire->append('abc');
+
+    tcp::Reader $r = tcp::Reader();
+    $r->feed($wire);
+    array<string> $got = array<string>();
+    while (true) {
+        string $head = guard $r->peek(4) else {
+            break;
+        }
+        usize $len = tcp::wire::le24($head) as usize;
+        if ($r->buffered() < 4 + $len) {
+            break;
+        }
+        uint8 $seq = $head->byte(3);
+        $r->skip(4);
+        string $payload = guard $r->take($len);
+        $got[] = "{$seq}:{$payload}";
+    }
+    assert($got->count() == 2, 'two packets');
+    assert($got[0] == '0:hello', 'the first');
+    assert($got[1] == '1:abc', 'the second');
+}
+
+test tcp_a_delimiter_split_across_reads_is_found
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $writer = $pair->client;
+    thread::task<string> $sender = guard thread::spawn(function() : string {
+        array<string> $parts = array<string>();
+        $parts[] = 'hel';
+        $parts[] = "lo\r";
+        $parts[] = "\nwor";
+        $parts[] = "ld\r\n";
+        foreach ($parts as $p) {
+            guard $writer->write($p, ms(5000)) else ($e) {
+                return "write: {$e}";
+            }
+            thread::sleep(20);
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Reader $r = tcp::Reader();
+    assert(line($r, $pair->server, "\r\n") == 'hello', 'the first line');
+    assert(line($r, $pair->server, "\r\n") == 'world', 'the second line');
+    expect($sender->wait() == 'ok', 'sent');
+}
+
+test tcp_exactly_waits_for_every_byte_across_reads
+{
+    tcp::StreamPair $pair = connectedPair();
+    usize $size = 300 * 1000;
+    tcp::Stream $writer = $pair->client;
+    thread::task<string> $sender = guard thread::spawn(function() : string {
+        string $all = pattern($size);
+        usize $off = 0;
+        while ($off < $size) {
+            usize $n = 7000;
+            if ($size - $off < $n) {
+                $n = $size - $off;
+            }
+            guard $writer->write($all->sub($off, $n), ms(5000)) else ($e) {
+                return "write: {$e}";
+            }
+            $off = $off + $n;
+        }
+        return 'ok';
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Reader $r = tcp::Reader();
+    string? $got = guard $r->exactly($pair->server, $size, ms(5000)) else ($e) {
+        die("exactly: {$e}");
+    }
+    string $body = guard $got else {
+        die('not all within 5 s');
+    }
+    expect($sender->wait() == 'ok', 'sent');
+    expect($body->size() == $size, "{$body->size()} of {$size} bytes");
+    assert(firstDiff($body, pattern($size)) == -1, 'byte for byte');
+}
+
+test tcp_a_deadline_keeps_a_partial_message
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'abc');
+    tcp::Reader $r = tcp::Reader();
+    result<string?, tcp::Error> $short = $r->exactly($pair->server, 5, ms(50));
+    assert(said($short) == 'null', 'the deadline passed first');
+    assert($r->buffered() == 3, 'what arrived is kept');
+    send($pair->client, 'de');
+    string? $got = guard $r->exactly($pair->server, 5, ms(5000)) else ($e) {
+        die("exactly: {$e}");
+    }
+    string $all = guard $got;
+    assert($all == 'abcde', 'the rest joins it');
+}
+
+test tcp_the_peer_closing_is_eof_with_the_partial_kept
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, "x\r\nabc");
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    tcp::Reader $r = tcp::Reader();
+    assert(line($r, $pair->server, "\r\n") == 'x', 'the whole line before the close');
+    result<string?, tcp::Error> $cut = $r->until($pair->server, "\r\n", ms(5000));
+    assert(said($cut) == 'eof', 'a line the close cut short');
+    assert($r->buffered() == 3, 'its bytes stay buffered');
+    assert($r->ended(), 'the reader knows the peer is done');
+    // no read after the end: it answers at once
+    assert(said($r->exactly($pair->server, 10, ms(5000))) == 'eof', 'eof again');
+}
+
+test tcp_pulled_lines_come_out_without_waiting
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Reader $r = tcp::Reader();
+    assert(said($r->pullUntil($pair->server, "\n")) == 'null', 'nothing yet is null');
+
+    send($pair->client, "a\nb\nc");
+    thread::sleep(50);
+    assert(said($r->pullUntil($pair->server, "\n")) == 'a', 'the first');
+    assert(said($r->pullUntil($pair->server, "\n")) == 'b', 'the second');
+    assert(said($r->pullUntil($pair->server, "\n")) == 'null', 'half a line waits');
+
+    send($pair->client, "\n");
+    guard $pair->client->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    thread::sleep(50);
+    // the line that came with the close still comes out first
+    assert(said($r->pullUntil($pair->server, "\n")) == 'c', 'the last line');
+    assert(said($r->pullUntil($pair->server, "\n")) == 'eof', 'then the end');
+}
+
+test tcp_pulled_fixed_sizes_come_out_without_waiting
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Reader $r = tcp::Reader();
+    send($pair->client, 'abcdefg');
+    thread::sleep(50);
+    assert(said($r->pullExactly($pair->server, 3)) == 'abc', 'the first');
+    assert(said($r->pullExactly($pair->server, 3)) == 'def', 'the second');
+    assert(said($r->pullExactly($pair->server, 3)) == 'null', 'one byte is not three');
+    assert($r->buffered() == 1, 'and it stays');
+}
+
+/**
+ * One RESP reply off `$s`: a simple string as itself, a bulk string as its bytes, nil as `nil`.
+ */
+internal function reply(tcp::Reader $r, tcp::Stream $s) : string
+{
+    string $head = line($r, $s, "\r\n");
+    uint8 $kind = $head->byte(0);
+    string $rest = $head->sub(1, $head->size() - 1);
+    // '+' a simple string, '$' a bulk string
+    if ($kind == 43) {
+        return $rest;
+    }
+    if ($kind != 36) {
+        die("unexpected reply: {$head}");
+    }
+    int64 $n = guard str::int($rest) else {
+        die("bad bulk length: {$rest}");
+    }
+    if ($n < 0) {
+        return 'nil';
+    }
+    string? $got = guard $r->exactly($s, ($n + 2) as usize, ms(5000)) else ($e) {
+        die("bulk: {$e}");
+    }
+    string $bulk = guard $got else {
+        die('no bulk within 5 s');
+    }
+    return $bulk->sub(0, $n as usize);
+}
+
+/**
+ * A command as a RESP array of bulk strings.
+ */
+internal function command(const array<string>& $words) : string
+{
+    string $out = "*{$words->count()}\r\n";
+    foreach ($words as $w) {
+        $out->append('$');
+        $out->append("{$w->size()}\r\n");
+        $out->append($w);
+        $out->append("\r\n");
+    }
+    return $out;
+}
+
+test tcp_a_resp_client_talks_to_a_fake_redis
+{
+    tcp::StreamPair $pair = connectedPair();
+    tcp::Stream $server = $pair->server;
+
+    // the fake: reads commands as arrays of bulk strings, answers PING, SET and GET
+    thread::task<string> $redis = guard thread::spawn(function() : string {
+        tcp::Reader $in = tcp::Reader();
+        map<string, string> $store = map<string, string>();
+        while (true) {
+            result<string?, tcp::Error> $head = $in->until($server, "\r\n", ms(5000));
+            if (!$head->has_value()) {
+                tcp::Error $e = $head->failure();
+                if ($e->name() == 'eof') {
+                    return 'ok';
+                }
+                return "head: {$e}";
+            }
+            string? $maybe = $head->unwrap();
+            string $count = guard $maybe else {
+                return 'no command within 5 s';
+            }
+            int64 $n = guard str::int($count->sub(1, $count->size() - 1)) else {
+                return "bad count: {$count}";
+            }
+            array<string> $words = array<string>();
+            int64 $i = 0;
+            while ($i < $n) {
+                string? $lenLine = guard $in->until($server, "\r\n", ms(5000)) else ($e) {
+                    return "len: {$e}";
+                }
+                string $lenText = guard $lenLine else {
+                    return 'no length';
+                }
+                int64 $len = guard str::int($lenText->sub(1, $lenText->size() - 1)) else {
+                    return "bad length: {$lenText}";
+                }
+                string? $word = guard $in->exactly($server, ($len + 2) as usize, ms(5000)) else ($e) {
+                    return "word: {$e}";
+                }
+                string $w = guard $word else {
+                    return 'no word';
+                }
+                $words[] = $w->sub(0, $len as usize);
+                $i = $i + 1;
+            }
+
+            string $answer = "-ERR unknown\r\n";
+            if ($words[0] == 'PING') {
+                $answer = "+PONG\r\n";
+            } else if ($words[0] == 'SET') {
+                $store[$words[1]] = $words[2];
+                $answer = "+OK\r\n";
+            } else if ($words[0] == 'GET') {
+                $answer = "$-1\r\n";
+                if ($store->has($words[1])) {
+                    string $value = $store[$words[1]];
+                    $answer = '$';
+                    $answer->append("{$value->size()}\r\n{$value}\r\n");
+                }
+            }
+            guard $server->write($answer, ms(5000)) else ($e) {
+                return "answer: {$e}";
+            }
+        }
+    }) else ($e) {
+        die('spawn failed');
+    }
+
+    tcp::Stream $c = $pair->client;
+    tcp::Reader $r = tcp::Reader();
+    array<string> $ping = array<string>();
+    $ping[] = 'PING';
+    array<string> $set = array<string>();
+    $set[] = 'SET';
+    $set[] = 'greeting';
+    $set[] = "hello\r\nworld";
+    array<string> $get = array<string>();
+    $get[] = 'GET';
+    $get[] = 'greeting';
+    array<string> $miss = array<string>();
+    $miss[] = 'GET';
+    $miss[] = 'nothing';
+
+    // pipelined: all four commands in one write, then the four replies in order
+    string $batch = command($ping);
+    $batch->append(command($set));
+    $batch->append(command($get));
+    $batch->append(command($miss));
+    send($c, $batch);
+
+    assert(reply($r, $c) == 'PONG', 'ping');
+    assert(reply($r, $c) == 'OK', 'set');
+    // a bulk string may hold the line delimiter itself
+    assert(reply($r, $c) == "hello\r\nworld", 'get');
+    assert(reply($r, $c) == 'nil', 'a missing key');
+
+    guard $c->shutdown(.write) else ($e) {
+        die("shutdown: {$e}");
+    }
+    string $done = $redis->wait();
+    expect($done == 'ok', "the fake: {$done}");
+}
