@@ -370,7 +370,8 @@ public class Stream : Source, Sink, Pollable
                 $this->close();
                 return .ok;
             }
-            if ($got->unwrap() == null) {
+            // a peer that never stops sending would keep every read busy: the deadline still ends it
+            if ($got->unwrap() == null || $by->passed()) {
                 $this->close();
                 return .error(.timeout);
             }
@@ -596,12 +597,22 @@ public class Stream : Source, Sink, Pollable
             return .error(.closed);
         }
 
-        if ($into->room() < $most) {
-            $into->reserve($into->size() + $most);
+        // a read grows the buffer by READ_BIG at most: a length a peer announced never turns into
+        // one allocation, and C is never told of more room than the buffer has
+        usize $grow = $most;
+        if ($grow > READ_BIG) {
+            $grow = READ_BIG;
+        }
+        if ($into->room() < $grow) {
+            $into->reserve($into->size() + $grow);
+        }
+        usize $ask = $most;
+        if ($ask > $into->room()) {
+            $ask = $into->room();
         }
         tcp_err $err = tcp_err();
         Deadline $until = guard $by else {
-            int64 $now = tcp_try_recv($this->fd, $into->spare(), $most as int64, &$err);
+            int64 $now = tcp_try_recv($this->fd, $into->spare(), $ask as int64, &$err);
             bool $shut = $this->leave();
             return $this->received($into, $now, $err, TCP_AGAIN, $shut);
         }
@@ -612,12 +623,12 @@ public class Stream : Source, Sink, Pollable
         // poll a blocking read starts with. Most reads come after a request sent, when nothing is
         // there yet, and for those the poll first is the cheaper order
         if ($more) {
-            $got = tcp_try_recv($this->fd, $into->spare(), $most as int64, &$err);
+            $got = tcp_try_recv($this->fd, $into->spare(), $ask as int64, &$err);
         }
         if ($got == TCP_AGAIN) {
-            $got = tcp_recv($this->fd, $into->spare(), $most as int64, $until->ms(), &$err);
+            $got = tcp_recv($this->fd, $into->spare(), $ask as int64, $until->ms(), &$err);
         }
-        bool $full = $got == ($most as int64);
+        bool $full = $got == ($ask as int64);
         if ($full != $more) {
             if ($full) {
                 $this->gate->mark(GATE_MORE);

@@ -141,6 +141,67 @@ test tcp_a_live_unix_listener_is_never_replaced
     $first->close();
 }
 
+test tcp_a_listener_leaves_a_file_another_put_on_its_path
+{
+    string $path = sockPath('theirs');
+    tcp::Listener $first = bindUnix($path);
+    // the first listener's file goes, and a second listener puts its own on the path
+    string $c = $path->clone();
+    tcp::tcp_file_id $id = tcp::tcp_file_id();
+    assert(tcp::tcp_socket_id($c->cstr(), &$id) == 0, 'the first file is a socket');
+    assert(tcp::tcp_unlink_socket($c->cstr(), &$id) == 0, 'and is removed');
+    tcp::Listener $second = bindUnix($path);
+
+    $first->close();
+    assert(present($path), 'the first listener leaves the second one its file');
+    tcp::Stream $client = connectUnix($path);
+    tcp::Stream $s = acceptOne($second);
+    assert($s->local == $second->local, 'the second listener still serves');
+    $second->close();
+    assert(!present($path), 'and removes its own file');
+}
+
+test tcp_a_socket_file_is_removed_only_by_its_identity
+{
+    string $path = sockPath('identity');
+    tcp::Listener $l = bindUnix($path);
+    string $c = $path->clone();
+    tcp::tcp_file_id $id = tcp::tcp_file_id();
+    assert(tcp::tcp_socket_id($c->cstr(), &$id) == 0, 'a socket file');
+    tcp::tcp_file_id $other = $id;
+    $other->ino = $other->ino + 1;
+    assert(tcp::tcp_unlink_socket($c->cstr(), &$other) < 0, 'another identity removes nothing');
+    assert(present($path), 'the file is still there');
+    $l->close();
+}
+
+#[if: os == linux]
+test tcp_a_busy_unix_listener_is_not_stale
+{
+    // Linux answers a connect to a full backlog with EAGAIN, not the refusal of a dead socket.
+    // macOS refuses both alike, so this holds on Linux alone (c/tcp.h, tcp_unlink_stale)
+    string $path = sockPath('busy');
+    tcp::ListenOptions $o = tcp::ListenOptions();
+    $o->backlog = 1;
+    tcp::Listener $first = guard tcp::Listener::bind(tcp::Address(unix: $path), $o) else ($e) {
+        die("bind: {$e}");
+    }
+    array<tcp::Stream> $queued = array<tcp::Stream>();
+    int32 $i = 0;
+    while ($i < 8) {
+        result<tcp::Stream, tcp::Error> $c = tcp::Stream::connect(tcp::Address(unix: $path), ms(200));
+        if ($c->has_value()) {
+            $queued[] = $c->unwrap();
+        }
+        $i = $i + 1;
+    }
+    string $why = failed(tcp::Listener::bind(tcp::Address(unix: $path)));
+    expect($why == 'addressInUse', "a second bind over a busy listener: {$why}");
+    assert(present($path), 'the busy listener keeps its file');
+    $first->close();
+}
+#[end]
+
 test tcp_a_plain_file_is_never_replaced
 {
     string $path = sockPath('plain');

@@ -102,6 +102,11 @@ public struct Deadline
         }
 
         time::duration $left = guard $rest;
+        // past INT32_MAX milliseconds anyway, and its milliseconds could overflow an int64 and
+        // come out as a wait that is short or forever
+        if ($left->as_secs() >= 2147484) {
+            return 2147483647;
+        }
         int64 $ms = $left->as_millis() as int64;
         if (time::duration::millis($ms) < $left) {
             $ms = $ms + 1;

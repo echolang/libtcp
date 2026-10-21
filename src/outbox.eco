@@ -7,34 +7,79 @@ namespace tcp;
 
 public class Outbox
 {
+    /**
+     * The most bytes owed at once. A push past it is refused, so a peer that sends requests and
+     * never reads the replies cannot make the outbox grow without end. Stop reading from the
+     * peer while `full()`, and go on once a flush has made room.
+     */
+    public const usize $limit;
     private string $queue;
     // how much of $queue went out already
     private usize $sent;
     // the sink still held bytes of its own after the last flush (a TLS layer's ciphertext)
     private bool $held;
 
-    public constructor()
+    public constructor(limit: usize $limit = 16777216)
     {
+        $this->limit = $limit;
         $this->queue = '';
         $this->sent = 0;
         $this->held = false;
     }
 
     /**
-     * Queue `$bytes` behind whatever is waiting.
+     * Queue `$bytes` behind whatever is waiting. `.tooLarge` with nothing queued when the bytes
+     * owed would pass `limit`.
      */
-    public function push(const string& $bytes) : void
+    public function push(const string& $bytes) : status<Error>
     {
+        guard $this->room($bytes->size()) else ($e) {
+            return .error($e);
+        }
         $this->queue->append($bytes);
+        return .ok;
     }
 
     /**
-     * Queue `$head` then `$body`, one after the other.
+     * Queue `$head` then `$body`, one after the other. `.tooLarge` with neither queued when the
+     * bytes owed would pass `limit`.
      */
-    public function push(const string& $head, const string& $body) : void
+    public function push(const string& $head, const string& $body) : status<Error>
     {
+        if ($body->size() > usize::max() - $head->size()) {
+            return .error(.tooLarge(usize::max() as uint64));
+        }
+        guard $this->room($head->size() + $body->size()) else ($e) {
+            return .error($e);
+        }
         $this->queue->append($head);
         $this->queue->append($body);
+        return .ok;
+    }
+
+    /**
+     * True while the bytes owed are at `limit`: stop reading from the peer until a flush makes
+     * room.
+     */
+    public const function full() : bool
+    {
+        return $this->pending() >= $this->limit;
+    }
+
+    /**
+     * `.tooLarge` unless `$n` more bytes fit under `limit`.
+     */
+    private const function room(usize $n) : status<Error>
+    {
+        usize $owed = $this->pending();
+        if ($owed > $this->limit || $n > $this->limit - $owed) {
+            usize $total = $owed + $n;
+            if ($n > usize::max() - $owed) {
+                $total = usize::max();
+            }
+            return .error(.tooLarge($total as uint64));
+        }
+        return .ok;
     }
 
     /**
@@ -58,6 +103,10 @@ public class Outbox
                 return .error($e);
             }
             usize $n = guard $put else {
+                break;
+            }
+            // a sink that took nothing made no progress: wait for writable, do not spin
+            if ($n == 0) {
                 break;
             }
             $this->sent = $this->sent + $n;

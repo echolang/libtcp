@@ -2,13 +2,26 @@
  * Fixed-width integers as wire protocols lay them out: big-endian (network order: frames,
  * Postgres) and little-endian (MySQL, most game protocols), read at an offset of a string and
  * appended onto one. A read expects the bytes to be there; check `size()` (or a reader's
- * `buffered()`) first.
+ * `buffered()`) first. One past the end stops the program, in a release build too.
  */
 
 namespace tcp::wire;
 
+/**
+ * Stops the program unless `$n` bytes of `$b` start at `$at`. A release build checks too: an
+ * offset or a length a peer sent, used unchecked, would otherwise read heap memory past the
+ * string as if it were the message.
+ */
+internal function need(const string& $b, usize $at, usize $n) : void
+{
+    if ($at > $b->size() || $b->size() - $at < $n) {
+        die("tcp::wire: {$n} bytes at {$at} of a string of {$b->size()}");
+    }
+}
+
 public function be16(const string& $b, usize $at = 0) : uint16
 {
+    need($b, $at, 2);
     uint16 $hi = $b->byte($at) as uint16;
     uint16 $lo = $b->byte($at + 1) as uint16;
     return ($hi << 8) | $lo;
@@ -16,6 +29,7 @@ public function be16(const string& $b, usize $at = 0) : uint16
 
 public function be32(const string& $b, usize $at = 0) : uint32
 {
+    need($b, $at, 4);
     uint32 $b0 = $b->byte($at) as uint32;
     uint32 $b1 = $b->byte($at + 1) as uint32;
     uint32 $b2 = $b->byte($at + 2) as uint32;
@@ -25,6 +39,7 @@ public function be32(const string& $b, usize $at = 0) : uint32
 
 public function be64(const string& $b, usize $at = 0) : uint64
 {
+    need($b, $at, 8);
     uint64 $hi = be32($b, $at) as uint64;
     uint64 $lo = be32($b, $at + 4) as uint64;
     return ($hi << 32) | $lo;
@@ -32,6 +47,7 @@ public function be64(const string& $b, usize $at = 0) : uint64
 
 public function le16(const string& $b, usize $at = 0) : uint16
 {
+    need($b, $at, 2);
     uint16 $lo = $b->byte($at) as uint16;
     uint16 $hi = $b->byte($at + 1) as uint16;
     return ($hi << 8) | $lo;
@@ -42,6 +58,7 @@ public function le16(const string& $b, usize $at = 0) : uint16
  */
 public function le24(const string& $b, usize $at = 0) : uint32
 {
+    need($b, $at, 3);
     uint32 $b0 = $b->byte($at) as uint32;
     uint32 $b1 = $b->byte($at + 1) as uint32;
     uint32 $b2 = $b->byte($at + 2) as uint32;
@@ -50,6 +67,7 @@ public function le24(const string& $b, usize $at = 0) : uint32
 
 public function le32(const string& $b, usize $at = 0) : uint32
 {
+    need($b, $at, 4);
     uint32 $low = le24($b, $at);
     uint32 $b3 = $b->byte($at + 3) as uint32;
     return ($b3 << 24) | $low;
@@ -57,6 +75,7 @@ public function le32(const string& $b, usize $at = 0) : uint32
 
 public function le64(const string& $b, usize $at = 0) : uint64
 {
+    need($b, $at, 8);
     uint64 $lo = le32($b, $at) as uint64;
     uint64 $hi = le32($b, $at + 4) as uint64;
     return ($hi << 32) | $lo;

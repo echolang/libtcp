@@ -108,10 +108,33 @@ int32_t tcp_addr_text(const tcp_addr *addr, char *buf, int32_t len);
 int32_t tcp_unix_path_max(void);
 
 /*
- * Remove a unix socket's file, but only when path is one (never a plain
- * file someone named the same): 0 when removed, -1 otherwise.
+ * A file's identity, which a new file on the same path never shares: device
+ * and inode on POSIX, volume serial and file index on Windows.
  */
-int32_t tcp_unlink_socket(const char *path);
+typedef struct tcp_file_id {
+    uint64_t dev;
+    uint64_t ino;
+} tcp_file_id;
+
+/* the identity of the unix socket file at path: 0, or -1 when path is not one */
+int32_t tcp_socket_id(const char *path, tcp_file_id *out);
+
+/*
+ * Remove a unix socket's file, but only when path is one (never a plain
+ * file someone named the same) and still the file id names (never one
+ * another listener put on the path since): 0 when removed, -1 otherwise.
+ */
+int32_t tcp_unlink_socket(const char *path, const tcp_file_id *id);
+
+/*
+ * Remove the unix socket file at path when nothing listens on it any more
+ * (its listener died and left it): 0 when removed, -1 otherwise. A live
+ * listener is left be, and so is any file that is not a socket. Where the
+ * OS refuses a connect to a live listener whose backlog is full exactly as
+ * to a dead one (macOS), such a listener reads as dead: its file is removed
+ * and its path taken, though it goes on serving the connections it has.
+ */
+int32_t tcp_unlink_stale(const char *path);
 
 /*
  * A listener is opaque, not a socket: each backend keeps in it what it

@@ -70,7 +70,10 @@ public class Reader
      */
     public const function byte(usize $at) : uint8
     {
-        assert($at < $this->buffered(), 'a byte past what is buffered');
+        // checked in a release build too: past the buffered bytes is heap memory, not the message
+        if ($at >= $this->buffered()) {
+            die('tcp::Reader::byte past what is buffered');
+        }
         return $this->pending->byte($this->start + $at);
     }
 
@@ -140,7 +143,10 @@ public class Reader
      */
     public function skip(usize $n) : void
     {
-        assert($n <= $this->buffered(), 'a skip past what is buffered');
+        // checked in a release build too: a start past the end would hand out heap memory next
+        if ($n > $this->buffered()) {
+            die('tcp::Reader::skip past what is buffered');
+        }
         $this->scanned = 0;
         $this->advance($n);
     }
@@ -366,15 +372,26 @@ public class Reader
 
     private function filled(result<usize?, Error> $got) : result<usize?, Error>
     {
-        if (!$got->has_value()) {
-            Error $e = $got->failure();
-            bool $eof = match ($e) {
-                Error::eof => true,
-                else => false,
-            };
-            if ($eof) {
-                $this->ended = true;
+        if ($got->has_value()) {
+            // a source that answers 0 made no progress: nothing yet, so a pull loop stops instead of spinning
+            usize? $none = null;
+            usize? $read = $got->unwrap();
+            usize $n = guard $read else {
+                return .ok($none);
             }
+            if ($n == 0) {
+                return .ok($none);
+            }
+            return $got;
+        }
+
+        Error $e = $got->failure();
+        bool $eof = match ($e) {
+            Error::eof => true,
+            else => false,
+        };
+        if ($eof) {
+            $this->ended = true;
         }
         return $got;
     }

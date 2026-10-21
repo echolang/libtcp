@@ -3,6 +3,7 @@
  * so a test reads as the behaviour it checks.
  */
 
+use std::thread;
 use std::time;
 
 internal function ms(int64 $n) : tcp::Deadline
@@ -171,7 +172,7 @@ internal function send(tcp::Stream $s, const string& $bytes) : void
 internal function readToEnd(tcp::Stream $s, int64 $timeoutMs) : string
 {
     string $all = '';
-    status<tcp::Error> $read = tcp::readAll($s, $all, ms($timeoutMs));
+    status<tcp::Error> $read = tcp::readAll($s, $all, max: 1 << 30, ms($timeoutMs));
     if (!$read->has_value()) {
         string $why = kind($read->failure());
         die("read: {$why} after {$all->size()} bytes");
@@ -192,4 +193,26 @@ internal function expect(bool $ok, const string& $why) : void
     if (!$ok) {
         die($why);
     }
+}
+
+/**
+ * Sends on `$s` without a pause from a thread of its own until a write fails (the peer closed):
+ * a peer that never stops, for the reads that have to end at their deadline all the same.
+ */
+internal function flood(tcp::Stream $s) : thread::task<usize>
+{
+    thread::task<usize> $t = guard thread::spawn(function() : usize {
+        string $chunk = pattern(4096);
+        usize $sent = 0;
+        while (true) {
+            status<tcp::Error> $put = $s->write($chunk, ms(10000));
+            if (!$put->has_value()) {
+                return $sent;
+            }
+            $sent = $sent + $chunk->size();
+        }
+    }) else ($e) {
+        die('spawn failed');
+    }
+    return $t;
 }

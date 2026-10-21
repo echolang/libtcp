@@ -709,15 +709,83 @@ int32_t tcp_unix_path_max(void)
     return (int32_t)sizeof un.sun_path - 1;
 }
 
-int32_t tcp_unlink_socket(const char *path)
+int32_t tcp_socket_id(const char *path, tcp_file_id *out)
 {
     struct stat st;
 
-    if (path == NULL || lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode)) {
+    /* lstat: a symlink to a socket is not one, and is never removed in its place */
+    if (path == NULL || out == NULL || lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode)) {
         return -1;
     }
 
+    out->dev = (uint64_t)st.st_dev;
+    out->ino = (uint64_t)st.st_ino;
+    return 0;
+}
+
+int32_t tcp_unlink_socket(const char *path, const tcp_file_id *id)
+{
+    tcp_file_id now;
+
+    if (id == NULL || tcp_socket_id(path, &now) != 0 || now.dev != id->dev || now.ino != id->ino) {
+        return -1;
+    }
+
+    /* POSIX has no unlink by identity: one that swaps the file in between can write the directory, and could remove it as well */
     return unlink(path) == 0 ? 0 : -1;
+}
+
+int32_t tcp_unlink_stale(const char *path)
+{
+    tcp_file_id id;
+    tcp_addr at;
+    struct sockaddr_storage ss;
+    socklen_t sl;
+    size_t n;
+    int fd;
+    int rc;
+    int code;
+
+    if (tcp_socket_id(path, &id) != 0) {
+        return -1;
+    }
+
+    n = strlen(path);
+    if (n >= sizeof at.path) {
+        return -1;
+    }
+
+    memset(&at, 0, sizeof at);
+    at.family = TCP_FAMILY_UNIX;
+    memcpy(at.path, path, n);
+    if (to_sockaddr(&at, &ss, &sl) != 0) {
+        return -1;
+    }
+
+    fd = open_socket(AF_UNIX);
+    if (fd < 0) {
+        return -1;
+    }
+
+    if (prepare(fd) != 0) {
+        close(fd);
+        return -1;
+    }
+
+    rc = connect(fd, (struct sockaddr *)&ss, sl);
+    code = errno;
+    close(fd);
+
+    /*
+     * Only a refusal says nothing listens. A live listener whose backlog is full answers EAGAIN on
+     * Linux, and is left be; macOS refuses it with ECONNREFUSED like a dead one (c/tcp.h). The file
+     * removed is the one probed, never one put on the path since.
+     */
+    if (rc == 0 || code != ECONNREFUSED) {
+        return -1;
+    }
+
+    return tcp_unlink_socket(path, &id);
 }
 
 int64_t tcp_try_recv(int64_t h, uint8_t *buf, int64_t len, tcp_err *err)
@@ -825,7 +893,8 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
     int64_t put;
     int ready;
 
-    if (alen < 0 || blen < 0) {
+    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
+    if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
@@ -863,7 +932,8 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
 
 int64_t tcp_try_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, int64_t blen, tcp_err *err)
 {
-    if (alen < 0 || blen < 0) {
+    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
+    if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
@@ -902,7 +972,8 @@ void tcp_close(int64_t h)
 
 int32_t tcp_set_option(int64_t h, int32_t opt, int64_t value, tcp_err *err)
 {
-    int v = value > 0x7fffffff ? 0x7fffffff : (int)value;
+    /* clamped both ways: a cast alone keeps the low bits, and -(2^32) + 5 would be 5 */
+    int v = value > 0x7fffffff ? 0x7fffffff : value < 0 ? 0 : (int)value;
     int rc;
 
     switch (opt) {
@@ -1106,6 +1177,11 @@ int32_t tcp_poll_ctl(int64_t p, int32_t op, int64_t h, uint64_t token, int32_t i
     struct epoll_event ev;
     int how = op == TCP_POLL_ADD ? EPOLL_CTL_ADD : op == TCP_POLL_MODIFY ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;
 
+    /* an op it does not know is a mistake, never a remove */
+    if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
+        return (int32_t)fail_as(err, TCP_K_INVALID, EINVAL);
+    }
+
     memset(&ev, 0, sizeof ev);
     if (interest & TCP_EV_READ) {
         ev.events |= EPOLLIN | EPOLLRDHUP;
@@ -1254,6 +1330,11 @@ static int poll_reserve(kpoll *p, int fd)
         return 0;
     }
 
+    /* the doubling below would overflow an int */
+    if (fd >= 0x3fffffff) {
+        return -1;
+    }
+
     while (cap <= fd) {
         cap *= 2;
     }
@@ -1327,6 +1408,11 @@ int32_t tcp_poll_ctl(int64_t handle, int32_t op, int64_t h, uint64_t token, int3
 
     if (fd < 0) {
         return (int32_t)fail(err, EBADF);
+    }
+
+    /* an op it does not know is a mistake, never a remove */
+    if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
+        return (int32_t)fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
     pthread_mutex_lock(&p->lock);

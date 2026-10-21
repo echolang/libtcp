@@ -32,7 +32,11 @@ public class Reader
         $this->max = $max;
         $this->idleLimit = $idle;
         // the frame cap is checked here, against the prefix: the bytes reader only buffers
-        $this->in = tcp::Reader(max: $max + HEADER);
+        usize $buffered = usize::max();
+        if ($max <= usize::max() - HEADER) {
+            $buffered = $max + HEADER;
+        }
+        $this->in = tcp::Reader(max: $buffered);
         $this->lastFrame = time::instant::now();
         $this->stamped = true;
     }
@@ -251,7 +255,7 @@ public function write<S : tcp::Sink>(S $dst, const string& $body, tcp::Deadline 
 
 /**
  * Queue `$body` as one frame on a reactor's `Outbox`: prefix, then body. `.tooLarge` past `MAX`,
- * with nothing queued.
+ * and `.transport(.tooLarge)` past the outbox's `limit`, either way with nothing queued.
  */
 public function push(tcp::Outbox $out, const string& $body) : status<Error>
 {
@@ -260,6 +264,8 @@ public function push(tcp::Outbox $out, const string& $body) : status<Error>
         return .error(.tooLarge($size));
     }
 
-    $out->push(header($size as uint32), $body);
+    guard $out->push(header($size as uint32), $body) else ($e) {
+        return .error(.transport($e));
+    }
     return .ok;
 }

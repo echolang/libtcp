@@ -166,3 +166,19 @@ test tcp_finish_gives_up_at_its_deadline
     string $buf = '';
     expect(failed($c->read($buf, 16, ms(2000))) == 'eof', 'the client saw the end of the stream');
 }
+
+test tcp_finish_ends_at_its_deadline_against_a_peer_that_never_pauses
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Stream $c = connectLocal($l->local->port);
+    tcp::Stream $s = acceptOne($l);
+    thread::task<usize> $sender = flood($c);
+    time::instant $t = time::instant::now();
+    string $why = failedStatus($s->finish(ms(300)));
+    int64 $waited = elapsedMs($t);
+    $c->close();
+    usize $sent = $sender->wait();
+    expect($why == 'timeout', "a drain that never ends still stops at the deadline: {$why}");
+    expect($waited < 3000, "and close to it: {$waited} ms");
+    assert($s->closed(), 'closed all the same');
+}

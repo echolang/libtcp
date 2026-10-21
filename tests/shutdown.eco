@@ -167,7 +167,7 @@ test tcp_every_call_on_a_closed_stream_is_closed
     expect(failedStatus($s->noDelay(true)) == 'closed', 'an option');
     expect(failedStatus($s->keepAlive(null)) == 'closed', 'keepalive');
     expect(failedStatus($s->buffers(send: 65536, receive: 0)) == 'closed', 'buffers');
-    expect(failedStatus(tcp::readAll($s, $got, ms(100))) == 'closed', 'read all');
+    expect(failedStatus(tcp::readAll($s, $got, max: 1024, ms(100))) == 'closed', 'read all');
     expect(failedStatus(tcp::readExactly($s, $got, 1, ms(100))) == 'closed', 'read exactly');
     expect(frameFailed(tcp::frame::Reader(max: 16)->read($s, ms(100))) == 'transport:closed', 'a frame read');
     expect(frameFailedStatus(tcp::frame::write($s, 'x', ms(100))) == 'transport:closed', 'a frame write');

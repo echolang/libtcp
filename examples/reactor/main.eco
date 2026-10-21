@@ -44,7 +44,9 @@ internal class Conn
  */
 internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echoed) : bool
 {
-    while ($c->reading) {
+    // a full outbox stops the reading: a peer that sends and never reads gets no more echoes
+    // queued, only the ones it owes room for once it reads again
+    while ($c->reading && !$c->out->full()) {
         result<string?, tcp::frame::Error> $frame = $c->reader->pull($c->stream);
         if (!$frame->has_value()) {
             // the peer finished sending: the echoes for what it sent still go out. Anything
@@ -63,7 +65,8 @@ internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echo
         string $body = guard $whole else {
             break;
         }
-        // the reader's max keeps every body inside what a prefix can announce
+        // the reader's max keeps every body inside what a prefix can announce; an echo that would
+        // pass the outbox's limit ends the connection, a peer that far behind is dropped
         guard tcp::frame::push($c->out, $body) else ($e) {
             return false;
         }
@@ -74,7 +77,7 @@ internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echo
     }
 
     // a level registration stays armed as it is: only tell the poller when the interest changes
-    tcp::Interest $want = guard $c->out->interest($c->stream, reading: $c->reading) else {
+    tcp::Interest $want = guard $c->out->interest($c->stream, reading: $c->reading && !$c->out->full()) else {
         return false;
     }
     if ($want != $c->watching) {

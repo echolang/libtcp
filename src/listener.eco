@@ -15,8 +15,10 @@ public class Listener : Pollable
     private const int64 $fd;
     private const StreamOptions $accepted;
     private Gate $gate;
-    // a unix socket's file this listener made, removed when it is released
+    // a unix socket's file this listener made, removed when it is released: by its identity, so
+    // never a file another listener has put on the path since
     private bool $removes;
+    private tcp_file_id $file;
 
     internal constructor(int64 $listener, Address $local, StreamOptions $accepted)
     {
@@ -26,6 +28,7 @@ public class Listener : Pollable
         $this->accepted = $accepted;
         $this->gate = Gate();
         $this->removes = false;
+        $this->file = tcp_file_id();
     }
 
     destructor()
@@ -38,10 +41,14 @@ public class Listener : Pollable
     /**
      * Bind and listen on `$at`. Port 0 lets the OS pick one; `$local->port` reads it back.
      *
-     * A unix socket's file is made here and removed when the listener is released. A file left
-     * by a listener that is gone (the process died) is replaced: one that nothing answers on is
-     * stale. A live listener on the path stays `.addressInUse`, and a file that is not a socket
-     * is never touched.
+     * A unix socket's file is made here and removed when the listener is released, unless
+     * another listener has put a file of its own on the path since. A file left by a listener
+     * that is gone (the process died) is replaced: one that refuses a connect is stale. A live
+     * listener on the path stays `.addressInUse`, except on macOS when its backlog is full: macOS
+     * refuses that connect exactly as a dead one's, so its path is taken over (it goes on serving
+     * the connections it has). A file that is not a socket is never touched. The probe and the
+     * removal go by the path, so its directory must not be writable by anyone untrusted: they
+     * could swap what the path names in between.
      */
     public static function bind(const Address& $at, ListenOptions $options = ListenOptions()) : result<Listener, Error>
     {
@@ -62,29 +69,32 @@ public class Listener : Pollable
         }
         if ($first->has_value()) {
             Listener $made = $first->unwrap();
-            $made->removes = true;
+            $made->own();
         }
         return $first;
     }
 
     /**
      * True when the file at a unix path is a socket nothing listens on any more, and it is gone
-     * now.
+     * now. The backend probes it: only it can tell a dead listener from a busy one where the OS
+     * can (c/tcp.h).
      */
     private static function stale(const Address& $at) : bool
     {
-        result<Stream, Error> $probe = Stream::connect($at, Deadline(ms: 500));
-        if ($probe->has_value()) {
-            Stream $live = $probe->unwrap();
-            $live->close();
-            return false;
-        }
-        Error $e = $probe->failure();
-        if ($e->name() != 'refused') {
-            return false;
-        }
         string $path = cstrOf($at->path);
-        return tcp_unlink_socket($path->cstr()) == 0;
+        return tcp_unlink_stale($path->cstr()) == 0;
+    }
+
+    /**
+     * Takes on the socket file the bind just made, by its identity: the release removes that
+     * file, and leaves one another listener has put on the path since.
+     */
+    private function own() : void
+    {
+        string $path = cstrOf($this->local->path);
+        tcp_file_id $id = tcp_file_id();
+        $this->removes = tcp_socket_id($path->cstr(), &$id) == 0;
+        $this->file = $id;
     }
 
     private static function listen(const Address& $at, ListenOptions $options) : result<Listener, Error>
@@ -146,7 +156,10 @@ public class Listener : Pollable
     }
 
     /**
-     * The next connection if one is already waiting, else null. For a reactor.
+     * The next connection if one is already waiting, else null. For a reactor. `.tooManyFiles`
+     * leaves the connection waiting and the listener readable, so a level registration reports
+     * it again at once: back off, or take the listener out of the poller until a descriptor is
+     * free, or the loop spins.
      */
     public function tryAccept() : result<Stream?, Error>
     {
@@ -249,7 +262,8 @@ public class Listener : Pollable
         tcp_listener_close($this->listener);
         if ($this->removes) {
             string $path = cstrOf($this->local->path);
-            tcp_unlink_socket($path->cstr());
+            tcp_file_id $id = $this->file;
+            tcp_unlink_socket($path->cstr(), &$id);
         }
     }
 

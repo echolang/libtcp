@@ -93,12 +93,22 @@ public struct Address
     }
 
     /**
-     * A numeric address with no lookup: `127.0.0.1`, `::1`, `fe80::1%en0`.
+     * A numeric address with no lookup: `127.0.0.1`, `::1`, `fe80::1%en0`. IPv4 is four decimal
+     * parts and nothing else: the shorthands the C resolvers take (`127.1`, `2130706433`,
+     * `0x7f.1`, `0177.0.0.1`) are refused, since each OS reads some of them differently and a
+     * check on the text would pass what then connects to loopback. A host check compares the
+     * parsed `Address`, never the text.
      */
     public static function parse(const string& $ip, uint16 $port) : result<Address, Error>
     {
         if ($ip->empty()) {
             return .error(.invalid('an address is needed: 0.0.0.0 or :: for every interface'));
+        }
+        guard noNul($ip, 'an address') else ($e) {
+            return .error($e);
+        }
+        if (!plainNumeric($ip)) {
+            return .error(.invalid("not a numeric address: {$ip}"));
         }
 
         string $text = cstrOf($ip);
@@ -106,6 +116,10 @@ public struct Address
         tcp_err $err = tcp_err();
         if (tcp_parse($text->cstr(), $port as int32, &$raw, &$err) < 0) {
             return .error(.invalid("not a numeric address: {$ip}"));
+        }
+        // macOS drops a scope that names no interface where Linux refuses it: refused everywhere
+        if ($ip->find('%') != $ip->size() && $raw->scope == 0) {
+            return .error(.invalid("no interface for the scope in {$ip}"));
         }
 
         return .ok(Address(raw: $raw));
@@ -260,6 +274,123 @@ internal function unixPath(const Address& $a) : status<Error>
 }
 
 /**
+ * `.invalid` when `$text` holds a NUL byte. C reads a string only up to its first NUL, so
+ * `localhost\0.example.com` would pass a check on its Echo text and then reach C as `localhost`.
+ */
+internal function noNul(const string& $text, const string& $what) : status<Error>
+{
+    if ($text->find('\0') != $text->size()) {
+        return .error(.invalid("{$what} cannot hold a NUL byte"));
+    }
+    return .ok;
+}
+
+/**
+ * True when `$ip` is spelled the one way every OS reads alike: IPv4 as a dotted quad, and IPv6
+ * with any IPv4 tail a dotted quad too and any `%scope` not empty. The C side checks the rest.
+ */
+internal function plainNumeric(const string& $ip) : bool
+{
+    usize $colon = $ip->find(':');
+    if ($colon == $ip->size()) {
+        return dottedQuad($ip);
+    }
+
+    usize $end = $ip->find('%');
+    if ($end + 1 == $ip->size()) {
+        return false;
+    }
+    // the tail after the last colon, before any scope: an embedded IPv4 address when it has a dot
+    usize $tail = 0;
+    usize $i = 0;
+    while ($i < $end) {
+        if ($ip->byte($i) == 58) {
+            $tail = $i + 1;
+        }
+        $i = $i + 1;
+    }
+    string $last = $ip->sub($tail, $end - $tail);
+    if ($last->find('.') == $last->size()) {
+        return true;
+    }
+    return dottedQuad($last);
+}
+
+/**
+ * True when the last label of `$host` (past a trailing dot) is a number, decimal or `0x` hex: no
+ * name ends that way, so the URL standard reads such a host as IPv4, and so do the C resolvers.
+ */
+internal function endsInNumber(const string& $host) : bool
+{
+    usize $end = $host->size();
+    if ($end > 0 && $host->byte($end - 1) == 46) {
+        $end = $end - 1;
+    }
+    usize $start = 0;
+    usize $i = 0;
+    while ($i < $end) {
+        if ($host->byte($i) == 46) {
+            $start = $i + 1;
+        }
+        $i = $i + 1;
+    }
+    if ($start == $end || $host->find(':') != $host->size()) {
+        return false;
+    }
+
+    bool $hex = $end - $start >= 2 && $host->byte($start) == 48 && ($host->byte($start + 1) == 120 || $host->byte($start + 1) == 88);
+    usize $at = $start;
+    if ($hex) {
+        $at = $start + 2;
+    }
+    while ($at < $end) {
+        uint8 $b = $host->byte($at);
+        bool $digit = $b >= 48 && $b <= 57;
+        bool $hexLetter = ($b >= 97 && $b <= 102) || ($b >= 65 && $b <= 70);
+        if (!$digit && !($hex && $hexLetter)) {
+            return false;
+        }
+        $at = $at + 1;
+    }
+    return true;
+}
+
+/**
+ * Four decimal parts of 0..255, without leading zeros (which some systems read as octal) or any
+ * other character.
+ */
+internal function dottedQuad(const string& $text) : bool
+{
+    usize $parts = 0;
+    usize $digits = 0;
+    uint32 $value = 0;
+    usize $i = 0;
+    while ($i <= $text->size()) {
+        if ($i == $text->size() || $text->byte($i) == 46) {
+            if ($digits == 0 || $value > 255) {
+                return false;
+            }
+            $parts = $parts + 1;
+            $digits = 0;
+            $value = 0;
+        } else {
+            uint8 $b = $text->byte($i);
+            if ($b < 48 || $b > 57 || $digits == 3) {
+                return false;
+            }
+            // a part may be 0, but no other part starts with one
+            if ($digits == 1 && $value == 0) {
+                return false;
+            }
+            $value = $value * 10 + (($b - 48) as uint32);
+            $digits = $digits + 1;
+        }
+        $i = $i + 1;
+    }
+    return $parts == 4;
+}
+
+/**
  * A port written in decimal digits and nothing else (no sign, no space), 0..65535, or null.
  */
 internal function portOf(const string& $digits) : uint16?
@@ -312,6 +443,13 @@ internal function lookup(const string& $host, uint16 $port, passive: bool $passi
 {
     if ($host->empty()) {
         return .error(.invalid('a host is needed: 0.0.0.0 or :: for every interface'));
+    }
+    guard noNul($host, 'a host name') else ($e) {
+        return .error($e);
+    }
+    // getaddrinfo reads a name that ends in a number as IPv4 shorthand, each OS its own way
+    if (endsInNumber($host) && !dottedQuad($host)) {
+        return .error(.invalid("not a host name, and not a dotted IPv4 address: {$host}"));
     }
 
     string $name = cstrOf($host);

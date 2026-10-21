@@ -122,3 +122,66 @@ test tcp_a_numeric_host_resolves_to_itself
     assert($got[0] == tcp::Address(loopback: 7), 'the one it names');
     expect(failed(tcp::resolve('', 7)) == 'invalid', 'an empty host is invalid');
 }
+
+test tcp_a_nul_byte_never_reaches_c
+{
+    // C stops at the first NUL: this would pass a check on '.example.com' and resolve localhost
+    string $host = "localhost\0.example.com";
+    expect(failed(tcp::resolve($host, 80)) == 'invalid', 'a host name with a NUL is refused');
+    expect(failed(tcp::resolve($host, 80, ms(2000))) == 'invalid', 'by the deadline-bound lookup too');
+    expect(failed(tcp::Stream::connect(host: $host, 80, ms(2000))) == 'invalid', 'and by a connect to a name');
+    expect(failed(tcp::Listener::bind(host: $host, 0)) == 'invalid', 'and by a bind to a name');
+    expect(failed(tcp::Address::parse("127.0.0.1\0junk", 80)) == 'invalid', 'a numeric address with a NUL too');
+    expect(failed(tcp::Address::parse("127.0.0.1\0:80")) == 'invalid', 'and host:port with one in the host');
+}
+
+test tcp_ipv4_shorthands_are_refused_on_every_os
+{
+    // the C resolvers take these, and not all alike: 0177.0.0.1 is 127.0.0.1 on Linux, 177.0.0.1 on macOS
+    expect(failed(tcp::Address::parse('0177.0.0.1', 80)) == 'invalid', 'a leading zero, octal to some');
+    expect(failed(tcp::Address::parse('01.2.3.4', 80)) == 'invalid', 'any leading zero');
+    expect(failed(tcp::Address::parse('2130706433', 80)) == 'invalid', 'one number');
+    expect(failed(tcp::Address::parse('0x7f.1', 80)) == 'invalid', 'hex');
+    expect(failed(tcp::Address::parse('127.1', 80)) == 'invalid', 'two parts');
+    expect(failed(tcp::Address::parse('1.2.3', 80)) == 'invalid', 'three parts');
+    expect(failed(tcp::Address::parse('1.2.3.4.5', 80)) == 'invalid', 'five parts');
+    expect(failed(tcp::Address::parse('1.2.3.256', 80)) == 'invalid', 'a part over 255');
+    expect(failed(tcp::Address::parse('1..3.4', 80)) == 'invalid', 'an empty part');
+    expect(failed(tcp::Address::parse('1.2.3.4.', 80)) == 'invalid', 'a trailing dot');
+    expect(failed(tcp::Address::parse('0177.0.0.1:80')) == 'invalid', 'host:port goes the same way');
+    expect(failed(tcp::Address::parse('::ffff:0177.0.0.1', 80)) == 'invalid', 'and an IPv4 tail of IPv6');
+    expect(failed(tcp::Address::parse('::1%', 80)) == 'invalid', 'an empty scope');
+    expect(failed(tcp::Address::parse('fe80::1%nosuchinterface0', 80)) == 'invalid', 'a scope that names no interface');
+
+    array<string> $fine = array<string>();
+    $fine[] = '127.0.0.1';
+    $fine[] = '0.0.0.0';
+    $fine[] = '10.0.10.255';
+    $fine[] = '::ffff:127.0.0.1';
+    foreach ($fine as $text) {
+        tcp::Address $a = guard tcp::Address::parse($text, 80) else ($e) {
+            die("parse {$text}: {$e}");
+        }
+        expect($a->host() == $text, "{$text} reads back as itself");
+    }
+}
+
+test tcp_a_lookup_refuses_ipv4_shorthands_as_names
+{
+    // getaddrinfo takes a shorthand as a name and reads it as IPv4 its own way
+    expect(failed(tcp::resolve('2130706433', 80)) == 'invalid', 'one number');
+    expect(failed(tcp::resolve('0177.0.0.1', 80)) == 'invalid', 'octal to some');
+    expect(failed(tcp::resolve('127.1', 80)) == 'invalid', 'two parts');
+    expect(failed(tcp::resolve('0x7f.0x1', 80)) == 'invalid', 'hex');
+    expect(failed(tcp::resolve('127.0.0.1.', 80)) == 'invalid', 'a trailing dot');
+    expect(failed(tcp::resolve('2130706433', 80, ms(5000))) == 'invalid', 'with a deadline too');
+
+    // names that only look numeric somewhere else are names
+    expect(tcp::endsInNumber('cafe.be') == false, 'hex letters in a name');
+    expect(tcp::endsInNumber('1.example.com') == false, 'a number up front');
+    expect(tcp::endsInNumber('example.0x') == true, 'an empty hex number');
+    array<tcp::Address> $lo = guard tcp::resolve('127.0.0.1', 80) else ($e) {
+        die("resolve: {$e}");
+    }
+    expect($lo->count() == 1 && $lo[0]->host() == '127.0.0.1', 'a dotted quad still resolves to itself');
+}

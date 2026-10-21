@@ -20,9 +20,14 @@ internal struct Answer
     public Error $error;
 }
 
+// the most lookup threads running at once, across the process
+internal const int32 LOOKUP_THREADS = 64;
+
 #[atomic]
 public class Lookup
 {
+    // lookup threads running now: a resolver that hangs must not let lookups pile up a thread each
+    internal static atomic<int32> $running = atomic<int32>(0);
     public const string $host;
     public const uint16 $port;
     // signalled once the answer is in, so a wait can end on it before its deadline
@@ -42,7 +47,8 @@ public class Lookup
     }
 
     /**
-     * Start looking `$host` up for `$port`.
+     * Start looking `$host` up for `$port`. A lookup runs on a thread of its own, and at most 64
+     * run at once: past that the start fails, so a resolver that hangs cannot pile up threads.
      */
     public static function start(const string& $host, uint16 $port) : result<Lookup, Error>
     {
@@ -134,9 +140,14 @@ public class Lookup
             return .ok($made);
         }
 
+        if (Lookup::$running->add(1) >= LOOKUP_THREADS) {
+            int32 $back = Lookup::$running->sub(1);
+            return .error(.os(SysError(.resolve, 0, "64 lookups are running already: the resolver is slow or stuck")));
+        }
         string $name = $host;
         thread::handle $worker = guard thread::spawn(function[mv $tx, $name, $port, $done, $notify]() : void {
             result<array<Address>, Error> $got = lookup($name, $port, passive: false);
+            int32 $left = Lookup::$running->sub(1);
             if ($got->has_value()) {
                 $tx->send(Answer(true, $got->unwrap(), Error::closed));
             } else {
@@ -144,6 +155,7 @@ public class Lookup
             }
             answered($done, $notify);
         }) else ($e) {
+            int32 $back = Lookup::$running->sub(1);
             return .error(.os(SysError(.resolve, 0, "no thread for the lookup: {$e->message()}")));
         }
         // the caller may stop waiting: the thread finishes on its own and nobody joins it

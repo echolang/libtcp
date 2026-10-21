@@ -64,6 +64,22 @@
 #define AF_UNIX 1
 #endif
 
+/* the reparse tag of a unix socket's file (winnt.h in newer SDKs) */
+#ifndef IO_REPARSE_TAG_AF_UNIX
+#define IO_REPARSE_TAG_AF_UNIX 0x80000023L
+#endif
+
+/*
+ * FILE_ID_INFO and its class (Windows 8 and later), declared here for the same reason: a ReFS
+ * file id is 128 bits, and the 64-bit index GetFileInformationByHandle gives is not unique there.
+ */
+typedef struct tcp_file_id_info {
+    ULONGLONG volume;
+    BYTE id[16];
+} tcp_file_id_info;
+
+#define TCP_FILE_ID_INFO ((FILE_INFO_BY_HANDLE_CLASS)18)
+
 /*
  * afunix.h's SOCKADDR_UN (Windows 10 1803 and later), declared here so the build needs no newer
  * SDK. On an older Windows a unix socket fails to open, and the failure says so.
@@ -371,7 +387,11 @@ static int64_t overlapped(SOCKET s, int sending, WSABUF *bufs, DWORD count, int3
         if (lost == 0) {
             rc = WSAGetOverlappedResult(s, &ov, &done, TRUE, &flags);
         } else {
-            /* a broken event is no use to wait on: poll the operation's own status instead */
+            /*
+             * a broken event is no use to wait on: poll the operation's own status instead. There is
+             * no giving up here: ov and the buffers stay the kernel's until the I/O lands, and ov is
+             * on this stack, so a return before that would let it write into a frame that is gone
+             */
             while (!(rc = WSAGetOverlappedResult(s, &ov, &done, FALSE, &flags)) && WSAGetLastError() == WSA_IO_INCOMPLETE) {
                 Sleep(1);
             }
@@ -424,7 +444,7 @@ static int32_t lookup(const char *host, int32_t port, int flags, tcp_addr *out, 
     }
 
     /* the wide form: a name is UTF-8, and the narrow one reads the system code page */
-    if (MultiByteToWideChar(CP_UTF8, 0, host, -1, whost, (int)(sizeof whost / sizeof whost[0])) == 0) {
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, host, -1, whost, (int)(sizeof whost / sizeof whost[0])) == 0) {
         return (int32_t)fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
 
@@ -581,12 +601,20 @@ failed:
     return fail(err, code);
 }
 
-/* the accepted socket, or INVALID_SOCKET with the code in *code */
+/*
+ * The accepted socket, or INVALID_SOCKET with the code in *code. accept() takes no flag, so the
+ * socket is inheritable until no_inherit clears it: a CreateProcess with inheritance on, on
+ * another thread in that moment, hands the child the connection. A process that spawns children
+ * that way names their handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
+ */
 static SOCKET accept_one(SOCKET listener, tcp_addr *peer, int *code)
 {
     SOCKADDR_STORAGE ss;
     int sl = (int)sizeof ss;
     SOCKET s;
+
+    /* a unix peer's path is read up to the length the OS gives: never stack bytes it did not write */
+    memset(&ss, 0, sizeof ss);
 
     s = accept(listener, (struct sockaddr *)&ss, &sl);
     if (s == INVALID_SOCKET) {
@@ -823,6 +851,8 @@ int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err)
     SOCKADDR_STORAGE ss;
     int sl = (int)sizeof ss;
 
+    memset(&ss, 0, sizeof ss);
+
     if (getsockname((SOCKET)h, (struct sockaddr *)&ss, &sl) != 0) {
         return (int32_t)fail(err, WSAGetLastError());
     }
@@ -838,22 +868,137 @@ int32_t tcp_unix_path_max(void)
     return (int32_t)sizeof un.sun_path - 1;
 }
 
-int32_t tcp_unlink_socket(const char *path)
+/*
+ * The unix socket file at path, opened as itself (never what a reparse point leads to) for access
+ * on top of reading its attributes, its identity in *id: a handle, or INVALID_HANDLE_VALUE when
+ * path is not one.
+ */
+static HANDLE open_socket_file(const char *path, DWORD access, tcp_file_id *id)
 {
     wchar_t wpath[MAX_PATH];
-    DWORD attrs;
+    FILE_ATTRIBUTE_TAG_INFO tag;
+    BY_HANDLE_FILE_INFORMATION info;
+    tcp_file_id_info full;
+    HANDLE h;
 
-    if (path == NULL || MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0) {
+    if (path == NULL || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wpath, MAX_PATH) == 0) {
+        return INVALID_HANDLE_VALUE;
+    }
+
+    h = CreateFileW(wpath, access | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        return h;
+    }
+
+    /* the AF_UNIX tag exactly: a symlink, a cloud placeholder or a deduplicated file is a reparse point too */
+    if (!GetFileInformationByHandleEx(h, FileAttributeTagInfo, &tag, sizeof tag)
+        || !(tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        || tag.ReparseTag != IO_REPARSE_TAG_AF_UNIX) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    /* the full 128-bit id where the system has it: its high half goes into dev, which it never is on NTFS */
+    if (GetFileInformationByHandleEx(h, TCP_FILE_ID_INFO, &full, sizeof full)) {
+        uint64_t lo;
+        uint64_t hi;
+
+        memcpy(&lo, full.id, sizeof lo);
+        memcpy(&hi, full.id + 8, sizeof hi);
+        id->dev = (uint64_t)full.volume ^ hi;
+        id->ino = lo;
+        return h;
+    }
+
+    if (!GetFileInformationByHandle(h, &info)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    id->dev = (uint64_t)info.dwVolumeSerialNumber;
+    id->ino = ((uint64_t)info.nFileIndexHigh << 32) | (uint64_t)info.nFileIndexLow;
+    return h;
+}
+
+int32_t tcp_socket_id(const char *path, tcp_file_id *out)
+{
+    HANDLE h;
+
+    if (out == NULL) {
         return -1;
     }
 
-    /* a unix socket's file is a reparse point (IO_REPARSE_TAG_AF_UNIX): a plain file is left be */
-    attrs = GetFileAttributesW(wpath);
-    if (attrs == INVALID_FILE_ATTRIBUTES || !(attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+    h = open_socket_file(path, 0, out);
+    if (h == INVALID_HANDLE_VALUE) {
         return -1;
     }
 
-    return DeleteFileW(wpath) ? 0 : -1;
+    CloseHandle(h);
+    return 0;
+}
+
+int32_t tcp_unlink_socket(const char *path, const tcp_file_id *id)
+{
+    /* positional: the field's name is also a windows.h macro */
+    FILE_DISPOSITION_INFO del = { TRUE };
+    tcp_file_id now;
+    HANDLE h;
+    BOOL ok;
+
+    if (id == NULL) {
+        return -1;
+    }
+
+    h = open_socket_file(path, DELETE, &now);
+    if (h == INVALID_HANDLE_VALUE) {
+        return -1;
+    }
+
+    if (now.dev != id->dev || now.ino != id->ino) {
+        CloseHandle(h);
+        return -1;
+    }
+
+    /* through the handle that was checked: no other file can take the path in between */
+    ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof del);
+    CloseHandle(h);
+    return ok ? 0 : -1;
+}
+
+int32_t tcp_unlink_stale(const char *path)
+{
+    tcp_file_id id;
+    tcp_addr at;
+    tcp_err err;
+    size_t n;
+    int64_t h;
+
+    if (tcp_socket_id(path, &id) != 0) {
+        return -1;
+    }
+
+    n = strlen(path);
+    if (n >= sizeof at.path) {
+        return -1;
+    }
+
+    memset(&at, 0, sizeof at);
+    at.family = TCP_FAMILY_UNIX;
+    memcpy(at.path, path, n);
+
+    /* only a refusal says nothing listens: a connect, a timeout or any other failure leaves the file be */
+    h = tcp_connect(&at, 500, &err);
+    if (h >= 0) {
+        tcp_close(h);
+        return -1;
+    }
+
+    if (h != TCP_ERR || err.kind != TCP_K_REFUSED) {
+        return -1;
+    }
+
+    return tcp_unlink_socket(path, &id);
 }
 
 int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_err *err)
@@ -951,7 +1096,8 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
     DWORD count;
     int64_t put;
 
-    if (alen < 0 || blen < 0) {
+    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
+    if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
 
@@ -989,7 +1135,8 @@ int64_t tcp_try_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *
     DWORD done = 0;
     int code;
 
-    if (alen < 0 || blen < 0) {
+    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
+    if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
 
@@ -1041,7 +1188,8 @@ void tcp_close(int64_t h)
 
 int32_t tcp_set_option(int64_t h, int32_t opt, int64_t value, tcp_err *err)
 {
-    int v = value > 0x7fffffff ? 0x7fffffff : (int)value;
+    /* clamped both ways: a cast alone keeps the low bits, and -(2^32) + 5 would be 5 */
+    int v = value > 0x7fffffff ? 0x7fffffff : value < 0 ? 0 : (int)value;
     int rc;
 
     switch (opt) {
@@ -1091,6 +1239,7 @@ int64_t tcp_wake_open(tcp_err *err)
 {
     struct sockaddr_in addr;
     int len = (int)sizeof addr;
+    BOOL one = TRUE;
     SOCKET s;
     int code;
 
@@ -1107,7 +1256,9 @@ int64_t tcp_wake_open(tcp_err *err)
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    if (bind(s, (struct sockaddr *)&addr, len) != 0
+    /* exclusive: no other process, the same user's included, can bind the port and take the wakes */
+    if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one) != 0
+        || bind(s, (struct sockaddr *)&addr, len) != 0
         || getsockname(s, (struct sockaddr *)&addr, &len) != 0
         || connect(s, (struct sockaddr *)&addr, len) != 0) {
         code = WSAGetLastError();
@@ -1199,6 +1350,8 @@ int32_t tcp_error_text(int32_t kind, int32_t code, char *buf, int32_t len)
 
     if (m <= 0) {
         snprintf(buf, (size_t)len, "error %d", (int)code);
+        /* an old msvcrt snprintf leaves a cut text unterminated */
+        buf[len - 1] = '\0';
         return (int32_t)strlen(buf);
     }
 
@@ -1237,6 +1390,11 @@ int32_t tcp_poll_ctl(int64_t p, int32_t op, int64_t h, uint64_t token, int32_t i
 {
     struct wep_event ev;
     int how = op == TCP_POLL_ADD ? WEP_CTL_ADD : op == TCP_POLL_MODIFY ? WEP_CTL_MOD : WEP_CTL_DEL;
+
+    /* an op it does not know is a mistake, never a remove */
+    if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
+        return (int32_t)fail_as(err, TCP_K_INVALID, WSAEINVAL);
+    }
 
     memset(&ev, 0, sizeof ev);
     if (interest & TCP_EV_READ) {

@@ -2,6 +2,9 @@
  * The reads composed from `Source::read` (`readExactly`, `readAll`), and `Stream::pair`.
  */
 
+use std::thread;
+use std::time;
+
 test tcp_a_pair_is_connected_both_ways
 {
     tcp::StreamPair $pair = connectedPair();
@@ -69,7 +72,7 @@ test tcp_read_all_reads_until_the_peer_closes
     send($pair->client, 'world');
     $pair->client->close();
     string $got = '';
-    guard tcp::readAll($pair->server, $got, ms(5000)) else ($e) {
+    guard tcp::readAll($pair->server, $got, max: 1024, ms(5000)) else ($e) {
         die("read all: {$e}");
     }
     assert($got == 'hello world', 'everything, and the end is not an error');
@@ -80,7 +83,74 @@ test tcp_read_all_gives_up_at_its_deadline
     tcp::StreamPair $pair = connectedPair();
     send($pair->client, 'x');
     string $got = '';
-    string $why = failedStatus(tcp::readAll($pair->server, $got, ms(200)));
+    string $why = failedStatus(tcp::readAll($pair->server, $got, max: 1024, ms(200)));
     expect($why == 'timeout', "a peer that never closes is a timeout: {$why}");
     assert($got == 'x', 'with what arrived kept');
+}
+
+test tcp_read_all_stops_past_its_max
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, pattern(5000));
+    $pair->client->close();
+    string $got = '';
+    string $why = failedStatus(tcp::readAll($pair->server, $got, max: 1000, ms(5000)));
+    expect($why == 'tooLarge', "a peer that sends more than max is refused: {$why}");
+    expect($got->size() <= 1001, "and no more than one byte past max is read: {$got->size()}");
+
+    string $exact = '';
+    tcp::StreamPair $again = connectedPair();
+    send($again->client, pattern(1000));
+    $again->client->close();
+    guard tcp::readAll($again->server, $exact, max: 1000, ms(5000)) else ($e) {
+        die("read all: {$e}");
+    }
+    expect($exact->size() == 1000, 'exactly max is not over it');
+}
+
+test tcp_read_all_ends_at_its_deadline_against_a_peer_that_never_pauses
+{
+    tcp::StreamPair $pair = connectedPair();
+    thread::task<usize> $sender = flood($pair->client);
+    string $got = '';
+    time::instant $t = time::instant::now();
+    string $why = failedStatus(tcp::readAll($pair->server, $got, max: 1099511627776, ms(300)));
+    int64 $waited = elapsedMs($t);
+    $pair->server->close();
+    usize $sent = $sender->wait();
+    expect($why == 'timeout', "a flood still ends at the deadline: {$why}");
+    expect($waited < 3000, "and close to it: {$waited} ms, {$got->size()} of {$sent} bytes read");
+}
+
+test tcp_read_exactly_grows_only_as_bytes_arrive
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'abc');
+    string $got = '';
+    // a length a peer announced: the buffer must not be reserved for it up front
+    string $why = failedStatus(tcp::readExactly($pair->server, $got, 1099511627776, ms(200)));
+    expect($why == 'timeout', "a count that never comes is a timeout: {$why}");
+    expect($got == 'abc', 'with what arrived kept');
+    expect($got->capacity() <= 4 * 1048576, "and a buffer sized by what came: {$got->capacity()}");
+}
+
+test tcp_read_exactly_refuses_a_count_that_cannot_fit
+{
+    tcp::StreamPair $pair = connectedPair();
+    string $got = 'ab';
+    string $why = failedStatus(tcp::readExactly($pair->server, $got, usize::max(), ms(100)));
+    expect($why == 'invalid', "a count past what a string holds is refused: {$why}");
+    expect($got == 'ab', 'and nothing is touched');
+}
+
+test tcp_a_read_never_reserves_what_it_was_asked_for_up_front
+{
+    tcp::StreamPair $pair = connectedPair();
+    send($pair->client, 'xyz');
+    string $got = '';
+    usize? $n = guard $pair->server->read($got, 1099511627776, ms(5000)) else ($e) {
+        die("read: {$e}");
+    }
+    expect(($n ?? 0) == 3 && $got == 'xyz', 'a read takes what is there');
+    expect($got->capacity() <= 4 * 1048576, "into a buffer sized by a chunk, not by the ask: {$got->capacity()}");
 }

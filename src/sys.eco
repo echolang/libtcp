@@ -28,12 +28,20 @@ internal struct tcp_addr
     }
 }
 
+internal struct tcp_file_id
+{
+    public uint64 $dev = 0;
+    public uint64 $ino = 0;
+}
+
 internal extern {
     function tcp_resolve(ptr<const uint8> $host, int32 $port, int32 $passive, ptr<tcp_addr> $out, int32 $max, ptr<tcp_err> $err) : int32;
     function tcp_parse(ptr<const uint8> $text, int32 $port, ptr<tcp_addr> $out, ptr<tcp_err> $err) : int32;
     function tcp_addr_text(ptr<const tcp_addr> $addr, ptr<uint8> $buf, int32 $len) : int32;
     function tcp_unix_path_max() : int32;
-    function tcp_unlink_socket(ptr<const uint8> $path) : int32;
+    function tcp_socket_id(ptr<const uint8> $path, ptr<tcp_file_id> $out) : int32;
+    function tcp_unlink_socket(ptr<const uint8> $path, ptr<const tcp_file_id> $id) : int32;
+    function tcp_unlink_stale(ptr<const uint8> $path) : int32;
     function tcp_listen(ptr<const tcp_addr> $at, int32 $backlog, int32 $flags, ptr<tcp_err> $err) : int64;
     function tcp_listener_socket(int64 $l) : int64;
     function tcp_accept(int64 $l, int32 $timeoutMs, ptr<tcp_addr> $peer, ptr<tcp_err> $err) : int64;
@@ -148,5 +156,6 @@ test tcp_layouts_match_the_c_contract
 {
     assert(mem::size<tcp_err>() == 8);
     assert(mem::size<tcp_addr>() == 132);
+    assert(mem::size<tcp_file_id>() == 16);
     assert(mem::size<Event>() == 16);
 }

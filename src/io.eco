@@ -60,12 +60,22 @@ public interface Sink
  */
 public function readExactly<S : Source>(S $src, string& $into, usize $n, Deadline $by) : status<Error>
 {
+    if ($n > usize::max() - $into->size()) {
+        return .error(.invalid("{$n} more bytes do not fit a string"));
+    }
+
+    // the bytes come in reads of READ_BIG at most, so the buffer grows only as they arrive,
+    // never by a length the peer announced and then did not send
     usize $want = $into->size() + $n;
     while ($into->size() < $want) {
-        usize? $got = guard $src->read($into, $want - $into->size(), $by) else ($e) {
+        usize $ask = $want - $into->size();
+        if ($ask > READ_BIG) {
+            $ask = READ_BIG;
+        }
+        usize? $got = guard $src->read($into, $ask, $by) else ($e) {
             return .error($e);
         }
-        if ($got == null) {
+        if ($got == null || ($into->size() < $want && $by->passed())) {
             return .error(.timeout);
         }
     }
@@ -73,13 +83,20 @@ public function readExactly<S : Source>(S $src, string& $into, usize $n, Deadlin
 }
 
 /**
- * Append everything `$src` sends onto `$into` until the peer closes, before the deadline.
- * `.timeout` when the deadline passes first, with what did arrive in `$into`.
+ * Append everything `$src` sends onto `$into` until the peer closes, before the deadline, and at
+ * most `$max` bytes. `.timeout` when the deadline passes first, with what did arrive in `$into`.
+ * `.tooLarge` once the peer sends more than `$max`: a peer cannot make it buffer without end.
  */
-public function readAll<S : Source>(S $src, string& $into, Deadline $by) : status<Error>
+public function readAll<S : Source>(S $src, string& $into, max: usize $max, Deadline $by) : status<Error>
 {
+    usize $added = 0;
     while (true) {
-        result<usize?, Error> $got = $src->read($into, 65536, $by);
+        // one byte over the limit is enough to tell a peer that sent too much
+        usize $ask = 65536;
+        if ($max - $added < $ask) {
+            $ask = $max - $added + 1;
+        }
+        result<usize?, Error> $got = $src->read($into, $ask, $by);
         if (!$got->has_value()) {
             Error $e = $got->failure();
             bool $ended = match ($e) {
@@ -91,7 +108,16 @@ public function readAll<S : Source>(S $src, string& $into, Deadline $by) : statu
             }
             return .error($e);
         }
-        if ($got->unwrap() == null) {
+        usize? $read = $got->unwrap();
+        usize $n = guard $read else {
+            return .error(.timeout);
+        }
+        $added = $added + $n;
+        if ($added > $max) {
+            return .error(.tooLarge($added as uint64));
+        }
+        // a peer that never pauses would keep every read busy: the deadline still ends it
+        if ($by->passed()) {
             return .error(.timeout);
         }
     }

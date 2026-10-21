@@ -1,106 +1,368 @@
 # libtcp
 
-TCP sockets and length-prefixed frames for Echo. IPv4, blocking calls with explicit timeouts, no TLS, no HTTP.
+Echo's standard library has files, streams, and threads. It does not have sockets. Sometimes your program still needs to listen, connect, and move bytes. This module is that missing piece: TCP (and unix sockets), a deadline on every wait, a poller, a buffered reader, and length-prefixed frames.
 
-The platform layer is C behind one contract (`c/tcp.h`). Everything above it is Echo: the read and write loops, the frames, and the threads that use them (`std::thread`).
+The C is a platform shim (`bind` / `listen` / `accept` / `recv` / `send`, epoll or kqueue, Winsock plus wepoll). Deadlines, addresses, frames, and the reactor pieces are Echo. There is no TLS. There is no HTTP. libhttp is the server. libcurl is the client. This is the sockets under both, and the sockets if you are writing neither.
 
-| Platform | Backend | State |
-|---|---|---|
-| macOS, Linux | `c/posix.c` | done |
-| Windows | `c/win32.c` (Winsock) | done |
+## A complete pass
 
-## Use
+Let's look at a whole program, so the rest of the page has somewhere to sit:
 
 ```echo
-#[depends: "../libtcp"]
+tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+    die("listen: {$e}");
+}
+
+tcp::Stream $client = guard tcp::Stream::connect($l->local, tcp::Deadline(ms: 1000)) else ($e) {
+    die("connect: {$e}");
+}
+
+tcp::Stream? $maybe = guard $l->accept(tcp::Deadline(ms: 1000)) else ($e) {
+    die("accept: {$e}");
+}
+tcp::Stream $server = guard $maybe else {
+    die('no client');
+}
+
+guard $client->write('hello', tcp::Deadline(ms: 1000)) else ($e) {
+    die("write: {$e}");
+}
+
+string $buf = '';
+guard $server->read($buf, 5, tcp::Deadline(ms: 1000)) else ($e) {
+    die("read: {$e}");
+}
+
+echo $buf;
 ```
+
+That is the whole shape: bind, connect, accept, write, read. Port `0` is ephemeral; `$l->local->port` is the one the OS picked.
+
+`accept` and `read` returning null means the deadline passed with nothing. That is not an error. Nothing was lost. Call again.
+
+`Stream::pair($by)` is this setup without the listener left around: two ends of one loopback connection, for tests.
+
+The poller shape lives in `examples/reactor/`.
+
+## Installing
+
+From your project directory:
+
+```bash
+epm add echolang/libtcp --git https://github.com/echolang/libtcp --range ^0.2
+```
+
+That writes a `#[requires:]` line and vendors the sources. The C shim travels with the module, so you never write a `#[cc:]` yourself.
+
+darwin, linux, and windows, matching Echo's prebuilts. Windows is Winsock, with readiness from the wepoll copy under `c/wepoll/`.
+
+## Addresses
+
+A listener and a connect take an `Address`. Names come in through `resolve`, which is a call of its own so it can be made once, on another thread, or not at all.
 
 ```echo
-tcp::Listener $l = guard tcp::Listener::open('127.0.0.1', 0) else ($e) {
-    die($e->message());
-}
-int32 $port = $l->port();
+tcp::Address $loop = tcp::Address(loopback: 8080);          // 127.0.0.1
+tcp::Address $v6   = tcp::Address(loopback: 8080, .v6);     // ::1
+tcp::Address $all  = tcp::Address(any: 8080);               // 0.0.0.0
+tcp::Address $sock = tcp::Address(unix: '/tmp/app.sock');
+```
 
-// accept with a timeout so the loop can check a stop flag
-tcp::Stream? $maybe = guard $l->accept(100) else ($e) {
-    die($e->message());
-}
+`Address::parse` is numeric, no DNS: `'127.0.0.1:80'`, `'[::1]:80'`, `'unix:/tmp/app.sock'`. An IPv6 address without brackets is refused, not split at its last colon: `1::2:3` is an address of its own, not `[1::2]:3`. `"{$a}"` prints the same forms, and `parse` reads them back.
 
-tcp::Stream $client = guard tcp::Stream::connect('127.0.0.1', $port) else ($e) {
-    die($e->message());
-}
-guard tcp::writeFrame($client, 'ping') else ($e) {
-    die($e->message());
+An empty host is refused. If you mean every interface, write `0.0.0.0` or `::`.
+
+```echo
+array<tcp::Address> $addrs = guard tcp::resolve('example.com', 443) else ($e) {
+    die("{$e}");
 }
 ```
 
-- `Listener::open(host, port, backlog = 16)`: `0.0.0.0` is every interface. An empty host is refused (`badHost`), so nothing listens wider than it asked. Port 0 lets the OS pick one; `port()` reads it back. `accept(timeoutMs)` returns null when nobody connected in time.
-- `Stream::connect(host, port, timeoutMs = 5000)`, `recv(buf, n, timeoutMs)`, `append(string&, most, timeoutMs)`, `writeAll(bytes, timeoutMs)`, `shutdownWrite()`, `close()`. A `Stream` closes when it is dropped.
-- `writeAll`'s timeout covers the whole write, not each send, so a peer that reads a byte at a time cannot hold the writer past it. A `timeout` there leaves an unknown part sent; drop the stream.
-- `Error` covers `bind`, `connect`, `accept` and `io` (each with the OS text), plus `closed`, `timeout`, `badPort`, `badHost` and `tooLarge`. A `timeout` on a read or an accept loses nothing: call again.
+That lookup waits as long as DNS takes. A deadline needs the other `resolve`, which runs `getaddrinfo` on a thread of its own:
+
+```echo
+array<tcp::Address> $addrs = guard tcp::resolve('example.com', 443, tcp::Deadline(ms: 2000)) else ($e) {
+    die("{$e}");
+}
+```
+
+A lookup that outlives its deadline finishes on its thread and the answer is dropped. `Lookup::start` is the same thing when you want to poll for it, or have a `Poller` woken when it is in (`start($host, $port, notify: $poller)`). A numeric host starts no thread.
+
+## Deadlines
+
+One deadline flows through every step of a composed call: each resolved address of a connect, the prefix and body of a frame. The whole call is bounded, not each step.
+
+```echo
+tcp::Deadline $by = tcp::Deadline(ms: 1000);
+```
+
+`Deadline(after: $span)` is the same idea from a `time::duration`. A duration converts implicitly, so `connect($addr, time::duration::secs(1))` is a deadline too. `never()` waits as long as it takes. `now()` looks once and does not wait.
+
+`earlier` takes whichever of two passes first. `remaining` is the time left, zero once passed, null for `never()`.
+
+## Listen and accept
+
+`bind` takes an address, or a host and a port. The host form resolves for listening and binds the first address that takes.
+
+```echo
+tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
+    die("{$e}");
+}
+
+tcp::Listener $l = guard tcp::Listener::bind(host: '127.0.0.1', 8080) else ($e) {
+    die("{$e}");
+}
+```
+
+`accept($by)` waits for a connection, or returns null if nobody connected in time. `tryAccept` is the same with no wait, for a reactor. A connection the peer reset before it could be set up is skipped, not reported.
+
+`close` is safe from any thread. An accept blocked on the listener wakes with `.closed`, and the port is free as soon as no call is inside.
+
+`ListenOptions` is plain data, applied at bind:
+
+- `backlog` 128: how many finished handshakes may wait for an accept.
+- `reusePort` off: several listeners on the same port, POSIX only (`SO_REUSEPORT`).
+- `dualStack` off: a listener takes the family it was given. On, an IPv6 `::` listener takes IPv4 too.
+- `accepted`: the `StreamOptions` every accepted stream starts with.
+
+## Connect
+
+One address, before the deadline:
+
+```echo
+tcp::Stream $s = guard tcp::Stream::connect($addr, tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
+```
+
+A host name resolves and connects to whichever of its addresses answers first, all before the one deadline. The addresses race Happy Eyeballs style (RFC 8305): the families take turns, a new attempt starts every 250ms (or as soon as the latest fails) while the earlier ones keep going, so one address that drops packets cannot use up the deadline. A failure is the last attempt's.
+
+```echo
+tcp::Stream $s = guard tcp::Stream::connect(host: 'example.com', 443, tcp::Deadline(ms: 5000)) else ($e) {
+    die("{$e}");
+}
+```
+
+For a reactor, `Stream::start` does not wait. Register the `Connecting` with a `Poller` for `.write`, and call `tryFinish` when it reports. On success the handle belongs to the stream, and a registration with a poller carries over: `modify` it with the stream from here on. A failure leaves the handle here for `close`, after the poller has let go of it.
+
+```echo
+tcp::Connecting $c = guard tcp::Stream::start($addr) else ($e) {
+    die("{$e}");
+}
+guard $poller->add($c, 1, .write, .oneshot) else ($e) {
+    die("{$e}");
+}
+```
+
+A connect needs a port 1..65535. Port 0 is `.invalid`.
+
+## Read and write
+
+`read` appends at most `$most` bytes onto `$into`: how many arrived, or null when the deadline passed with nothing. `.eof` once the peer has closed. The read after the last byte is the eof, not the one that took it.
+
+`write` sends every byte before the deadline, so a peer that reads a byte at a time cannot hold the writer past it. `write($head, $body)` is one gathered write, neither copied, one packet when they fit.
+
+```echo
+guard $s->write('hello', tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
+
+string $buf = '';
+usize? $n = guard $s->read($buf, 4096, tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
+```
+
+A write `.timeout` leaves an unknown part sent and breaks the write side. Every later write is `.broken`. That is the catch: you cannot know how much the peer saw.
+
+`tryRead` and `tryWrite` never wait. A partial `tryWrite` is normal; the reactor keeps the offset (`$from`). `tryWrite($head, $body, $from)` counts across both, so one offset covers the pair.
+
+`readExactly` and `readAll` sit on any `Source`. Bytes that did arrive stay in `$into` even when the call fails.
+
+## Shutdown and close
+
+`shutdown(.write)` is a half-close: the peer reads the end of the stream while this side can still read. A read after `.read` or `.both` answers `.closed`, and so does a write after `.write` or `.both`. Asking again is not an error.
+
+The read side is this stream's alone. The peer is not told. Bytes it still sends wait unread. A `close` with them there is a reset, and a reset can destroy the reply the peer has not read yet.
+
+`finish($by)` shuts the write side, drains whatever the peer still sends until it closes too or the deadline passes, then closes. Use it when the peer might still be reading.
+
+`close` from any thread wakes every call blocked on the stream with `.closed`. The descriptor is released once the last of them has left. `Stream` is `#[atomic]`: an accept thread can hand it to the thread that serves it, and one thread may read while another writes.
+
+## Errors
+
+The cases are what a caller branches on. `"{$e}"` is the sentence. `name()` is the case without a match: `'eof'`, `'reset'`, and so on.
+
+| Case | Means |
+|---|---|
+| `eof` | the peer closed cleanly, and more was wanted |
+| `timeout` | a connect or a write ran out of time |
+| `closed` | this side closed the handle, or shut that direction |
+| `broken` | an earlier write failed partway |
+| `refused` | nothing listens at the address |
+| `reset` | the peer reset the connection, or it died another way |
+| `unreachable` | no route to the host or its network |
+| `addressInUse` | the address is already taken |
+| `tooManyFiles` | the process or the system is out of descriptors |
+| `resolve` | the host name did not resolve |
+| `invalid` | a port out of range, an empty host, an address that does not parse |
+| `os` | anything else, with the OS sentence |
+| `tooLarge` | a message over a reader's `max` |
+
+`gone()` is eof or reset: nothing more will come, and nothing sent will reach it. `sys()` is the failed system call behind the cases that carry one.
+
+Nothing-yet is never an error. A read or an accept that ran out of time hands back null, and so does a try call that would have had to wait.
+
+## Options
+
+`StreamOptions` is applied when a stream is connected or accepted. Fields with defaults, set by assignment.
+
+```echo
+tcp::StreamOptions $opt = tcp::StreamOptions();
+$opt->keepAlive = time::duration::secs(30);
+$opt->sendBuffer = 256 * 1024;
+```
+
+`noDelay` is on: request and reply traffic should never wait for a delayed ACK. `keepAlive` is off. Kernel buffer sizes of `0` keep the system's choice.
+
+Unix sockets skip no-delay and keepalive. Setting them on the stream after the fact is `.invalid`: a unix peer cannot vanish without the kernel knowing, and there is no Nagle delay to turn off.
+
+## Unix sockets
+
+A path on this machine instead of an address and a port. Local Postgres, MySQL, Redis.
+
+```echo
+tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: '/tmp/app.sock')) else ($e) {
+    die("{$e}");
+}
+```
+
+The socket file is made at bind and removed when the listener is released. A file left by a listener that is gone (the process died) is replaced: one that nothing answers on is stale. A live listener on the path stays `.addressInUse`, and a file that is not a socket is never touched.
+
+A path that is empty, holds a NUL, or is longer than the platform takes (103 bytes on macOS, 107 on Linux and Windows) is `.invalid`.
+
+## Poller
+
+A reactor that serves many connections from one thread: register streams and listeners, wait for some to be ready, then call their try methods until they answer null. epoll on Linux, kqueue on macOS, wepoll on Windows.
+
+Level or oneshot, never edge-triggered. Windows has no edge mode, so the portable surface does not either. A handle registered with a poller is driven with the try calls only.
+
+```echo
+tcp::Poller $poller = guard tcp::Poller::open() else ($e) {
+    die("{$e}");
+}
+
+guard $poller->add($listener, 0, .read) else ($e) {
+    die("{$e}");
+}
+
+array<tcp::Event> $events = array<tcp::Event>();
+guard $poller->wait($events, tcp::Deadline::never()) else ($e) {
+    die("{$e}");
+}
+```
+
+Keep one `$events` across waits. Its room is reused, so a wait allocates nothing after the first. Still empty means the deadline passed.
+
+`Event` carries the token you registered with: `readable()`, `writable()`, `hangup()`, `error()`. `woken()` is another thread calling `Poller::wake`. Several wakes before a wait sees them are one wake.
+
+`modify` changes interest, or arms a oneshot registration again. Remove a source before closing it. Removing a closed source is `.closed`: the OS dropped its registration with the handle, and the number may belong to another socket by now.
+
+`Stream`, `Listener`, and `Connecting` are `Pollable`. Token `0xFFFFFFFFFFFFFFFF` is the poller's own and is refused.
+
+## Outbox
+
+The bytes a reactor owes one connection. A try write takes what the socket has room for, and the rest waits here until the stream reports writable again.
+
+```echo
+tcp::Outbox $out = tcp::Outbox(limit: 4194304);
+guard $out->push('hello') else ($e) {
+    die("{$e}");   // .tooLarge: the bytes owed would pass the limit
+}
+guard $out->flush($stream) else ($e) {
+    die("{$e}");
+}
+
+tcp::Interest? $want = $out->interest($stream, reading: true);
+```
+
+`interest` is `.read` while reading and nothing is owed, `.write` or `.both` while bytes are owed, null once the connection is done. The stream has the last word (`Pollable::needs`), so a layer over a socket can ask for more than the caller named.
+
+## Reader
+
+A buffered reader for any wire format: a line protocol, a length in a header, or both. The core is free of I/O (`feed` bytes in, `take` and `until` out), so it also parses bytes that come from somewhere else.
+
+```echo
+tcp::Reader $r = tcp::Reader(max: 65536);
+
+string? $line = guard $r->until($stream, "\n", tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
+
+string $header = guard $r->peek(4) else {
+    // not four bytes yet
+    return;
+};
+uint32 $n = tcp::wire::be32($header);
+string? $body = guard $r->exactly($stream, $n as usize, tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+};
+```
+
+`exactly($n)` and `until($delim)` wait. `pullExactly` and `pullUntil` never wait: a reactor calls them until they answer null. Bytes read past a message stay buffered for the next one. `rest()` hands them over whole, to a TLS layer after a plaintext start.
+
+`max` (default 1 MiB) is the longest message held. A larger one is `.tooLarge` before it is read, so a peer cannot make a reader grow without end.
 
 ## Frames
 
-A frame is a `uint32` big-endian byte count followed by that many bytes.
+Length-prefixed messages: a uint32 big-endian byte count, then that many bytes. The encoding is pure; `Reader` and `write` move frames over any `Source` and `Sink`.
 
-- `frame(body)`, `frameHeader(uint32)`, `frameLength(bytes)` and `frameFits(size)` are pure. A body over `FRAME_MAX` (4 GiB - 1) is `tooLarge`, never a prefix cut to 32 bits: a wrapped length would make the receiver read the rest of the body as frames of its own.
-- `writeFrame(stream, body, timeoutMs)` sends prefix and body under one deadline. A body up to 64 KiB is copied behind its prefix and goes out as one write (one packet); a larger one is sent as prefix, then body, never copied.
-- A body `read` hands back shares the reader's buffer when it is most of it, and is copied out when it is small, so a caller that keeps small bodies does not keep 64 KiB read buffers alive.
-- `FrameReader(max, idleMs = -1)` turns a connection's bytes back into frames. `read(stream, timeoutMs)` waits up to the timeout for a whole frame, however many reads that takes, and returns its body; null means the timeout passed first. A partial frame is kept for the next call, so short timeouts never drop bytes. With `idleMs`, a reader that gets no whole frame for that long (from construction, or from the last frame) answers `FrameError.idle`, even partway through a longer or endless `read`. Bytes that trickle in without completing a frame do not reset it.
+```echo
+guard tcp::frame::write($stream, 'hello', tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
 
-A prefix over `max` is `FrameError.tooLarge` before anything is allocated. Text that is not a frame lands there: an HTTP request line (`GET `) reads as more than a gigabyte. A peer that closes between frames is `closed`; one that closes partway through a frame is `truncated`.
-
-## The platform contract
-
-`c/tcp.h` is the only thing a backend implements:
-
-- **Handles** are `int64_t`, so a POSIX fd and a Winsock `SOCKET` both fit.
-- **Return codes:** every call returns 0 or more on success, `TCP_ERR` (-1) on failure (the OS code from `tcp_last_error()`, kept per thread), `TCP_CLOSED` (-2) when the peer closed, and `TCP_TIMEOUT` (-3) when the wait ran out.
-- **`timeout_ms`:** -1 waits forever, 0 polls once.
-- No call raises a signal, and no handle is inherited by a child process.
-
-| Concern | `posix.c` | `win32.c` |
-|---|---|---|
-| Init | nothing | `WSAStartup(2.2)` once (`InitOnceExecuteOnce`) in `tcp_listen` / `tcp_connect` |
-| Socket | `socket`, `FD_CLOEXEC`, `O_NONBLOCK` | `WSASocketW(..., WSA_FLAG_NO_HANDLE_INHERIT)`, `ioctlsocket(FIONBIO)`; accepted sockets also `SetHandleInformation` |
-| Rebind | `SO_REUSEADDR` | `SO_EXCLUSIVEADDRUSE` (Windows `SO_REUSEADDR` lets a second socket take a bound port) |
-| Wait | `poll` | accept and connect: `select` with `exceptfds` (`WSAPoll` missed failed connects before Windows 10 2004); recv and send: overlapped `WSARecv` / `WSASend` on an event of their own, `CancelIoEx` at the deadline (see below) |
-| Connect | non-blocking connect, wait writable, `SO_ERROR` | the same; `WSAEWOULDBLOCK` is in progress, always check `SO_ERROR` |
-| No SIGPIPE | `MSG_NOSIGNAL` / `SO_NOSIGPIPE` | not needed |
-| Closed | `recv` 0, `ECONNRESET`, `EPIPE` | `recv` 0, `WSAECONNRESET`, `WSAECONNABORTED`, `WSAESHUTDOWN` |
-| Lengths | `size_t` | `int`: `recv` clamps to `INT_MAX`, `send` to 64 KiB (see below) |
-| Close | `close`, `shutdown(SHUT_WR)` | `closesocket`, `shutdown(SD_SEND)` |
-| Clock | `CLOCK_MONOTONIC` | `GetTickCount64` |
-| Last error | `__thread` | `__declspec(thread)` |
-| Errors | `errno`, `strerror_r` | `WSAGetLastError`, `FormatMessageW` as UTF-8 |
-
-A Winsock `send` takes the whole call into the kernel whenever the buffer has any room, so one large call to a peer that never reads would return at once. `win32.c` hands it at most 64 KiB per call, so a full buffer pushes back and `writeAll`'s deadline holds.
-
-Reads and writes on a connection are overlapped, not readiness-based, because readiness fails on Windows when two threads use one socket. While one thread waits in `select` (or `WSAPoll`) to read, another thread's wait to write wakes late or not at all, and a 2 MiB write that takes 16 ms alone times out after seconds. Each overlapped call waits on its own event, so a reader thread and a writer thread never meet.
-
-The manifest picks the backend:
-
-```
-#[if: os == windows]
-#[cc: sources "c/win32.c"]
-#[link: lib "ws2_32"]
-#[else]
-#[cc: sources "c/posix.c"]
-#[end]
+tcp::frame::Reader $frames = tcp::frame::Reader(max: 65536, idle: time::duration::secs(30));
+string? $body = guard $frames->read($stream, tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+};
 ```
 
-## Limits
+Prefix and body go in one gathered write, neither copied. `frame::push($out, $body)` queues the same pair on an `Outbox`. A body past `frame::MAX` (what a 4-byte prefix can announce) is `.tooLarge`, with nothing sent.
 
-- **Name lookup is not bounded.** `connect` resolves a host name with `getaddrinfo` before its timeout starts, and a DNS stall blocks it. Pass an address where that matters.
-- **One reader and one writer per `Stream` at a time.** One thread may read while another writes (full duplex). Two readers, or two writers, interleave bytes. Closing a stream on one thread while another is in a call on it can hit a recycled descriptor (or `SOCKET`), so close only once the others are done.
-- **CLOEXEC on macOS.** Linux creates every socket `CLOEXEC` atomically (`SOCK_CLOEXEC`, `accept4`). macOS has no such call: the flag is set right after, and a `fork` + `exec` on another thread in that gap inherits the descriptor. Spawn children with `POSIX_SPAWN_CLOEXEC_DEFAULT` where it matters.
-- **Windows.** A connect to a closed port can come back as `timeout` rather than a connect error: Windows retries a refused SYN for about two seconds. A reset from the peer drops bytes this side has not read yet. A listener's port cannot be bound again while connections it accepted are still open (`SO_EXCLUSIVEADDRUSE`).
-- **Slow peers are the caller's policy.** Use `FrameReader`'s `idleMs` and a `writeAll` deadline, and cap connections; the library does not.
+`frame::Reader::pull` is the reactor form: call it until it answers null, then wait on the poller. Frames that arrived with the peer's close still come out first, then `.end`, or `.truncated` when the close cut a frame short.
 
-`tests/` is the conformance suite. It is written against the Echo API only, so a backend is done when `echoc test` passes unchanged on its platform.
+`$idle` ends a conversation that delivers no whole frame for that long. Bytes trickling in do not count, so a peer that sends one byte a minute is still idle. `read` answers `.idle` itself. A reactor waits no later than its readers' earliest `idleAt()`, and a frame already in the socket still beats the limit.
 
-## Test
+A prefix over `max` is `.tooLarge` before any body is buffered. Text that is not a frame lands here: `GET ` reads as over a gigabyte.
+
+`frame::Error::end` is the peer closing between frames, the clean end of a conversation. That is not `tcp::Error::closed`, which is this side closing. `transport` keeps the connection's error whole. `"{$e}"` and `name()` work the same way (`'transport:reset'`).
+
+## Wire
+
+Fixed-width integers as wire protocols lay them out, read at an offset of a string and appended onto one. Big-endian is network order (frames, Postgres). Little-endian is MySQL and most game protocols. `le24` is MySQL's packet length.
+
+A read expects the bytes to be there. Check `size()` or a reader's `buffered()` first.
+
+```echo
+uint32 $n = tcp::wire::be32($bytes, 0);
+tcp::wire::putBe32($out, $n);
+```
+
+## Source and Sink
+
+`Stream` is a `Source` and a `Sink`. The layers above it (frames today, a test double, TLS tomorrow) take those interfaces, not one concrete socket. `Pollable::needs` is the matching hook for a poller: a plain socket answers what you asked; a layer over one may need write readiness to flush ciphertext a read produced.
+
+There is no TLS in this module. The seams are there so a layer can sit on a stream without the stream knowing.
+
+## Working here
 
 ```bash
 echoc test
+echoc run -m examples/reactor
 ```
+
+The example is a frame echo server on one thread: a `Poller`, `frame::Reader::pull`, an `Outbox`. It runs for a couple of seconds, then the main thread stops it with `Poller::wake`.
+
+## License
+
+MIT. Copyright Mario Döring, Boris Stock.
