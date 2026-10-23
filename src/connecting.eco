@@ -1,7 +1,7 @@
 /**
  * A connect that does not wait, for a reactor or a game's frame loop: `Stream::start` begins it,
- * a `Poller` reports the handle writable when it is over, and `tryFinish` turns it into the
- * `Stream`, or says why it failed.
+ * a `Poller` reports writable when it is over, and `tryFinish` turns it into the `Stream`, or
+ * says why it failed.
  */
 
 namespace tcp;
@@ -10,9 +10,6 @@ use std::time;
 
 public class Connecting : Pollable
 {
-    /**
-     * Where it connects to.
-     */
     public const Address $to;
     // the socket while this owns it; -1 once handed to the stream or closed
     private int64 $fd;
@@ -36,11 +33,10 @@ public class Connecting : Pollable
     }
 
     /**
-     * The stream once the connect is over, or null while it is still in progress: call it when
-     * the poller reports the handle writable. A failure (`.refused`, `.unreachable`, ...) leaves
-     * the handle here for `close`, after the poller has let go of it. On success the handle
-     * belongs to the stream, and a registration with a poller carries over: `modify` it with the
-     * stream from here on.
+     * The stream once the connect is over, or null while it is still going. Call it when the
+     * poller says writable. On failure the handle stays here for `close` after the poller lets
+     * go. On success it belongs to the stream, and a poller registration carries over: `modify`
+     * it with the stream from here on.
      */
     public function tryFinish() : result<Stream?, Error>
     {
@@ -103,11 +99,9 @@ public class Connecting : Pollable
 }
 
 /**
- * Connect to whichever of `$addrs` answers first, all before the deadline: Happy Eyeballs (RFC
- * 8305). The families take turns, starting with the one the system put first, so a host whose
- * IPv6 silently drops packets still connects over IPv4. One attempt starts every `$stagger`, or
- * at once when the latest one fails, and the earlier ones keep racing. The first to connect wins
- * and the others are closed. When every one fails, the failure is the last one's.
+ * Connect to whichever of `$addrs` answers first: Happy Eyeballs (RFC 8305). Families take
+ * turns, a new attempt every `$stagger` or as soon as the latest fails. The first to connect
+ * wins; the others are closed. When every one fails, the failure is the last one's.
  */
 internal function connectAll(const array<Address>& $addrs, Deadline $by, StreamOptions $options, time::duration $stagger) : result<Stream, Error>
 {

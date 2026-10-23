@@ -46,8 +46,8 @@ public enum Error
     }
 
     /**
-     * The case's name, `end` or `idle` and so on; a transport error is `transport:` and the
-     * cause's name, `transport:reset`.
+     * The case's name (`end`, `idle`, ...); a transport error is `transport:` plus the cause,
+     * `transport:reset`.
      */
     public const function name() : string
     {

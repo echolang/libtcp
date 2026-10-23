@@ -2,21 +2,18 @@
  * libtcp on POSIX (macOS, Linux): the c/tcp.h contract over BSD sockets.
  *
  * Every socket is non-blocking and CLOEXEC. A call waits with poll() up to
- * its timeout, then tries the operation; a wake that finds nothing to do
- * (EAGAIN) waits again until the deadline. So no call blocks past its
- * timeout. A send and an accept try once before the first wait, since they
- * usually find room or a connection and the poll would be wasted. The try
- * calls skip the wait and answer TCP_AGAIN instead.
+ * its timeout, then tries the operation; EAGAIN waits again until the
+ * deadline. A send and an accept try once before the first wait: they
+ * usually find room or a connection. Try calls skip the wait and answer
+ * TCP_AGAIN.
  *
- * A failure is sorted into a TCP_K_* kind right where it happens and handed
- * back through the caller's tcp_err, with errno kept beside it for the text.
+ * A failure becomes a TCP_K_* kind where it happens, handed back through
+ * the caller's tcp_err, errno kept beside it for the text.
  *
- * On Linux a socket is born CLOEXEC (SOCK_CLOEXEC, accept4), so a fork and
- * exec on another thread never inherits it. macOS has no atomic form: the
- * flag is set right after, and a fork landing in that gap inherits the fd.
- *
- * Readiness is epoll on Linux and kqueue on macOS, behind the same
- * tcp_poll_* calls. A wake is an eventfd on Linux and a pipe on macOS.
+ * Linux sockets are born CLOEXEC (SOCK_CLOEXEC, accept4). macOS has no
+ * atomic form: the flag is set right after, and a fork in that gap inherits
+ * the fd. Readiness is epoll on Linux, kqueue on macOS. A wake is an
+ * eventfd on Linux and a pipe on macOS.
  */
 
 #if defined(__linux__)
@@ -64,9 +61,9 @@
 #include "common.h"
 
 /*
- * A listener on Linux is its socket: a shutdown wakes a poll blocked on a listening socket, and
- * every accept after it fails. On macOS a shutdown wakes nothing, so a listener is a record that
- * also holds the wake tcp_listener_cancel signals.
+ * A listener on Linux is its socket: a shutdown wakes a poll blocked on it, and every accept
+ * after it fails. On macOS a shutdown wakes nothing, so a listener is a record that also holds
+ * the wake tcp_listener_cancel signals.
  */
 #if defined(__linux__)
 #define LISTENER_IS_SOCKET 1
@@ -821,7 +818,7 @@ int64_t tcp_try_recv(int64_t h, uint8_t *buf, int64_t len, tcp_err *err)
 
 int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_err *err)
 {
-    int64_t deadline;
+    int64_t deadline = deadline_of(timeout_ms);
     int64_t got;
     int ready;
 
@@ -829,13 +826,6 @@ int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_e
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
-    /* while a reply streams in, the next bytes are nearly always there: try before paying for a poll */
-    got = tcp_try_recv(h, buf, len, err);
-    if (got != TCP_AGAIN) {
-        return got;
-    }
-
-    deadline = deadline_of(timeout_ms);
     for (;;) {
         ready = wait_for((int)h, POLLIN, deadline, -1, err);
         if (ready < 0) {
@@ -900,7 +890,6 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
     int64_t put;
     int ready;
 
-    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
     if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
@@ -939,7 +928,6 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
 
 int64_t tcp_try_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, int64_t blen, tcp_err *err)
 {
-    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
     if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
@@ -979,7 +967,6 @@ void tcp_close(int64_t h)
 
 int32_t tcp_set_option(int64_t h, int32_t opt, int64_t value, tcp_err *err)
 {
-    /* clamped both ways: a cast alone keeps the low bits, and -(2^32) + 5 would be 5 */
     int v = value > 0x7fffffff ? 0x7fffffff : value < 0 ? 0 : (int)value;
     int rc;
 
@@ -1184,7 +1171,6 @@ int32_t tcp_poll_ctl(int64_t p, int32_t op, int64_t h, uint64_t token, int32_t i
     struct epoll_event ev;
     int how = op == TCP_POLL_ADD ? EPOLL_CTL_ADD : op == TCP_POLL_MODIFY ? EPOLL_CTL_MOD : EPOLL_CTL_DEL;
 
-    /* an op it does not know is a mistake, never a remove */
     if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
         return (int32_t)fail_as(err, TCP_K_INVALID, EINVAL);
     }
@@ -1337,7 +1323,6 @@ static int poll_reserve(kpoll *p, int fd)
         return 0;
     }
 
-    /* the doubling below would overflow an int */
     if (fd >= 0x3fffffff) {
         return -1;
     }
@@ -1417,7 +1402,6 @@ int32_t tcp_poll_ctl(int64_t handle, int32_t op, int64_t h, uint64_t token, int3
         return (int32_t)fail(err, EBADF);
     }
 
-    /* an op it does not know is a mistake, never a remove */
     if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
         return (int32_t)fail_as(err, TCP_K_INVALID, EINVAL);
     }

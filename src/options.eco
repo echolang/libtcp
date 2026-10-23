@@ -10,8 +10,8 @@ use std::time;
 public struct StreamOptions
 {
     /**
-     * Send small writes at once instead of waiting to batch them (TCP_NODELAY). On by default:
-     * request and reply traffic should never wait for a delayed ACK.
+     * Send small writes at once (TCP_NODELAY). On by default: request and reply traffic should
+     * never wait for a delayed ACK.
      */
     public bool $noDelay = true;
 

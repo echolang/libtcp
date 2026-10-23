@@ -55,7 +55,6 @@ test tcp_a_c_call_is_handed_whole_milliseconds
 
 test tcp_a_deadline_too_far_for_milliseconds_still_waits_its_longest
 {
-    // 2^64 / 1000 seconds and a bit: its milliseconds wrap to 384, a short wait, unless capped first
     time::duration $span = time::duration::secs(18446744073709552);
     int32 $ms = tcp::Deadline(at: time::instant::now() + $span)->ms();
     expect($ms == 2147483647, "capped, not wrapped into a short wait or forever: {$ms}");

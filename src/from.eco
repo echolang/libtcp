@@ -1,6 +1,6 @@
 /**
  * `str::from` for this library's types, so `"{$e}"` and `"{$address}"` work, and `hash::of` so an
- * `Address` can key a map. A file of its own because a namespace is a property of the file.
+ * `Address` can key a map. Own file because a namespace is a property of the file.
  */
 
 namespace str;

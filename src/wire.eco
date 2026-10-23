@@ -1,17 +1,14 @@
 /**
- * Fixed-width integers as wire protocols lay them out: big-endian (network order: frames,
- * Postgres) and little-endian (MySQL, most game protocols), read at an offset of a string (or of
- * a view, a reader's `window` say) and appended onto one. A read expects the bytes to be there;
- * check the size (or a reader's `buffered()`) first. One past the end stops the program, in a
- * release build too.
+ * Fixed-width integers as wire protocols lay them out: big-endian (frames, Postgres) and
+ * little-endian (MySQL, most game protocols). Read at an offset of a string (or a view, a
+ * reader's `window`) and append onto one. The bytes have to be there: one past the end stops
+ * the program, in a release build too.
  */
 
 namespace tcp::wire;
 
 /**
- * Stops the program unless `$n` bytes of `$b` start at `$at`. A release build checks too: an
- * offset or a length a peer sent, used unchecked, would otherwise read heap memory past the
- * string as if it were the message.
+ * Stops the program unless `$n` bytes of `$b` start at `$at`. A release build checks too.
  */
 #[inline]
 internal function need(string::view $b, usize $at, usize $n) : void

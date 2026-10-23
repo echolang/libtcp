@@ -2,9 +2,8 @@
  * libtcp: TCP sockets, readiness and length-prefixed frames for Echo.
  *
  * The platform layer is C behind one contract (c/tcp.h): c/posix.c on macOS
- * and Linux (epoll or kqueue for readiness), c/win32.c on Windows (Winsock,
- * with readiness from the vendored wepoll). Deadlines, addresses, frames and
- * everything else are Echo. No TLS, no HTTP.
+ * and Linux (epoll or kqueue), c/win32.c on Windows (Winsock, wepoll).
+ * Deadlines, addresses, frames and the rest are Echo. No TLS, no HTTP.
  */
 
 #[module: "libtcp"]

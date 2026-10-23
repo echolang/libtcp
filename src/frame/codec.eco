@@ -1,6 +1,6 @@
 /**
  * Length-prefixed frames: a uint32 big-endian byte count, then that many bytes. This file is the
- * pure encoding; `Reader` and `write` move frames over any `tcp::Source` and `tcp::Sink`.
+ * encoding; `Reader` and `write` move frames over any `tcp::Source` and `tcp::Sink`.
  */
 
 namespace tcp::frame;

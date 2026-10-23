@@ -1,7 +1,7 @@
 /**
  * What a byte stream offers, so the layers above it (frames today, TLS or a test double
- * tomorrow) take any of them, not one concrete socket. What a `Poller` watches is `Pollable`, in
- * src/poll.eco. `readExactly` and `readAll` are the reads composed from `Source::read`.
+ * tomorrow) take any of them, not one concrete socket. What a `Poller` watches is `Pollable`
+ * (src/poll.eco). `readExactly` and `readAll` are the reads composed from `Source::read`.
  */
 
 namespace tcp;
@@ -64,8 +64,6 @@ public function readExactly<S : Source>(S $src, string& $into, usize $n, Deadlin
         return .error(.invalid("{$n} more bytes do not fit a string"));
     }
 
-    // the bytes come in reads of READ_BIG at most, so the buffer grows only as they arrive,
-    // never by a length the peer announced and then did not send
     usize $want = $into->size() + $n;
     while ($into->size() < $want) {
         usize $ask = $want - $into->size();
@@ -84,14 +82,13 @@ public function readExactly<S : Source>(S $src, string& $into, usize $n, Deadlin
 
 /**
  * Append everything `$src` sends onto `$into` until the peer closes, before the deadline, and at
- * most `$max` bytes. `.timeout` when the deadline passes first, with what did arrive in `$into`.
- * `.tooLarge` once the peer sends more than `$max`: a peer cannot make it buffer without end.
+ * most `$max` bytes. `.timeout` when the deadline passes first, `.tooLarge` past `$max`, either
+ * way with what did arrive in `$into`.
  */
 public function readAll<S : Source>(S $src, string& $into, max: usize $max, Deadline $by) : status<Error>
 {
     usize $added = 0;
     while (true) {
-        // one byte over the limit is enough to tell a peer that sent too much
         usize $ask = 65536;
         if ($max - $added < $ask) {
             $ask = $max - $added + 1;
@@ -116,7 +113,6 @@ public function readAll<S : Source>(S $src, string& $into, max: usize $max, Dead
         if ($added > $max) {
             return .error(.tooLarge($added as uint64));
         }
-        // a peer that never pauses would keep every read busy: the deadline still ends it
         if ($by->passed()) {
             return .error(.timeout);
         }

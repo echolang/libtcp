@@ -110,9 +110,8 @@ public class Stream : Source, Sink, Pollable
 
     /**
      * Resolve `$host` and connect to whichever of its addresses answers first, all before the
-     * one deadline. The lookup is bounded by the deadline too (`tcp::resolve`). The addresses
-     * race Happy Eyeballs style (RFC 8305): the families take turns, a new attempt starts every
-     * `$stagger` (or as soon as the latest fails) while the earlier ones keep going, so one
+     * one deadline. The lookup is bounded by it too. Addresses race Happy Eyeballs (RFC 8305):
+     * families take turns, a new attempt every `$stagger` or as soon as the latest fails, so one
      * address that drops packets cannot use up the deadline. A failure is the last attempt's.
      */
     public static function connect(host: const string& $host, uint16 $port, Deadline $by, StreamOptions $options = StreamOptions(), stagger: time::duration $stagger = time::duration::millis(250)) : result<Stream, Error>
@@ -295,10 +294,10 @@ public class Stream : Source, Sink, Pollable
 
     /**
      * Shut one direction or both. After `.write` the peer reads the end of the stream while
-     * this side can still read. A read after `.read` or `.both` answers `.closed`, and so does a
-     * write after `.write` or `.both`. The read side is this stream's alone: the peer is not
-     * told, and bytes it still sends wait unread (a `close` with them there is a reset). A
-     * direction shut already stays shut: asking again is not an error.
+     * this side can still read. A read after `.read` or `.both` is `.closed`, and so is a write
+     * after `.write` or `.both`. The read side is this stream's alone: the peer is not told, and
+     * bytes it still sends wait unread (a `close` with them there is a reset). A direction shut
+     * already stays shut: asking again is not an error.
      */
     public function shutdown(Direction $which) : status<Error>
     {
@@ -370,7 +369,6 @@ public class Stream : Source, Sink, Pollable
                 $this->close();
                 return .ok;
             }
-            // a peer that never stops sending would keep every read busy: the deadline still ends it
             if ($got->unwrap() == null || $by->passed()) {
                 $this->close();
                 return .error(.timeout);
@@ -597,8 +595,6 @@ public class Stream : Source, Sink, Pollable
             return .error(.closed);
         }
 
-        // a read grows the buffer by READ_BIG at most: a length a peer announced never turns into
-        // one allocation, and C is never told of more room than the buffer has
         usize $grow = $most;
         if ($grow > READ_BIG) {
             $grow = READ_BIG;
@@ -617,8 +613,24 @@ public class Stream : Source, Sink, Pollable
             return $this->received($into, $now, $err, TCP_AGAIN, $shut);
         }
 
-        // `tcp_recv` takes what is already there before it polls
-        int64 $got = tcp_recv($this->fd, $into->spare(), $ask as int64, $until->ms(), &$err);
+        int64 $got = TCP_AGAIN;
+        bool $more = $this->gate->has(GATE_MORE);
+        // last read filled the request, so more is likely waiting: skip the poll. Most reads
+        // come after a request sent, when nothing is there yet; those poll first
+        if ($more) {
+            $got = tcp_try_recv($this->fd, $into->spare(), $ask as int64, &$err);
+        }
+        if ($got == TCP_AGAIN) {
+            $got = tcp_recv($this->fd, $into->spare(), $ask as int64, $until->ms(), &$err);
+        }
+        bool $full = $got == ($ask as int64);
+        if ($full != $more) {
+            if ($full) {
+                $this->gate->mark(GATE_MORE);
+            } else {
+                $this->gate->unmark(GATE_MORE);
+            }
+        }
         bool $closed = $this->leave();
         return $this->received($into, $got, $err, TCP_TIMEOUT, $closed);
     }

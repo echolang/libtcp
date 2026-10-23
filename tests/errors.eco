@@ -116,8 +116,8 @@ internal function sysCode(tcp::Error $e) : int32
 
 test tcp_every_error_case_answers_sys
 {
-    // `sys` works around an echoc miscompile (a payload matched into a nullable), so every case
-    // is asked, each with its own code
+    // `sys` works around an echoc miscompile (a payload matched into a nullable): every case is
+    // asked, each with its own code
     expect(sysCode(.refused(tcp::SysError(.connect, 1, 'a'))) == 1, 'refused');
     expect(sysCode(.reset(tcp::SysError(.read, 2, 'b'))) == 2, 'reset');
     expect(sysCode(.unreachable(tcp::SysError(.connect, 3, 'c'))) == 3, 'unreachable');

@@ -1,9 +1,8 @@
 /**
- * Name lookups a deadline can bound. The system resolver (`getaddrinfo`) waits as long as DNS
- * takes, so a `Lookup` runs it on a thread of its own: the caller waits for the answer up to its
- * deadline, polls for it from a frame loop, or has a reactor's `Poller` woken when it is in. A
- * lookup that outlives its deadline finishes on its thread and its answer is dropped. A numeric
- * host needs no lookup and starts no thread.
+ * Name lookups a deadline can bound. `getaddrinfo` waits as long as DNS takes, so a `Lookup`
+ * runs it on a thread of its own. Wait for the answer, poll from a frame loop, or have a
+ * `Poller` woken when it lands. A lookup that outlives its deadline finishes on its thread and
+ * the answer is dropped. A numeric host starts no thread.
  */
 
 namespace tcp;
@@ -20,13 +19,11 @@ internal struct Answer
     public Error $error;
 }
 
-// the most lookup threads running at once, across the process
 internal const int32 LOOKUP_THREADS = 64;
 
 #[atomic]
 public class Lookup
 {
-    // lookup threads running now: a resolver that hangs must not let lookups pile up a thread each
     internal static atomic<int32> $running = atomic<int32>(0);
     public const string $host;
     public const uint16 $port;
@@ -47,8 +44,7 @@ public class Lookup
     }
 
     /**
-     * Start looking `$host` up for `$port`. A lookup runs on a thread of its own, and at most 64
-     * run at once: past that the start fails, so a resolver that hangs cannot pile up threads.
+     * Start looking `$host` up for `$port`. At most 64 lookups run at once; past that it fails.
      */
     public static function start(const string& $host, uint16 $port) : result<Lookup, Error>
     {

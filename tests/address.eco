@@ -137,7 +137,6 @@ test tcp_a_nul_byte_never_reaches_c
 
 test tcp_ipv4_shorthands_are_refused_on_every_os
 {
-    // the C resolvers take these, and not all alike: 0177.0.0.1 is 127.0.0.1 on Linux, 177.0.0.1 on macOS
     expect(failed(tcp::Address::parse('0177.0.0.1', 80)) == 'invalid', 'a leading zero, octal to some');
     expect(failed(tcp::Address::parse('01.2.3.4', 80)) == 'invalid', 'any leading zero');
     expect(failed(tcp::Address::parse('2130706433', 80)) == 'invalid', 'one number');
@@ -168,7 +167,6 @@ test tcp_ipv4_shorthands_are_refused_on_every_os
 
 test tcp_a_lookup_refuses_ipv4_shorthands_as_names
 {
-    // getaddrinfo takes a shorthand as a name and reads it as IPv4 its own way
     expect(failed(tcp::resolve('2130706433', 80)) == 'invalid', 'one number');
     expect(failed(tcp::resolve('0177.0.0.1', 80)) == 'invalid', 'octal to some');
     expect(failed(tcp::resolve('127.1', 80)) == 'invalid', 'two parts');
@@ -176,7 +174,6 @@ test tcp_a_lookup_refuses_ipv4_shorthands_as_names
     expect(failed(tcp::resolve('127.0.0.1.', 80)) == 'invalid', 'a trailing dot');
     expect(failed(tcp::resolve('2130706433', 80, ms(5000))) == 'invalid', 'with a deadline too');
 
-    // names that only look numeric somewhere else are names
     expect(tcp::endsInNumber('cafe.be') == false, 'hex letters in a name');
     expect(tcp::endsInNumber('1.example.com') == false, 'a number up front');
     expect(tcp::endsInNumber('example.0x') == true, 'an empty hex number');

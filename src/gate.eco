@@ -1,8 +1,7 @@
 /**
- * Closing a handle while another thread is inside a call on it. The handle's number is released
- * exactly once, by whoever leaves last after a close, so no call ever runs on a number that has
- * since been handed to another socket. The gate only counts and says who that is; the owner
- * (`Stream`, `Listener`) does the release, so the gate knows no kind of handle.
+ * Closing a handle while another thread is inside a call on it. The last one out after a close
+ * releases the number, so no call ever runs on a socket that has since been handed out. The
+ * owner (`Stream`, `Listener`) does the release; the gate only counts.
  */
 
 namespace tcp;
@@ -13,6 +12,9 @@ internal const int32 GATE_CLOSED = 0x40000000;
 internal const int32 GATE_BROKEN = 0x20000000;
 internal const int32 GATE_WRITE_SHUT = 0x10000000;
 internal const int32 GATE_READ_SHUT = 0x04000000;
+
+// a hint, not state: the last read filled all it asked for, so more is likely waiting
+internal const int32 GATE_MORE = 0x08000000;
 
 /**
  * How a call left a `Gate`.
@@ -62,9 +64,9 @@ internal struct Gate
 
     /**
      * Counts the caller out. When it was the last one in after a close, `last` says so and the
-     * caller releases the handle: the gate never touches it. `closed` says the handle was closed
-     * by the time the call left: then the call was cancelled, and what it returned says nothing
-     * about the peer (c/tcp.h).
+     * caller releases the handle: the gate never touches it. `closed` means the handle was
+     * closed by the time the call left: the call was cancelled, and what it returned says
+     * nothing about the peer (c/tcp.h).
      */
     public function leave() : Exit
     {
@@ -107,6 +109,19 @@ internal struct Gate
                 return;
             }
             if ($this->word->compare_exchange($w, $w | $flag)) {
+                return;
+            }
+        }
+    }
+
+    public function unmark(int32 $flag) : void
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & $flag) == 0) {
+                return;
+            }
+            if ($this->word->compare_exchange($w, $w & ~$flag)) {
                 return;
             }
         }

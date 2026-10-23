@@ -1,7 +1,6 @@
 /**
  * The platform contract over real loopback sockets: listening, connecting, deadlines, the error
- * kinds and closed handles. Every file in tests/ is written against the Echo API only, so the
- * same suite proves each backend (c/posix.c, c/win32.c) unchanged.
+ * kinds, closed handles. Same suite against each backend (c/posix.c, c/win32.c).
  */
 
 use std::time;

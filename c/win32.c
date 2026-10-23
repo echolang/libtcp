@@ -1,46 +1,22 @@
 /*
- * libtcp on Windows: the c/tcp.h contract over Winsock 2.
+ * libtcp on Windows: the c/tcp.h contract over Winsock 2. No socket is
+ * inheritable, and no call blocks past its timeout.
  *
- * No socket is inheritable, and no call blocks past its timeout.
+ * Listening and connecting wait in select(), not WSAPoll: before Windows 10
+ * 2004 WSAPoll never reported a failed non-blocking connect. A refused
+ * connect wakes exceptfds. Connection reads and writes use overlapped I/O
+ * instead. Two threads waiting on one socket in select starve each other, so
+ * a 2 MiB write times out. Try calls stay a plain non-overlapped recv or
+ * WSASend: WSAEWOULDBLOCK when they would wait, nothing started that would
+ * have to be cancelled.
  *
- * Listening and connecting run non-blocking: a call waits with select() up
- * to its timeout, then tries the operation, and a wake that finds nothing to
- * do (WSAEWOULDBLOCK) waits again until the deadline. select, not WSAPoll:
- * before Windows 10 2004 WSAPoll never reported a failed non-blocking
- * connect, and a refused connect sat out its timeout. select reports it
- * through exceptfds.
+ * tcp_cancel shuts the socket down and cancels every overlapped call with
+ * CancelIoEx. A wake is a UDP socket on loopback connected to itself, so it
+ * reads as readable to both select and wepoll. Readiness is wepoll (AFD).
  *
- * A connection's blocking reads and writes use overlapped I/O instead: each
- * call starts the operation with its own event, waits on that, and cancels
- * it at the deadline. Readiness does not work here. Two threads waiting on
- * one socket, one to read and one to write, starve each other: with a reader
- * parked in select (or WSAPoll), a writer's wake comes late or not at all,
- * and a 2 MiB write that takes 16 ms alone times out after seconds.
- *
- * A connection stays in non-blocking mode, which overlapped calls ignore, so
- * the try calls are a plain non-overlapped recv or WSASend: one call that
- * answers WSAEWOULDBLOCK when it would wait, and reports exactly what it
- * took. Nothing is started that would have to be cancelled.
- *
- * tcp_cancel shuts the socket down and cancels every overlapped call on it
- * (CancelIoEx with no OVERLAPPED reaches every thread's), so a call blocked
- * on another thread returns at once; one that starts after it fails at once
- * on the shut socket.
- *
- * A wake is a UDP socket on loopback connected to itself: signalling sends
- * it a datagram, so it reads as readable both to select (an accept waiting
- * for it) and to wepoll, which only ever watches sockets.
- *
- * Readiness (tcp_poll_*) is wepoll (c/wepoll/wepoll.c, BSD-2), which polls
- * the AFD driver the way epoll polls a Linux socket.
- *
- * Failures are sorted into TCP_K_* kinds where they happen. Winsock and
- * Win32 codes share one space, and FormatMessage reads both, getaddrinfo's
- * included.
- *
- * Winsock starts once (WSAStartup), on the first call that makes a socket or
- * resolves a name: every other call takes a handle one of those made. It is
- * never cleaned up; the process ending does that.
+ * Failures become TCP_K_* where they happen. Winsock and Win32 codes share
+ * one space; FormatMessage reads both. Winsock starts once on the first
+ * socket or lookup. The process ending cleans it up.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -69,10 +45,7 @@
 #define IO_REPARSE_TAG_AF_UNIX 0x80000023L
 #endif
 
-/*
- * FILE_ID_INFO and its class (Windows 8 and later), declared here for the same reason: a ReFS
- * file id is 128 bits, and the 64-bit index GetFileInformationByHandle gives is not unique there.
- */
+/* FILE_ID_INFO and its class (Windows 8 and later), declared here for the same reason */
 typedef struct tcp_file_id_info {
     ULONGLONG volume;
     BYTE id[16];
@@ -342,8 +315,8 @@ static SOCKET open_socket(int family)
 /*
  * One overlapped send or receive over up to two buffers, waiting up to timeout_ms (0: only what
  * completes at once). On the deadline the operation is cancelled and its result collected either
- * way, so bytes that landed in the race are reported, not lost. The count, TCP_EOF, TCP_TIMEOUT,
- * or TCP_ERR; a call cancelled by tcp_cancel on another thread is TCP_ERR of kind shutdown.
+ * way, so bytes that landed in the race are reported, not lost. A call cancelled by tcp_cancel
+ * on another thread is TCP_ERR of kind shutdown.
  */
 static int64_t overlapped(SOCKET s, int sending, WSABUF *bufs, DWORD count, int32_t timeout_ms, tcp_err *err)
 {
@@ -387,11 +360,7 @@ static int64_t overlapped(SOCKET s, int sending, WSABUF *bufs, DWORD count, int3
         if (lost == 0) {
             rc = WSAGetOverlappedResult(s, &ov, &done, TRUE, &flags);
         } else {
-            /*
-             * a broken event is no use to wait on: poll the operation's own status instead. There is
-             * no giving up here: ov and the buffers stay the kernel's until the I/O lands, and ov is
-             * on this stack, so a return before that would let it write into a frame that is gone
-             */
+            /* a broken event is no use to wait on: poll the operation's own status instead */
             while (!(rc = WSAGetOverlappedResult(s, &ov, &done, FALSE, &flags)) && WSAGetLastError() == WSA_IO_INCOMPLETE) {
                 Sleep(1);
             }
@@ -601,19 +570,13 @@ failed:
     return fail(err, code);
 }
 
-/*
- * The accepted socket, or INVALID_SOCKET with the code in *code. accept() takes no flag, so the
- * socket is inheritable until no_inherit clears it: a CreateProcess with inheritance on, on
- * another thread in that moment, hands the child the connection. A process that spawns children
- * that way names their handles (PROC_THREAD_ATTRIBUTE_HANDLE_LIST).
- */
+/* the accepted socket, or INVALID_SOCKET with the code in *code */
 static SOCKET accept_one(SOCKET listener, tcp_addr *peer, int *code)
 {
     SOCKADDR_STORAGE ss;
     int sl = (int)sizeof ss;
     SOCKET s;
 
-    /* a unix peer's path is read up to the length the OS gives: never stack bytes it did not write */
     memset(&ss, 0, sizeof ss);
 
     s = accept(listener, (struct sockaddr *)&ss, &sl);
@@ -650,7 +613,7 @@ int64_t tcp_accept(int64_t l, int32_t timeout_ms, tcp_addr *peer, tcp_err *err)
 {
     int64_t deadline;
     SOCKET sock = ((listener *)(intptr_t)l)->s;
-    SOCKET wake_s = (SOCKET)((listener *)(intptr_t)l)->wake;
+    SOCKET wake_s = (SOCKET)tcp_wake_handle(((listener *)(intptr_t)l)->wake);
     int ready_now;
     int code = 0;
     SOCKET s;
@@ -899,7 +862,6 @@ static HANDLE open_socket_file(const char *path, DWORD access, tcp_file_id *id)
         return INVALID_HANDLE_VALUE;
     }
 
-    /* the full 128-bit id where the system has it: its high half goes into dev, which it never is on NTFS */
     if (GetFileInformationByHandleEx(h, TCP_FILE_ID_INFO, &full, sizeof full)) {
         uint64_t lo;
         uint64_t hi;
@@ -1096,7 +1058,6 @@ int64_t tcp_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *b, i
     DWORD count;
     int64_t put;
 
-    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
     if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
@@ -1135,7 +1096,6 @@ int64_t tcp_try_sendv(int64_t h, const uint8_t *a, int64_t alen, const uint8_t *
     DWORD done = 0;
     int code;
 
-    /* a sum past INT64_MAX is no buffer anyone has, and would overflow below */
     if (alen < 0 || blen < 0 || alen > INT64_MAX - blen) {
         return fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
@@ -1188,7 +1148,6 @@ void tcp_close(int64_t h)
 
 int32_t tcp_set_option(int64_t h, int32_t opt, int64_t value, tcp_err *err)
 {
-    /* clamped both ways: a cast alone keeps the low bits, and -(2^32) + 5 would be 5 */
     int v = value > 0x7fffffff ? 0x7fffffff : value < 0 ? 0 : (int)value;
     int rc;
 
@@ -1234,12 +1193,18 @@ int32_t tcp_set_option(int64_t h, int32_t opt, int64_t value, tcp_err *err)
     return 0;
 }
 
-/* a wake is a UDP socket on loopback, connected to itself; the handle is the socket */
+/* a wake is a UDP socket on loopback, connected to itself */
+typedef struct wake {
+    SOCKET s;
+    volatile LONG pending;
+} wake;
+
 int64_t tcp_wake_open(tcp_err *err)
 {
     struct sockaddr_in addr;
     int len = (int)sizeof addr;
     BOOL one = TRUE;
+    wake *w;
     SOCKET s;
     int code;
 
@@ -1247,59 +1212,74 @@ int64_t tcp_wake_open(tcp_err *err)
         return TCP_ERR;
     }
 
+    w = (wake *)malloc(sizeof *w);
+    if (w == NULL) {
+        return fail_as(err, TCP_K_OTHER, ERROR_NOT_ENOUGH_MEMORY);
+    }
+
     s = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
     if (s == INVALID_SOCKET) {
-        return fail(err, WSAGetLastError());
+        code = WSAGetLastError();
+        free(w);
+        return fail(err, code);
     }
 
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-    /* exclusive: no other process, the same user's included, can bind the port and take the wakes */
     if (setsockopt(s, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *)&one, sizeof one) != 0
         || bind(s, (struct sockaddr *)&addr, len) != 0
         || getsockname(s, (struct sockaddr *)&addr, &len) != 0
         || connect(s, (struct sockaddr *)&addr, len) != 0) {
         code = WSAGetLastError();
         closesocket(s);
+        free(w);
         return fail(err, code);
     }
 
     code = blocking(s, 0);
     if (code != 0) {
         closesocket(s);
+        free(w);
         return fail(err, code);
     }
 
-    return (int64_t)s;
+    w->s = s;
+    w->pending = 0;
+    return (int64_t)(intptr_t)w;
 }
 
 int64_t tcp_wake_handle(int64_t w)
 {
-    return w != 0 ? w : -1;
+    return w != 0 ? (int64_t)((wake *)(intptr_t)w)->s : -1;
 }
 
 void tcp_wake_signal(int64_t w)
 {
+    wake *it = (wake *)(intptr_t)w;
     char one = 1;
 
-    /* a full queue is already signalled */
-    if (w != 0) {
-        (void)send((SOCKET)w, &one, 1, 0);
+    if (it != NULL && InterlockedExchange(&it->pending, 1) == 0) {
+        /* a full queue is already signalled */
+        (void)send(it->s, &one, 1, 0);
     }
 }
 
 void tcp_wake_drain(int64_t w)
 {
+    wake *it = (wake *)(intptr_t)w;
     char buf[64];
 
-    if (w == 0) {
+    if (it == NULL) {
         return;
     }
 
-    while (recv((SOCKET)w, buf, sizeof buf, 0) > 0) {
+    while (recv(it->s, buf, sizeof buf, 0) > 0) {
     }
+
+    /* after the recv, never before: a signal in between would leave the flag set and nothing to read */
+    InterlockedExchange(&it->pending, 0);
 }
 
 int32_t tcp_wake_wait(int64_t w, int32_t timeout_ms)
@@ -1308,13 +1288,16 @@ int32_t tcp_wake_wait(int64_t w, int32_t timeout_ms)
         return TCP_ERR;
     }
 
-    return (int32_t)wait_for((SOCKET)w, 0, deadline_of(timeout_ms), INVALID_SOCKET, NULL);
+    return (int32_t)wait_for((SOCKET)tcp_wake_handle(w), 0, deadline_of(timeout_ms), INVALID_SOCKET, NULL);
 }
 
 void tcp_wake_close(int64_t w)
 {
-    if (w != 0) {
-        closesocket((SOCKET)w);
+    wake *it = (wake *)(intptr_t)w;
+
+    if (it != NULL) {
+        closesocket(it->s);
+        free(it);
     }
 }
 
@@ -1350,7 +1333,6 @@ int32_t tcp_error_text(int32_t kind, int32_t code, char *buf, int32_t len)
 
     if (m <= 0) {
         snprintf(buf, (size_t)len, "error %d", (int)code);
-        /* an old msvcrt snprintf leaves a cut text unterminated */
         buf[len - 1] = '\0';
         return (int32_t)strlen(buf);
     }
@@ -1391,7 +1373,6 @@ int32_t tcp_poll_ctl(int64_t p, int32_t op, int64_t h, uint64_t token, int32_t i
     struct wep_event ev;
     int how = op == TCP_POLL_ADD ? WEP_CTL_ADD : op == TCP_POLL_MODIFY ? WEP_CTL_MOD : WEP_CTL_DEL;
 
-    /* an op it does not know is a mistake, never a remove */
     if (op != TCP_POLL_ADD && op != TCP_POLL_MODIFY && op != TCP_POLL_REMOVE) {
         return (int32_t)fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }

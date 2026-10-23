@@ -1,11 +1,10 @@
 /**
- * Why a socket call did not do what was asked. The cases are what a caller branches on: the
- * peer went away (`eof`, `reset`), nobody answered (`refused`, `unreachable`), the process ran
- * out of descriptors (`tooManyFiles`), and so on. Everything else carries the OS sentence in
- * `os`.
+ * Why a socket call failed. Cases are what you branch on: the peer went away (`eof`, `reset`),
+ * nobody answered (`refused`, `unreachable`), out of descriptors (`tooManyFiles`). Everything
+ * else is `os` with the OS sentence.
  *
- * "Nothing yet" is never an error. A read or an accept that ran out of time hands back null, and
- * so does a try call that would have had to wait.
+ * "Nothing yet" is never an error. A timed-out read or accept hands back null, and so does a
+ * try call that would have had to wait.
  */
 
 namespace tcp;
@@ -121,8 +120,7 @@ public enum Error
 
     /**
      * A message over a reader's `max`: a length that announces more, or that many bytes without
-     * the delimiter. Refused before it is buffered, so a peer cannot make a reader grow without
-     * end.
+     * the delimiter. Refused before it is buffered, so a peer cannot grow a reader without end.
      */
     case tooLarge(uint64 $size);
 
@@ -146,8 +144,7 @@ public enum Error
     }
 
     /**
-     * The case's name, `eof` or `reset` and so on: what a log line or a test compares, without a
-     * match.
+     * The case's name (`eof`, `reset`, ...): what a log line or a test compares, without a match.
      */
     public const function name() : string
     {

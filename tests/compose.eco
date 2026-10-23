@@ -127,7 +127,6 @@ test tcp_read_exactly_grows_only_as_bytes_arrive
     tcp::StreamPair $pair = connectedPair();
     send($pair->client, 'abc');
     string $got = '';
-    // a length a peer announced: the buffer must not be reserved for it up front
     string $why = failedStatus(tcp::readExactly($pair->server, $got, 1099511627776, ms(200)));
     expect($why == 'timeout', "a count that never comes is a timeout: {$why}");
     expect($got == 'abc', 'with what arrived kept');

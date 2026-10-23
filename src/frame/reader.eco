@@ -1,9 +1,7 @@
 /**
- * Turns the bytes of one connection back into frames: a `tcp::Reader` that knows the 4-byte
- * prefix. The core is free of I/O (`feed` bytes in, `take` frames out); `read` drives it from any
- * `tcp::Source` under a deadline and keeps a partial frame across short waits, and `pull` drives
- * it from a reactor without waiting. The idle limit lives in the core too: `read` and a reactor
- * both go by `idleAt`.
+ * Turns the bytes of one connection back into frames. The core is free of I/O (`feed` in, `take`
+ * out). `read` drives it from any `tcp::Source` under a deadline and keeps a partial frame;
+ * `pull` drives it from a reactor. The idle limit lives here too: both paths go by `idleAt`.
  */
 
 namespace tcp::frame;
@@ -21,11 +19,10 @@ public class Reader
     private bool $stamped;
 
     /**
-     * `$max` caps the body of one frame; a prefix over it is an error, not an allocation.
-     * `$idle` ends a conversation that delivers no whole frame for that long, counted from
-     * construction and, after each frame, from the next `take` that finds no whole frame (so the
-     * time the caller spends on a frame is not the peer's): a server's guard against a peer that
-     * holds a connection open and sends nothing, or a byte at a time.
+     * `$max` is the largest body; a prefix over it is an error, not an allocation. `$idle` is
+     * how long the peer may go without a whole frame. The clock starts at construction and,
+     * after each frame, at the next empty `take`, so time spent on a frame is not the peer's.
+     * A byte a minute still counts as idle.
      */
     public constructor(max: usize $max, idle: time::duration? $idle = null)
     {
@@ -41,19 +38,15 @@ public class Reader
         $this->stamped = true;
     }
 
-    /**
-     * The idle limit, or null for none.
-     */
     public const function idle() : time::duration?
     {
         return $this->idleLimit;
     }
 
     /**
-     * When the conversation goes idle: no whole frame by then, and it is over. Never without a
-     * limit. `read` answers `.idle` itself; a reactor waits no later than its readers' earliest,
-     * and drops a connection whose deadline has passed once it has read what was there and
-     * `take` answered null, so a frame already in the socket beats the limit.
+     * When the conversation goes idle: no whole frame by then. Never without a limit. `read`
+     * answers `.idle` itself. A reactor waits no later than its readers' earliest, then `pull`s
+     * once more, so a frame already in the socket beats the limit.
      */
     public const function idleAt() : tcp::Deadline
     {
@@ -145,17 +138,15 @@ public class Reader
             if (!$got->has_value()) {
                 return .error($this->failed($got->failure()));
             }
-            // a null read: the wait ran out, and the checks at the top decide what that means
+            // null: the wait ran out; the checks at the top say what that means
         }
     }
 
     /**
-     * The next frame from what `$src` has already, without waiting: for a reactor, which calls it
-     * until it answers null and then waits on its `Poller`. The bytes go straight into the
-     * reader's buffer. Frames that came in with the peer's close still come out first, then
-     * `.end`, or `.truncated` when the close cut a frame short. `.idle` once the idle limit has
-     * passed with the socket empty and no whole frame here, so a frame already in the socket
-     * still beats the limit.
+     * The next frame from what `$src` already has, without waiting. For a reactor: call until it
+     * answers null, then wait on the `Poller`. Frames that arrived with the peer's close still
+     * come out first, then `.end`, or `.truncated` if the close cut a frame short. `.idle` once
+     * the limit has passed with the socket empty, so a frame already there still beats it.
      */
     public function pull<S : tcp::Source>(S $src) : result<string?, Error>
     {

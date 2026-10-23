@@ -1,10 +1,8 @@
 /**
- * Readiness, for a reactor that serves many connections from one thread: register streams and
- * listeners with a `Poller`, wait for some to be ready, then call their try methods until they
- * answer null. epoll on Linux, kqueue on macOS, wepoll (AFD) on Windows.
- *
- * Level or oneshot, never edge-triggered: Windows has no edge mode, so the portable surface does
- * not either. A handle registered with a poller is driven with the try calls only.
+ * Readiness for a reactor: register streams and listeners with a `Poller`, wait until some are
+ * ready, then call their try methods until they answer null. epoll on Linux, kqueue on macOS,
+ * wepoll (AFD) on Windows. Level or oneshot, never edge: Windows has no edge mode. A handle in
+ * a poller is driven with the try calls only.
  */
 
 namespace tcp;
@@ -21,8 +19,8 @@ public interface Pollable
     const function handle() : int64;
 
     /**
-     * True once the owner is closed, and `handle` names nothing of its own any more. A poller
-     * refuses it then instead of touching a number that may be another socket's by now.
+     * True once the owner is closed. A poller refuses it then: `handle` may already be another
+     * socket's number.
      */
     const function closed() : bool;
 
@@ -195,9 +193,9 @@ public class Poller
 
     /**
      * Wait until something is ready, the deadline passes, or another thread calls `wake`, and
-     * put what is ready in `$out` (emptied first). A wake is an event of its own, `woken()`, and
-     * is used up by the wait that reports it. Still empty means the deadline passed. Keep one
-     * `$out` across waits: its room is reused, so a wait allocates nothing after the first.
+     * put what is ready in `$out` (emptied first). A wake is an event of its own, `woken()`, used
+     * up by the wait that reports it. Still empty means the deadline passed. Keep one `$out`
+     * across waits: its room is reused.
      */
     public function wait(array<Event>& $out, Deadline $by) : status<Error>
     {
@@ -233,9 +231,8 @@ public class Poller
 
 /**
  * A handle another thread can make readable. Each `Poller` owns one, registered under
- * `POLL_WAKE`, to stop its wait. On its own it is a timed wait across threads, which the
- * standard library's `condition` does not have: one thread `wait`s with a deadline, another
- * `wake`s it. A wake stays until `reset`, so a wake that comes before the wait is not lost.
+ * `POLL_WAKE`, to stop its wait. On its own it is a timed wait across threads, which
+ * `condition` does not have. A wake stays until `reset`, so a wake before the wait is not lost.
  */
 #[atomic]
 public class Waker
@@ -271,7 +268,7 @@ public class Waker
     }
 
     /**
-     * Make it quiet again.
+     * Drop the signal so the next wait sleeps.
      */
     public function reset() : void
     {

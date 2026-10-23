@@ -1,7 +1,7 @@
 /*
  * libtcp: what both backends share. Not part of the contract: each of
  * c/posix.c and c/win32.c includes this once, after its platform headers,
- * and defines the two hooks it declares (kind_of, now_ms).
+ * and defines the two hooks (kind_of, now_ms).
  *
  * struct sockaddr_storage and socklen_t are spelled the same on both:
  * Winsock's ws2tcpip.h defines socklen_t as int.

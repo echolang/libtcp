@@ -2,18 +2,17 @@
  * libtcp: the platform contract.
  *
  * Every backend (c/posix.c, c/win32.c) implements exactly these symbols.
- * The C side is mechanism only: one socket call, bounded by a timeout, with
- * its failure sorted into a portable kind. Policy is Echo: deadlines that
- * span several calls, trying each resolved address, write-all loops,
- * frames, and when a handle may be released.
+ * The C side is mechanism: one socket call, bounded by a timeout, failure
+ * sorted into a portable kind. Policy is Echo: deadlines that span several
+ * calls, trying each resolved address, write-all loops, frames, and when a
+ * handle may be released.
  *
  * Handles are int64_t, so a POSIX fd and a Winsock SOCKET (UINT_PTR) both
- * fit. Every call that can fail takes a tcp_err the backend fills on
- * failure: no thread-local, so nothing Echo does between the call and
- * reading the error can clobber it.
+ * fit. Every call that can fail takes a tcp_err the backend fills: no
+ * thread-local, so nothing Echo does between the call and reading the
+ * error can clobber it.
  *
  * timeout_ms: -1 waits forever, 0 polls once, > 0 waits at most that long.
- *
  * No call raises a signal (no SIGPIPE), and no handle is inherited by a
  * child process.
  */
@@ -129,10 +128,10 @@ int32_t tcp_unlink_socket(const char *path, const tcp_file_id *id);
 /*
  * Remove the unix socket file at path when nothing listens on it any more
  * (its listener died and left it): 0 when removed, -1 otherwise. A live
- * listener is left be, and so is any file that is not a socket. Where the
- * OS refuses a connect to a live listener whose backlog is full exactly as
- * to a dead one (macOS), such a listener reads as dead: its file is removed
- * and its path taken, though it goes on serving the connections it has.
+ * listener is left be, and so is any file that is not a socket. macOS
+ * refuses a connect to a full backlog the same way it refuses a dead
+ * socket, so such a listener reads as dead: its file is removed and its
+ * path taken, though it keeps the connections it has.
  */
 int32_t tcp_unlink_stale(const char *path);
 
@@ -198,14 +197,13 @@ int32_t tcp_shutdown(int64_t h, int32_t how, tcp_err *err);
 /*
  * Wake every call blocked on connection h, on any thread: it returns at
  * once, and so does every call made on h after this. The handle stays open
- * (and its number taken) until tcp_close.
+ * until tcp_close.
  *
- * What a cancelled call returns is the backend's, not the contract's: data
- * already there, TCP_EOF, TCP_TIMEOUT, or TCP_ERR of any kind (POSIX cancels
- * with a shutdown, and a recv after it reads the end exactly as when the
- * peer closed). The caller that cancelled knows why the call ended; it must
- * not read the result as the peer's doing. The same holds for
- * tcp_listener_cancel.
+ * What a cancelled call returns is the backend's: data already there,
+ * TCP_EOF, TCP_TIMEOUT, or TCP_ERR of any kind (POSIX cancels with a
+ * shutdown, and a recv after it reads the end). The caller that cancelled
+ * knows why the call ended; it must not read the result as the peer's doing.
+ * Same for tcp_listener_cancel.
  */
 void tcp_cancel(int64_t h);
 

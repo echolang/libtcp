@@ -1,7 +1,6 @@
 /**
- * tcp::Reader and tcp::wire: lines and fixed-size messages without I/O, then over real sockets
- * (blocking and pulled), the limits and ends of a conversation, and a small RESP exchange with a
- * fake Redis, the shape a database client takes.
+ * tcp::Reader and tcp::wire: lines and fixed-size messages without I/O, then over real sockets,
+ * the limits and ends of a conversation, and a small RESP exchange with a fake Redis.
  */
 
 use std::thread;

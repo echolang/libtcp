@@ -8,9 +8,7 @@ namespace tcp;
 public class Outbox
 {
     /**
-     * The most bytes owed at once. A push past it is refused, so a peer that sends requests and
-     * never reads the replies cannot make the outbox grow without end. Stop reading from the
-     * peer while `full()`, and go on once a flush has made room.
+     * The most bytes owed at once: a push past it is refused.
      */
     public const usize $limit;
     private string $queue;
@@ -58,8 +56,7 @@ public class Outbox
     }
 
     /**
-     * True while the bytes owed are at `limit`: stop reading from the peer until a flush makes
-     * room.
+     * True while the bytes owed are at `limit`: stop reading from the peer until a flush.
      */
     public const function full() : bool
     {
@@ -105,7 +102,6 @@ public class Outbox
             usize $n = guard $put else {
                 break;
             }
-            // a sink that took nothing made no progress: wait for writable, do not spin
             if ($n == 0) {
                 break;
             }
@@ -113,7 +109,7 @@ public class Outbox
         }
 
         if ($this->sent == $this->queue->size()) {
-            // all out: the buffer stays, empty, for the next push
+            // keep the buffer, empty, for the next push
             $this->queue->clear();
             $this->sent = 0;
         } else if ($this->sent > 0 && $this->sent * 2 >= $this->queue->size()) {
@@ -129,9 +125,6 @@ public class Outbox
         return .ok;
     }
 
-    /**
-     * Bytes queued and not sent yet.
-     */
     public const function pending() : usize
     {
         return $this->queue->size() - $this->sent;

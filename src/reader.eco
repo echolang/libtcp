@@ -1,10 +1,9 @@
 /**
  * A buffered reader for any wire format: a line protocol (Redis), a length in a header (MySQL,
- * Postgres, frames), or both. The core is free of I/O (`feed` bytes in, `take` and `until` out),
- * so it also parses bytes that come from somewhere else; `exactly` and `until` drive it from any
- * `Source` under a deadline, and `pullExactly` and `pullUntil` from a reactor without waiting.
- * Bytes read past a message stay buffered for the next one, and `rest` hands them over whole,
- * to a TLS layer after a plaintext start.
+ * Postgres, frames), or both. The core is free of I/O (`feed` in, `take` and `until` out).
+ * `exactly` and `until` drive it from any `Source` under a deadline; `pullExactly` and
+ * `pullUntil` from a reactor. Bytes past a message stay buffered, and `rest` hands them over
+ * whole, to a TLS layer after a plaintext start.
  */
 
 namespace tcp;
@@ -70,7 +69,6 @@ public class Reader
      */
     public const function byte(usize $at) : uint8
     {
-        // checked in a release build too: past the buffered bytes is heap memory, not the message
         if ($at >= $this->buffered()) {
             die('tcp::Reader::byte past what is buffered');
         }
@@ -133,9 +131,8 @@ public class Reader
         }
         $this->scanned = 0;
 
-        // a message shares the read buffer, so one the caller keeps keeps all of it. a large one
-        // takes the buffer, and the bytes after it are copied to one of their own (a sub would
-        // share it still), so the message leaves as the buffer's only owner
+        // a large message takes the buffer with it; leftover bytes are copied out so the
+        // message is the buffer's only owner (a sub would still share it)
         string $shared = $this->pending->sub($this->start, $n);
         if ($n * 2 >= $this->pending->capacity()) {
             string? $whole = $shared;
@@ -144,8 +141,7 @@ public class Reader
             return $whole;
         }
 
-        // a small one is copied out, so the buffer stays this reader's alone and is reused, not
-        // reallocated, for the next message
+        // a small one is copied out, so the buffer stays this reader's and is reused
         string? $copy = $shared->clone();
         $shared = '';
         $this->advance($n);
@@ -157,7 +153,6 @@ public class Reader
      */
     public function skip(usize $n) : void
     {
-        // checked in a release build too: a start past the end would hand out heap memory next
         if ($n > $this->buffered()) {
             die('tcp::Reader::skip past what is buffered');
         }
@@ -402,7 +397,6 @@ public class Reader
     private function filled(result<usize?, Error> $got) : result<usize?, Error>
     {
         if ($got->has_value()) {
-            // a source that answers 0 made no progress: nothing yet, so a pull loop stops instead of spinning
             usize? $none = null;
             usize? $read = $got->unwrap();
             usize $n = guard $read else {

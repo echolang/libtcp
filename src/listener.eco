@@ -41,14 +41,11 @@ public class Listener : Pollable
     /**
      * Bind and listen on `$at`. Port 0 lets the OS pick one; `$local->port` reads it back.
      *
-     * A unix socket's file is made here and removed when the listener is released, unless
-     * another listener has put a file of its own on the path since. A file left by a listener
-     * that is gone (the process died) is replaced: one that refuses a connect is stale. A live
-     * listener on the path stays `.addressInUse`, except on macOS when its backlog is full: macOS
-     * refuses that connect exactly as a dead one's, so its path is taken over (it goes on serving
-     * the connections it has). A file that is not a socket is never touched. The probe and the
-     * removal go by the path, so its directory must not be writable by anyone untrusted: they
-     * could swap what the path names in between.
+     * A unix socket's file is made here and unlinked on release, but only the file this listener
+     * made. A dead listener's leftover file is replaced. A live one stays `.addressInUse`. macOS
+     * refuses a connect to a full backlog the same way it refuses a dead socket, so that path
+     * gets taken (the old listener keeps the connections it has). A file that is not a socket is
+     * never touched.
      */
     public static function bind(const Address& $at, ListenOptions $options = ListenOptions()) : result<Listener, Error>
     {
@@ -157,9 +154,8 @@ public class Listener : Pollable
 
     /**
      * The next connection if one is already waiting, else null. For a reactor. `.tooManyFiles`
-     * leaves the connection waiting and the listener readable, so a level registration reports
-     * it again at once: back off, or take the listener out of the poller until a descriptor is
-     * free, or the loop spins.
+     * leaves the listener readable: a level wait reports it again at once, so back off or the
+     * loop spins.
      */
     public function tryAccept() : result<Stream?, Error>
     {
@@ -226,7 +222,7 @@ public class Listener : Pollable
     }
 
     /**
-     * A listener needs exactly what the caller wants: read, for the next connection.
+     * Whatever the caller wants: read, while a connection waits.
      */
     public const function needs(Interest? $want) : Interest?
     {

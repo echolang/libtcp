@@ -1,7 +1,7 @@
 /**
  * Closing from another thread: a call blocked on a stream or a listener wakes at once with
  * `.closed`, and the handle's number is never reused under a call that still holds it. Then the
- * graceful close, which lets a reply survive bytes the server never read.
+ * graceful close: a reply survives bytes the server never read.
  */
 
 use std::thread;

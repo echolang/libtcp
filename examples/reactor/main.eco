@@ -1,12 +1,11 @@
 /**
  * A frame echo server that serves every connection from one thread. The listener and each stream
- * sit in one `Poller`; when it reports something ready, the loop pulls whole frames off the
- * stream with `frame::Reader::pull` (which never waits), queues each echo on the connection's
- * `Outbox`, and flushes what the socket takes. Whatever does not fit waits for the stream to
- * report writable.
+ * sit in one `Poller`; when it reports something ready, the loop pulls whole frames with
+ * `frame::Reader::pull` (never waits), queues each echo on the connection's `Outbox`, and
+ * flushes what the socket takes. Whatever does not fit waits for writable.
  *
- * It runs for `SECONDS`, then the main thread stops it with `Poller::wake`, which is how any other
- * thread asks a reactor to wind down. Meanwhile a few client threads talk to it.
+ * It runs for `SECONDS`, then the main thread stops it with `Poller::wake`, which is how any
+ * other thread asks a reactor to wind down. Meanwhile a few client threads talk to it.
  */
 
 use std::thread;
@@ -44,8 +43,6 @@ internal class Conn
  */
 internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echoed) : bool
 {
-    // a full outbox stops the reading: a peer that sends and never reads gets no more echoes
-    // queued, only the ones it owes room for once it reads again
     while ($c->reading && !$c->out->full()) {
         result<string?, tcp::frame::Error> $frame = $c->reader->pull($c->stream);
         if (!$frame->has_value()) {
@@ -65,8 +62,7 @@ internal function pump(tcp::Poller $poller, Conn $c, uint64 $token, int64& $echo
         string $body = guard $whole else {
             break;
         }
-        // the reader's max keeps every body inside what a prefix can announce; an echo that would
-        // pass the outbox's limit ends the connection, a peer that far behind is dropped
+        // the reader's max keeps every body inside what a prefix can announce
         guard tcp::frame::push($c->out, $body) else ($e) {
             return false;
         }
@@ -105,11 +101,9 @@ internal function serve(tcp::Listener $listener, tcp::Poller $poller) : int64
     array<tcp::Event> $events = array<tcp::Event>();
     array<uint64> $over = array<uint64>();
     while (true) {
-        // the wait ends by the time the first connection goes idle. One that has (no event since
-        // its last frame) gets a last pump, and `pull` gives up on it only once its socket is
-        // empty, so a frame already there still counts. A connection the peer finished is only
-        // owed writes, which its own events drive. A scan per wait is fine for an example; a
-        // server with many connections keeps a timer wheel or a heap
+        // wait no later than the first idle. A connection that has gone idle gets one last
+        // pump; `pull` only gives up once the socket is empty, so a frame already there still
+        // counts. A scan per wait is fine for an example; a real server keeps a timer wheel
         tcp::Deadline $until = tcp::Deadline::never();
         foreach ($conns as $token => $c) {
             if (!$c->reading) {

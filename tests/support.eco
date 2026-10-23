@@ -1,6 +1,6 @@
 /**
- * Helpers the socket tests share. Each one dies with a sentence instead of handing a failure back,
- * so a test reads as the behaviour it checks.
+ * Helpers the socket tests share. Each one dies with a sentence instead of handing a failure
+ * back, so a test reads as the behaviour it checks.
  */
 
 use std::thread;
@@ -39,7 +39,7 @@ internal function connectedPair() : tcp::StreamPair
 }
 
 /**
- * The next connection on `$l`, waiting up to five seconds.
+ * The next connection on `$l`, or die after five seconds.
  */
 internal function acceptOne(tcp::Listener $l) : tcp::Stream
 {
@@ -53,7 +53,7 @@ internal function acceptOne(tcp::Listener $l) : tcp::Stream
 }
 
 /**
- * The name of an error's case, so a test can say which one it expects in one line.
+ * The error's case name.
  */
 internal function kind(const tcp::Error& $e) : string
 {
@@ -196,8 +196,7 @@ internal function expect(bool $ok, const string& $why) : void
 }
 
 /**
- * Sends on `$s` without a pause from a thread of its own until a write fails (the peer closed):
- * a peer that never stops, for the reads that have to end at their deadline all the same.
+ * Sends on `$s` from a thread of its own until a write fails: a peer that never stops.
  */
 internal function flood(tcp::Stream $s) : thread::task<usize>
 {

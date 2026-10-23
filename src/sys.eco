@@ -1,7 +1,7 @@
 /**
- * C symbols from the platform backend (c/tcp.h, implemented by c/posix.c or c/win32.c). One
- * block: a C symbol may only appear once per module. The structs mirror the C layouts field for
- * field; `tcp_event` is the public `Event` (src/poll.eco), so a wait fills the caller's array.
+ * C symbols from the platform backend (c/tcp.h, c/posix.c or c/win32.c). One block: a C symbol
+ * may only appear once per module. The structs match the C layouts field for field; `tcp_event`
+ * is the public `Event` (src/poll.eco), so a wait fills the caller's array.
  */
 
 namespace tcp;

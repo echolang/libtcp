@@ -1,9 +1,7 @@
 /**
- * A layer over a stream, the way TLS will sit: `Scrambled` implements Source, Sink and Pollable
- * around a `Stream`. It XORs every byte, sends a one-byte hello before anything else and needs the
- * peer's before it can read, and hands the socket at most a few bytes of what it holds per flush.
- * So it holds bytes of its own after a try write, needs write readiness to read, and has bytes
- * read ahead when it takes over after a plaintext start: what a real TLS layer does. Frames, the
+ * A layer over a stream, the way TLS will sit: XOR, a one-byte hello both ways, and a flush that
+ * hands the socket only a few bytes at a time. So it holds ciphertext after a try write, needs
+ * write readiness to read, and has bytes read ahead after a plaintext start. Frames, the
  * buffered reader, and a reactor loop all run through it unchanged.
  */
 
