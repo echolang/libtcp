@@ -14,9 +14,6 @@ internal const int32 GATE_BROKEN = 0x20000000;
 internal const int32 GATE_WRITE_SHUT = 0x10000000;
 internal const int32 GATE_READ_SHUT = 0x04000000;
 
-// a hint, not state: the last read filled all it asked for, so more is likely waiting
-internal const int32 GATE_MORE = 0x08000000;
-
 /**
  * How a call left a `Gate`.
  */
@@ -110,19 +107,6 @@ internal struct Gate
                 return;
             }
             if ($this->word->compare_exchange($w, $w | $flag)) {
-                return;
-            }
-        }
-    }
-
-    public function unmark(int32 $flag) : void
-    {
-        while (true) {
-            int32 $w = $this->word->load();
-            if (($w & $flag) == 0) {
-                return;
-            }
-            if ($this->word->compare_exchange($w, $w & ~$flag)) {
                 return;
             }
         }

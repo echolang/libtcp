@@ -821,7 +821,7 @@ int64_t tcp_try_recv(int64_t h, uint8_t *buf, int64_t len, tcp_err *err)
 
 int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_err *err)
 {
-    int64_t deadline = deadline_of(timeout_ms);
+    int64_t deadline;
     int64_t got;
     int ready;
 
@@ -829,6 +829,13 @@ int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_e
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
+    /* while a reply streams in, the next bytes are nearly always there: try before paying for a poll */
+    got = tcp_try_recv(h, buf, len, err);
+    if (got != TCP_AGAIN) {
+        return got;
+    }
+
+    deadline = deadline_of(timeout_ms);
     for (;;) {
         ready = wait_for((int)h, POLLIN, deadline, -1, err);
         if (ready < 0) {

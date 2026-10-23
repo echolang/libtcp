@@ -206,6 +206,48 @@ test tcp_exactly_waits_for_every_byte_across_reads
     assert(firstDiff($body, pattern($size)) == -1, 'byte for byte');
 }
 
+test tcp_ensure_and_window_read_in_place
+{
+    tcp::StreamPair $pair = connectedPair();
+    // a 3 byte length, then that many bytes, twice: the MySQL packet shape
+    string $wire = '';
+    tcp::wire::putLe24($wire, 5);
+    $wire->append('hello');
+    tcp::wire::putLe24($wire, 2);
+    $wire->append('ok');
+    send($pair->client, $wire);
+
+    tcp::Reader $r = tcp::Reader();
+    bool $head = guard $r->ensure($pair->server, 3, ms(5000)) else ($e) {
+        die("ensure: {$e}");
+    }
+    assert($head, 'the header is there');
+    string::view $h = $r->window(3);
+    usize $len = ($h->byte(0) as usize) | (($h->byte(1) as usize) << 8) | (($h->byte(2) as usize) << 16);
+    assert($len == 5, 'the length reads in place');
+    $r->skip(3);
+    bool $body = guard $r->ensure($pair->server, $len, ms(5000)) else ($e) {
+        die("ensure: {$e}");
+    }
+    assert($body && string::from($r->window($len)) == 'hello', 'the body reads in place');
+    $r->skip($len);
+
+    bool $second = guard $r->ensure($pair->server, 5, ms(5000)) else ($e) {
+        die("ensure: {$e}");
+    }
+    assert($second && string::from($r->window(5)->sub(3, 2)) == 'ok', 'the next message follows');
+    $r->skip(5);
+    assert($r->buffered() == 0, 'all consumed');
+
+    // a deadline that passes keeps what came, as `exactly` does
+    send($pair->client, 'ab');
+    bool $short = guard $r->ensure($pair->server, 4, ms(50)) else ($e) {
+        die("ensure: {$e}");
+    }
+    assert(!$short && $r->buffered() == 2, 'not all within the deadline, the rest kept');
+    assert($r->ensure($pair->server, $r->max + 1, ms(50))->failed(), 'over max is refused');
+}
+
 test tcp_a_deadline_keeps_a_partial_message
 {
     tcp::StreamPair $pair = connectedPair();

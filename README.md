@@ -269,6 +269,8 @@ Keep one `$events` across waits. Its room is reused, so a wait allocates nothing
 
 `Stream`, `Listener`, and `Connecting` are `Pollable`. Token `0xFFFFFFFFFFFFFFFF` is the poller's own and is refused.
 
+`Waker` is the piece a poller is woken with, and it works on its own too: a timed wait across threads, which the standard library's `condition` does not have. One thread calls `wait($by)`, another `wake()`. A wake stays until `reset()`, so one that comes before the wait is not lost.
+
 ## Outbox
 
 The bytes a reactor owes one connection. A try write takes what the socket has room for, and the rest waits here until the stream reports writable again.

@@ -617,25 +617,8 @@ public class Stream : Source, Sink, Pollable
             return $this->received($into, $now, $err, TCP_AGAIN, $shut);
         }
 
-        int64 $got = TCP_AGAIN;
-        bool $more = $this->gate->has(GATE_MORE);
-        // the last read filled its request, so bytes are likely waiting: take them without the
-        // poll a blocking read starts with. Most reads come after a request sent, when nothing is
-        // there yet, and for those the poll first is the cheaper order
-        if ($more) {
-            $got = tcp_try_recv($this->fd, $into->spare(), $ask as int64, &$err);
-        }
-        if ($got == TCP_AGAIN) {
-            $got = tcp_recv($this->fd, $into->spare(), $ask as int64, $until->ms(), &$err);
-        }
-        bool $full = $got == ($ask as int64);
-        if ($full != $more) {
-            if ($full) {
-                $this->gate->mark(GATE_MORE);
-            } else {
-                $this->gate->unmark(GATE_MORE);
-            }
-        }
+        // `tcp_recv` takes what is already there before it polls
+        int64 $got = tcp_recv($this->fd, $into->spare(), $ask as int64, $until->ms(), &$err);
         bool $closed = $this->leave();
         return $this->received($into, $got, $err, TCP_TIMEOUT, $closed);
     }

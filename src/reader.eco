@@ -92,6 +92,20 @@ public class Reader
     }
 
     /**
+     * The next `$n` unread bytes, borrowed and not consumed: a header to decode or a message to
+     * read in place, without a copy. Valid until the reader next reads, skips or takes; `skip`
+     * them once done. They have to be buffered (`ensure` waits for that).
+     */
+    public const function window(usize $n) : string::view
+    {
+        // checked in a release build too: past the buffered bytes is heap memory, not the message
+        if ($n > $this->buffered()) {
+            die('tcp::Reader::window past what is buffered');
+        }
+        return $this->pending->view()->sub($this->start, $n);
+    }
+
+    /**
      * Where `$delim` starts among the unread bytes, or null when it is not buffered.
      */
     public const function find(const string& $delim) : usize?
@@ -241,18 +255,32 @@ public class Reader
      */
     public function exactly<S : Source>(S $src, usize $n, Deadline $by) : result<string?, Error>
     {
-        string? $none = null;
+        bool $there = guard $this->ensure($src, $n, $by) else ($e) {
+            return .error($e);
+        }
+        if (!$there) {
+            string? $none = null;
+            return .ok($none);
+        }
+        return $this->exactly($n);
+    }
+
+    /**
+     * Wait until at least `$n` bytes are buffered off `$src`, however many reads it takes: true
+     * once they are, false when the deadline passed first, with what arrived kept. Nothing is
+     * consumed, so `window` reads them in place. `.eof` when the peer closes first, `.tooLarge`
+     * when `$n` is over `max`.
+     */
+    public function ensure<S : Source>(S $src, usize $n, Deadline $by) : result<bool, Error>
+    {
+        if ($n > $this->max) {
+            return .error(.tooLarge($n as uint64));
+        }
         bool $first = true;
-        while (true) {
-            string? $ready = guard $this->exactly($n) else ($e) {
-                return .error($e);
-            }
-            if ($ready != null) {
-                return .ok($ready);
-            }
+        while ($this->buffered() < $n) {
             // the first pass always reads once, so bytes already in the socket beat a passed deadline
             if (!$first && $by->passed()) {
-                return .ok($none);
+                return .ok(false);
             }
             $first = false;
 
@@ -262,6 +290,7 @@ public class Reader
                 return .error($got->failure());
             }
         }
+        return .ok(true);
     }
 
     /**

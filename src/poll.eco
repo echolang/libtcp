@@ -232,11 +232,13 @@ public class Poller
 }
 
 /**
- * A handle another thread can make readable, to stop a `Poller` waiting. Each poller owns one,
- * registered under `POLL_WAKE`, and resets it in the wait that reports it.
+ * A handle another thread can make readable. Each `Poller` owns one, registered under
+ * `POLL_WAKE`, to stop its wait. On its own it is a timed wait across threads, which the
+ * standard library's `condition` does not have: one thread `wait`s with a deadline, another
+ * `wake`s it. A wake stays until `reset`, so a wake that comes before the wait is not lost.
  */
 #[atomic]
-internal class Waker
+public class Waker
 {
     private const int64 $wake;
 

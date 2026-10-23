@@ -1,0 +1,36 @@
+use std::thread;
+
+test a_waker_wakes_a_waiting_thread
+{
+    tcp::Waker $w = guard tcp::Waker::open() else ($e) {
+        die("open: {$e}");
+    }
+    thread::task<bool> $waiter = guard thread::spawn(function() : bool {
+        return $w->wait(ms(5000));
+    }) else ($e) {
+        die($e->message());
+    }
+    thread::sleep(20);
+    $w->wake();
+    assert($waiter->wait());
+}
+
+test a_waker_wait_ends_at_the_deadline
+{
+    tcp::Waker $w = guard tcp::Waker::open() else ($e) {
+        die("open: {$e}");
+    }
+    assert(!$w->wait(ms(30)));
+}
+
+test a_wake_before_the_wait_is_kept_until_reset
+{
+    tcp::Waker $w = guard tcp::Waker::open() else ($e) {
+        die("open: {$e}");
+    }
+    $w->wake();
+    assert($w->wait(ms(0)));
+    assert($w->wait(ms(0)));
+    $w->reset();
+    assert(!$w->wait(ms(0)));
+}
