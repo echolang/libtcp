@@ -1,12 +1,27 @@
 # libtcp
 
-Echo's standard library has files, streams, and threads. It does not have sockets. Sometimes your program still needs to listen, connect, and move bytes. This module is that missing piece: TCP (and unix sockets), a deadline on every wait, a poller, a buffered reader, and length-prefixed frames.
+TCP sockets for Echo. Bind, connect, accept, and move bytes, with a deadline on every wait.
 
-The C is a platform shim (`bind` / `listen` / `accept` / `recv` / `send`, epoll or kqueue, Winsock plus wepoll). Deadlines, addresses, frames, and the reactor pieces are Echo. There is no TLS. There is no HTTP. libhttp is the server. libcurl is the client. This is the sockets under both, and the sockets if you are writing neither.
+- `Listener`, `Stream`, `Address`
+- IPv4, IPv6, and unix sockets
+- a `Poller` (epoll, kqueue, wepoll)
+- a buffered `Reader`, an `Outbox`, length-prefixed frames
 
-## A complete pass
+## Installation
 
-Let's look at a whole program, so the rest of the page has somewhere to sit:
+From your project directory:
+
+```bash
+epm add echolang/libtcp --git https://github.com/echolang/libtcp --range ^0.2
+```
+
+That writes a `#[requires:]` line and vendors the sources. The C shim travels with the module, so you never write a `#[cc:]` yourself.
+
+darwin, linux, and windows, matching Echo's prebuilts. Windows is Winsock, with readiness from the wepoll copy under `c/wepoll/`.
+
+## Quick start
+
+Bind, connect, accept, write, read:
 
 ```echo
 tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(loopback: 0)) else ($e) {
@@ -36,7 +51,7 @@ guard $server->read($buf, 5, tcp::Deadline(ms: 1000)) else ($e) {
 echo $buf;
 ```
 
-That is the whole shape: bind, connect, accept, write, read. Port `0` is ephemeral; `$l->local->port` is the one the OS picked.
+Port `0` is ephemeral. `$l->local->port` is the one the OS picked.
 
 `accept` and `read` returning null means the deadline passed with nothing. That is not an error. Nothing was lost. Call again.
 
@@ -44,21 +59,9 @@ That is the whole shape: bind, connect, accept, write, read. Port `0` is ephemer
 
 The poller shape lives in `examples/reactor/`.
 
-## Installing
-
-From your project directory:
-
-```bash
-epm add echolang/libtcp --git https://github.com/echolang/libtcp --range ^0.2
-```
-
-That writes a `#[requires:]` line and vendors the sources. The C shim travels with the module, so you never write a `#[cc:]` yourself.
-
-darwin, linux, and windows, matching Echo's prebuilts. Windows is Winsock, with readiness from the wepoll copy under `c/wepoll/`.
-
 ## Addresses
 
-A listener and a connect take an `Address`. Names come in through `resolve`, which is a call of its own so it can be made once, on another thread, or not at all.
+A listener and a connect take an `Address`. Names come in through `resolve`, a call of its own, so it can be made once, on another thread, or not at all.
 
 ```echo
 tcp::Address $loop = tcp::Address(loopback: 8080);          // 127.0.0.1
@@ -67,7 +70,7 @@ tcp::Address $all  = tcp::Address(any: 8080);               // 0.0.0.0
 tcp::Address $sock = tcp::Address(unix: '/tmp/app.sock');
 ```
 
-`Address::parse` is numeric, no DNS: `'127.0.0.1:80'`, `'[::1]:80'`, `'unix:/tmp/app.sock'`. An IPv6 address without brackets is refused, not split at its last colon: `1::2:3` is an address of its own, not `[1::2]:3`. `"{$a}"` prints the same forms, and `parse` reads them back.
+`Address::parse` is numeric, no DNS: `'127.0.0.1:80'`, `'[::1]:80'`, `'unix:/tmp/app.sock'`. An IPv6 address without brackets is refused, not split at its last colon: `1::2:3` is an address of its own, not `[1::2]:3`. IPv4 shorthands (`127.1`, `2130706433`) are `.invalid`. `"{$a}"` prints the same forms, and `parse` reads them back.
 
 An empty host is refused. If you mean every interface, write `0.0.0.0` or `::`.
 
@@ -85,7 +88,7 @@ array<tcp::Address> $addrs = guard tcp::resolve('example.com', 443, tcp::Deadlin
 }
 ```
 
-A lookup that outlives its deadline finishes on its thread and the answer is dropped. `Lookup::start` is the same thing when you want to poll for it, or have a `Poller` woken when it is in (`start($host, $port, notify: $poller)`). A numeric host starts no thread.
+A lookup that outlives its deadline finishes on its thread and the answer is dropped. `Lookup::start` is the same thing when you want to poll for it, or have a `Poller` woken when it is in (`start($host, $port, notify: $poller)`). A numeric host starts no thread. At most 64 lookups run at once; past that, `start` fails.
 
 ## Deadlines
 
@@ -119,10 +122,10 @@ tcp::Listener $l = guard tcp::Listener::bind(host: '127.0.0.1', 8080) else ($e) 
 
 `ListenOptions` is plain data, applied at bind:
 
-- `backlog` 128: how many finished handshakes may wait for an accept.
-- `reusePort` off: several listeners on the same port, POSIX only (`SO_REUSEPORT`).
-- `dualStack` off: a listener takes the family it was given. On, an IPv6 `::` listener takes IPv4 too.
-- `accepted`: the `StreamOptions` every accepted stream starts with.
+- `backlog` 128: how many finished handshakes may wait for an accept
+- `reusePort` off: several listeners on the same port, POSIX only (`SO_REUSEPORT`)
+- `dualStack` off: a listener takes the family it was given. On, an IPv6 `::` listener takes IPv4 too
+- `accepted`: the `StreamOptions` every accepted stream starts with
 
 ## Connect
 
@@ -188,6 +191,34 @@ The read side is this stream's alone. The peer is not told. Bytes it still sends
 
 `close` from any thread wakes every call blocked on the stream with `.closed`. The descriptor is released once the last of them has left. `Stream` is `#[atomic]`: an accept thread can hand it to the thread that serves it, and one thread may read while another writes.
 
+## Unix sockets
+
+A path on this machine instead of an address and a port. Local Postgres, MySQL, Redis.
+
+```echo
+tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: '/tmp/app.sock')) else ($e) {
+    die("{$e}");
+}
+```
+
+The socket file is made at bind and removed when the listener is released. A file left by a listener that is gone (the process died) is replaced: one that nothing answers on is stale. A live listener on the path stays `.addressInUse`, and a file that is not a socket is never touched.
+
+A path that is empty, holds a NUL, or is longer than the platform takes (103 bytes on macOS, 107 on Linux and Windows) is `.invalid`.
+
+## Options
+
+`StreamOptions` is applied when a stream is connected or accepted. Fields with defaults, set by assignment.
+
+```echo
+tcp::StreamOptions $opt = tcp::StreamOptions();
+$opt->keepAlive = time::duration::secs(30);
+$opt->sendBuffer = 256 * 1024;
+```
+
+`noDelay` is on: request and reply traffic should never wait for a delayed ACK. `keepAlive` is off. Kernel buffer sizes of `0` keep the system's choice.
+
+Unix sockets skip no-delay and keepalive. Setting them on the stream after the fact is `.invalid`: a unix peer cannot vanish without the kernel knowing, and there is no Nagle delay to turn off.
+
 ## Errors
 
 The cases are what a caller branches on. `"{$e}"` is the sentence. `name()` is the case without a match: `'eof'`, `'reset'`, and so on.
@@ -211,34 +242,6 @@ The cases are what a caller branches on. `"{$e}"` is the sentence. `name()` is t
 `gone()` is eof or reset: nothing more will come, and nothing sent will reach it. `sys()` is the failed system call behind the cases that carry one.
 
 Nothing-yet is never an error. A read or an accept that ran out of time hands back null, and so does a try call that would have had to wait.
-
-## Options
-
-`StreamOptions` is applied when a stream is connected or accepted. Fields with defaults, set by assignment.
-
-```echo
-tcp::StreamOptions $opt = tcp::StreamOptions();
-$opt->keepAlive = time::duration::secs(30);
-$opt->sendBuffer = 256 * 1024;
-```
-
-`noDelay` is on: request and reply traffic should never wait for a delayed ACK. `keepAlive` is off. Kernel buffer sizes of `0` keep the system's choice.
-
-Unix sockets skip no-delay and keepalive. Setting them on the stream after the fact is `.invalid`: a unix peer cannot vanish without the kernel knowing, and there is no Nagle delay to turn off.
-
-## Unix sockets
-
-A path on this machine instead of an address and a port. Local Postgres, MySQL, Redis.
-
-```echo
-tcp::Listener $l = guard tcp::Listener::bind(tcp::Address(unix: '/tmp/app.sock')) else ($e) {
-    die("{$e}");
-}
-```
-
-The socket file is made at bind and removed when the listener is released. A file left by a listener that is gone (the process died) is replaced: one that nothing answers on is stale. A live listener on the path stays `.addressInUse`, and a file that is not a socket is never touched.
-
-A path that is empty, holds a NUL, or is longer than the platform takes (103 bytes on macOS, 107 on Linux and Windows) is `.invalid`.
 
 ## Poller
 
@@ -276,7 +279,7 @@ Keep one `$events` across waits. Its room is reused, so a wait allocates nothing
 The bytes a reactor owes one connection. A try write takes what the socket has room for, and the rest waits here until the stream reports writable again.
 
 ```echo
-tcp::Outbox $out = tcp::Outbox(limit: 4194304);
+tcp::Outbox $out = tcp::Outbox();
 guard $out->push('hello') else ($e) {
     die("{$e}");   // .tooLarge: the bytes owed would pass the limit
 }
@@ -286,6 +289,8 @@ guard $out->flush($stream) else ($e) {
 
 tcp::Interest? $want = $out->interest($stream, reading: true);
 ```
+
+The default limit is 16 MiB. A push that would pass it is `.tooLarge`, with nothing queued.
 
 `interest` is `.read` while reading and nothing is owed, `.write` or `.both` while bytes are owed, null once the connection is done. The stream has the last word (`Pollable::needs`), so a layer over a socket can ask for more than the caller named.
 
@@ -311,6 +316,8 @@ string? $body = guard $r->exactly($stream, $n as usize, tcp::Deadline(ms: 1000))
 ```
 
 `exactly($n)` and `until($delim)` wait. `pullExactly` and `pullUntil` never wait: a reactor calls them until they answer null. Bytes read past a message stay buffered for the next one. `rest()` hands them over whole, to a TLS layer after a plaintext start.
+
+`window` is the same bytes as `peek`, without a copy. Valid until the reader next reads, skips, or takes.
 
 `max` (default 1 MiB) is the longest message held. A larger one is `.tooLarge` before it is read, so a peer cannot make a reader grow without end.
 
@@ -343,7 +350,7 @@ A prefix over `max` is `.tooLarge` before any body is buffered. Text that is not
 
 Fixed-width integers as wire protocols lay them out, read at an offset of a string and appended onto one. Big-endian is network order (frames, Postgres). Little-endian is MySQL and most game protocols. `le24` is MySQL's packet length.
 
-A read expects the bytes to be there. Check `size()` or a reader's `buffered()` first.
+A read expects the bytes to be there. Check `size()` or a reader's `buffered()` first. One past the end stops the program, in a release build too.
 
 ```echo
 uint32 $n = tcp::wire::be32($bytes, 0);
@@ -354,7 +361,7 @@ tcp::wire::putBe32($out, $n);
 
 `Stream` is a `Source` and a `Sink`. The layers above it (frames today, a test double, TLS tomorrow) take those interfaces, not one concrete socket. `Pollable::needs` is the matching hook for a poller: a plain socket answers what you asked; a layer over one may need write readiness to flush ciphertext a read produced.
 
-There is no TLS in this module. The seams are there so a layer can sit on a stream without the stream knowing.
+There is no TLS in this module, and no HTTP. The seams are there so a layer can sit on a stream without the stream knowing.
 
 ## Working here
 
