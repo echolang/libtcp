@@ -11,7 +11,7 @@ use std::time;
  */
 internal function sockPath(const string& $tag) : string
 {
-    string $dir = string::from(std::env::tmp());
+    string $dir = std::env::tmp()->string();
     // Windows names its temp directory in TEMP; TMPDIR is a POSIX habit
     string::view? $win = std::env::var('TEMP');
     if ($win != null) {
@@ -21,7 +21,7 @@ internal function sockPath(const string& $tag) : string
     int32 $pid = std::env::pid();
     // join borrows its parts: a temporary built in the call would be gone before it is read
     string $name = "ltcp-{$pid}-{$tag}.sock";
-    string $path = std::env::join($dir, $name);
+    string $path = std::fs::join($dir, $name)->string();
     return $path;
 }
 
@@ -30,13 +30,13 @@ internal function sockPath(const string& $tag) : string
  */
 internal function present(const string& $path) : bool
 {
-    string $dir = string::from(std::env::tmp());
+    string $dir = std::env::tmp()->string();
     string::view? $win = std::env::var('TEMP');
     if ($win != null) {
         string::view $w = guard $win;
         $dir = string::from($w);
     }
-    std::io::dir $d = guard std::io::opendir($dir) else ($e) {
+    std::fs::dir $d = guard std::fs::opendir($dir) else ($e) {
         die("opendir {$dir}: {$e}");
     }
     foreach ($d as $entry) {
@@ -204,16 +204,16 @@ test tcp_a_busy_unix_listener_is_not_stale
 test tcp_a_plain_file_is_never_replaced
 {
     string $path = sockPath('plain');
-    usize $n = guard std::io::writefile($path, 'keep me') else ($e) {
+    usize $n = guard std::fs::writefile($path, 'keep me') else ($e) {
         die("writefile: {$e}");
     }
     result<tcp::Listener, tcp::Error> $bound = tcp::Listener::bind(tcp::Address(unix: $path));
     expect(!$bound->has_value(), 'a bind over a plain file fails');
-    string $kept = guard std::io::readfile($path) else ($e) {
+    string $kept = guard std::fs::readfile($path) else ($e) {
         die("readfile: {$e}");
     }
     assert($kept == 'keep me', 'and the file is untouched');
-    bool $gone = guard std::io::remove($path) else ($e) {
+    bool $gone = guard std::fs::remove($path) else ($e) {
         die("remove: {$e}");
     }
 }
