@@ -6,6 +6,7 @@ TCP sockets for Echo. Bind, connect, accept, and move bytes, with a deadline on 
 - IPv4, IPv6, and unix sockets
 - a `Poller` (epoll, kqueue, wepoll)
 - a buffered `Reader`, an `Outbox`, length-prefixed frames
+- the client side of an HTTP/1.1 exchange: a request head out, an answer's head and body in
 
 ## Installation
 
@@ -346,6 +347,37 @@ A prefix over `max` is `.tooLarge` before any body is buffered. Text that is not
 
 `frame::Error::end` is the peer closing between frames, the clean end of a conversation. That is not `tcp::Error::closed`, which is this side closing. `transport` keeps the connection's error whole. `"{$e}"` and `name()` work the same way (`'transport:reset'`).
 
+## HTTP/1.1 client
+
+The client side of one HTTP/1.1 exchange, over any `Source` and `Sink`: write a request head, read the answer's head, then its body. A proxy that has to speak to an upstream itself (a WebSocket handshake, say) needs exactly this much.
+
+```echo
+tcp::http1::Head $h = tcp::http1::Head('GET', '/ws');
+$h->add('Host', 'app.internal');
+$h->add('Connection', 'Upgrade');
+$h->add('Upgrade', 'websocket');
+guard tcp::http1::send($stream, $h, '', tcp::Deadline(ms: 1000)) else ($e) {
+    die("{$e}");
+}
+
+tcp::Reader $in = tcp::Reader(max: 65536);
+tcp::http1::Answer $a = guard tcp::http1::answer($stream, $in, tcp::Deadline(ms: 5000)) else ($e) {
+    die("{$e}");
+}
+if ($a->status == 101 && $a->has('Upgrade', 'websocket')) {
+    string $early = $in->rest();
+    // the connection is the new protocol's now, starting with $early
+}
+```
+
+`Head` writes the request line and the fields in the order they were added, and nothing else: not `Host`, and not a body's `Content-Length`. A method or field name that is not a token, or a target or value with a CR, LF or NUL, is `.invalid` before a byte goes out, so a value cannot smuggle in a second request.
+
+`answer` reads past interim 1xx answers to the final one, or to a `101`. The reader's `max` caps the head. Bytes past the head stay in the reader: after a `101`, `rest()` is the start of the protocol switched to. `parse` is the same reading for a head you already have.
+
+`body` reads the rest by the framing the head says (`Answer::framing`): none for 1xx, 204 and 304, chunked when the last transfer coding is, `Content-Length`, or up to the close. Chunks come out decoded and trailers are dropped. `$max` caps the body (`.tooLarge`), and a close partway through is `.truncated`. Do not call it for the answer to a HEAD.
+
+What is not here yet: keeping a connection for a second request, and streaming a body in either direction. Bytes past a body are dropped, so close the connection after one exchange.
+
 ## Wire
 
 Fixed-width integers as wire protocols lay them out, read at an offset of a string and appended onto one. Big-endian is network order (frames, Postgres). Little-endian is MySQL and most game protocols. `le24` is MySQL's packet length.
@@ -361,7 +393,7 @@ tcp::wire::putBe32($out, $n);
 
 `Stream` is a `Source` and a `Sink`. The layers above it (frames today, a test double, TLS tomorrow) take those interfaces, not one concrete socket. `Pollable::needs` is the matching hook for a poller: a plain socket answers what you asked; a layer over one may need write readiness to flush ciphertext a read produced.
 
-There is no TLS in this module, and no HTTP. The seams are there so a layer can sit on a stream without the stream knowing.
+There is no TLS in this module, and no HTTP server. The seams are there so a layer can sit on a stream without the stream knowing.
 
 ## Working here
 

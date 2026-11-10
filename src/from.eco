@@ -22,6 +22,14 @@ public function from(const tcp::frame::Error& $e) : string
 }
 
 /**
+ * The HTTP/1.1 error's sentence, the same as `http1::Error::message`.
+ */
+public function from(const tcp::http1::Error& $e) : string
+{
+    return $e->message();
+}
+
+/**
  * `127.0.0.1:80`, `[::1]:80` for IPv6, or `unix:/path` for a unix socket (`unix:` alone for an
  * unnamed one). `Address::parse` reads each of them back.
  */

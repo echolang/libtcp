@@ -1,0 +1,232 @@
+/**
+ * The client side of HTTP/1.1 over real sockets: a head written and refused, an answer's head
+ * read across short reads, the bytes after a 101, and bodies by length, by chunks and to the
+ * close.
+ */
+
+/**
+ * The answer `$wire` makes, sent in one write and then closed.
+ */
+internal function answered(const string& $wire, tcp::Reader $in) : result<tcp::http1::Answer, tcp::http1::Error>
+{
+    tcp::StreamPair $p = connectedPair();
+    send($p->server, $wire);
+    $p->server->close();
+    return tcp::http1::answer($p->client, $in, ms(2000));
+}
+
+/**
+ * How reading the answer `$wire` makes ends, with a reader of `$max`.
+ */
+internal function headKind(const string& $wire, usize $max = 65536) : string
+{
+    return httpKind(answered($wire, tcp::Reader(max: $max)));
+}
+
+/**
+ * The body of the answer `$wire` makes, sent in one write and then closed.
+ */
+internal function bodyOf(const string& $wire, usize $max) : result<string, tcp::http1::Error>
+{
+    tcp::StreamPair $p = connectedPair();
+    send($p->server, $wire);
+    $p->server->close();
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    tcp::http1::Answer $a = guard tcp::http1::answer($p->client, $in, ms(2000)) else ($e) {
+        die("head: {$e}");
+    }
+    return tcp::http1::body($p->client, $in, $a, $max, ms(2000));
+}
+
+internal function httpKind<T>(result<T, tcp::http1::Error> $r) : string
+{
+    if ($r->has_value()) {
+        return 'ok';
+    }
+    return $r->failure()->name();
+}
+
+test http1_a_head_goes_out_as_written
+{
+    tcp::http1::Head $h = tcp::http1::Head('GET', '/ws?room=1');
+    $h->add('Host', 'app.internal');
+    $h->add('Upgrade', 'websocket');
+    string $wire = guard $h->render() else ($e) {
+        die("render: {$e}");
+    }
+    assert($wire == "GET /ws?room=1 HTTP/1.1\r\nHost: app.internal\r\nUpgrade: websocket\r\n\r\n");
+}
+
+test http1_a_head_that_would_smuggle_a_request_is_refused
+{
+    tcp::http1::Head $value = tcp::http1::Head('GET', '/');
+    $value->add('X-A', "1\r\nX-B: 2");
+    assert(httpKind($value->render()) == 'invalid');
+
+    tcp::http1::Head $nul = tcp::http1::Head('GET', '/');
+    $nul->add('X-A', "1\x002");
+    assert(httpKind($nul->render()) == 'invalid');
+
+    tcp::http1::Head $name = tcp::http1::Head('GET', '/');
+    $name->add('X A', '1');
+    assert(httpKind($name->render()) == 'invalid');
+
+    assert(httpKind(tcp::http1::Head('GET', "/ HTTP/1.1\r\nHost: x")->render()) == 'invalid');
+    assert(httpKind(tcp::http1::Head('GET', '')->render()) == 'invalid');
+    assert(httpKind(tcp::http1::Head('G T', '/')->render()) == 'invalid');
+}
+
+test http1_send_writes_head_and_body
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::http1::Head $h = tcp::http1::Head('POST', '/');
+    $h->add('Content-Length', '5');
+    guard tcp::http1::send($p->client, $h, 'hello', ms(2000)) else ($e) {
+        die("send: {$e}");
+    }
+    $p->client->close();
+    string $got = readToEnd($p->server, 2000);
+    assert($got == "POST / HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello");
+}
+
+test http1_an_answer_head_is_read_and_its_fields_found
+{
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    tcp::http1::Answer $a = guard answered("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Protocol: chat\r\n\r\nframes", $in) else ($e) {
+        die("answer: {$e}");
+    }
+    assert($a->status == 101);
+    assert($a->reason == 'Switching Protocols');
+    assert($a->fields->count() == 3);
+    assert(($a->field('sec-websocket-protocol') ?? '') == 'chat');
+    assert($a->field('Missing') == null);
+    assert($a->has('Connection', 'upgrade'));
+    assert($a->has('upgrade', 'WebSocket'));
+    assert(!$a->has('Connection', 'close'));
+    // what came after the head is the protocol switched to
+    assert($in->rest() == 'frames');
+}
+
+test http1_interim_answers_are_read_past
+{
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    tcp::http1::Answer $a = guard answered("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n", $in) else ($e) {
+        die("answer: {$e}");
+    }
+    assert($a->status == 404);
+    assert($a->field('Link') == null);
+}
+
+test http1_a_head_split_over_many_reads_comes_together
+{
+    tcp::StreamPair $p = connectedPair();
+    string $wire = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    foreach (0 .. $wire->size() as $i) {
+        send($p->server, $wire->sub($i, 1)->clone());
+    }
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    tcp::http1::Answer $a = guard tcp::http1::answer($p->client, $in, ms(2000)) else ($e) {
+        die("answer: {$e}");
+    }
+    assert($a->status == 200);
+    string $body = guard tcp::http1::body($p->client, $in, $a, 1024, ms(2000)) else ($e) {
+        die("body: {$e}");
+    }
+    assert($body == 'ok');
+}
+
+test http1_a_bad_or_oversized_head_is_refused
+{
+    assert(headKind("HTTP/2 200 OK\r\n\r\n") == 'malformed');
+    assert(headKind("HTTP/1.1 2x0 OK\r\n\r\n") == 'malformed');
+    assert(headKind("HTTP/1.1 200 OK\r\nNo colon\r\n\r\n") == 'malformed');
+    assert(headKind("HTTP/1.1 200 OK\r\nA: 1\r\n folded\r\n\r\n") == 'malformed');
+    assert(headKind("HTTP/1.1 200 OK\r\nA: 1\r2\r\n\r\n") == 'malformed');
+    assert(headKind("HTTP/1.1 200 OK\r\nA: 1\r\n") == 'truncated');
+
+    string $big = "HTTP/1.1 200 OK\r\nX: ";
+    foreach (0 .. 2000 as $i) {
+        $big->append('a');
+    }
+    assert(headKind($big, 1024) == 'tooLarge');
+}
+
+test http1_a_head_that_does_not_come_is_a_timeout
+{
+    tcp::StreamPair $p = connectedPair();
+    send($p->server, "HTTP/1.1 200 OK\r\n");
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    assert(httpKind(tcp::http1::answer($p->client, $in, ms(100))) == 'timeout');
+}
+
+test http1_a_body_by_length_stops_at_its_length
+{
+    assert(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA", 1024)->or('') == 'hello');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nshort", 1024)) == 'truncated');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 2000\r\n\r\n", 1024)) == 'tooLarge');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello", 1024)) == 'malformed');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!", 1024)) == 'malformed');
+    assert(bodyOf("HTTP/1.1 200 OK\r\nContent-Length: 5, 5\r\n\r\nhello", 1024)->or('') == 'hello');
+}
+
+test http1_a_chunked_body_is_decoded
+{
+    string $wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n5;ext=1\r\nhello\r\nA\r\n, world!!!\r\n0\r\nTrailer: x\r\n\r\n";
+    assert(bodyOf($wire, 1024)->or('') == 'hello, world!!!');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n", 1024)) == 'malformed');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 1024)) == 'malformed');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", 1024)) == 'truncated');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n", 1024)) == 'tooLarge');
+}
+
+test http1_a_large_chunked_body_comes_through_whole
+{
+    tcp::StreamPair $p = connectedPair();
+    string $data = pattern(300000);
+    send($p->server, "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n");
+    usize $at = 0;
+    while ($at < $data->size()) {
+        usize $n = 7000;
+        if ($data->size() - $at < $n) {
+            $n = $data->size() - $at;
+        }
+        send($p->server, "{$n:x}\r\n");
+        send($p->server, $data->sub($at, $n)->clone());
+        send($p->server, "\r\n");
+        $at = $at + $n;
+    }
+    send($p->server, "0\r\n\r\n");
+    tcp::Reader $in = tcp::Reader(max: 65536);
+    tcp::http1::Answer $a = guard tcp::http1::answer($p->client, $in, ms(2000)) else ($e) {
+        die("answer: {$e}");
+    }
+    string $body = guard tcp::http1::body($p->client, $in, $a, 1 << 20, ms(5000)) else ($e) {
+        die("body: {$e}");
+    }
+    expect(firstDiff($body, $data) == -1, "{$body->size()} bytes, byte for byte");
+}
+
+test http1_a_body_without_framing_ends_at_the_close
+{
+    assert(bodyOf("HTTP/1.1 200 OK\r\n\r\nuntil the end", 1024)->or('') == 'until the end');
+    assert(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nraw", 1024)->or('') == 'raw');
+    assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\n\r\nuntil the end", 4)) == 'tooLarge');
+}
+
+test http1_some_answers_have_no_body
+{
+    assert(bodyOf("HTTP/1.1 204 No Content\r\nContent-Length: 4\r\n\r\nnope", 1024)->or('x') == '');
+    assert(bodyOf("HTTP/1.1 304 Not Modified\r\n\r\nnope", 1024)->or('x') == '');
+}
+
+test http1_every_error_case_has_its_name_and_sentence
+{
+    assert(tcp::http1::Error::invalid('x')->name() == 'invalid');
+    assert(tcp::http1::Error::malformed('x')->name() == 'malformed');
+    assert(tcp::http1::Error::tooLarge(5)->name() == 'tooLarge');
+    assert(tcp::http1::Error::timeout->name() == 'timeout');
+    assert(tcp::http1::Error::truncated->name() == 'truncated');
+    assert(tcp::http1::Error::transport(tcp::Error::closed)->name() == 'transport:closed');
+    tcp::http1::Error $e = tcp::http1::Error::malformed('no status line');
+    assert("{$e}" == 'not an HTTP/1.1 answer: no status line');
+}

@@ -1,0 +1,142 @@
+/**
+ * The head of an HTTP/1.1 request, written by hand onto a stream: the request line and the
+ * fields, in the order they were added. Nothing is added for the caller, not even `Host`, and a
+ * body's `Content-Length` is the caller's to set. What would let a peer read a second request
+ * out of this one (a line break, a NUL, a name that is not a token) is refused before a byte
+ * goes out.
+ */
+
+namespace tcp::http1;
+
+/**
+ * One field of a head, as it is written or as it was read.
+ */
+public struct Field
+{
+    public string $name;
+    public string $value;
+}
+
+public struct Head
+{
+    public string $method;
+    public string $target;
+    public array<Field> $fields;
+
+    /**
+     * A request for `$target`, origin form (`/path?query`), with no fields yet.
+     */
+    public constructor(const string& $method, const string& $target)
+    {
+        $this->method = $method;
+        $this->target = $target;
+        $this->fields = array<Field>();
+    }
+
+    /**
+     * Adds a field after the ones already there; a name may come more than once.
+     */
+    public function add(const string& $name, const string& $value) : void
+    {
+        $this->fields[] = Field($name, $value);
+    }
+
+    /**
+     * The head as it goes on the wire, ending in the blank line, or `.invalid` with nothing to
+     * send.
+     */
+    public const function render() : result<string, Error>
+    {
+        if (!token($this->method)) {
+            return .error(.invalid('the method is not a token'));
+        }
+        if (!visible($this->target)) {
+            return .error(.invalid('the target is empty or has a space or control byte'));
+        }
+
+        string $out = "{$this->method} {$this->target} HTTP/1.1\r\n";
+        foreach ($this->fields as const &$f) {
+            if (!token($f->name)) {
+                return .error(.invalid("the field name '{$f->name}' is not a token"));
+            }
+            if (!plain($f->value)) {
+                return .error(.invalid("the field {$f->name} has a line break or a NUL"));
+            }
+            $out->append($f->name);
+            $out->append(': ');
+            $out->append($f->value);
+            $out->append("\r\n");
+        }
+        $out->append("\r\n");
+        return .ok($out);
+    }
+}
+
+/**
+ * Writes `$head` and then `$body` onto `$to` as one gathered write, before the deadline. A body
+ * needs its `Content-Length` among the fields.
+ */
+public function send<W : tcp::Sink>(W $to, const Head& $head, const string& $body, tcp::Deadline $by) : status<Error>
+{
+    string $wire = guard $head->render() else ($e) {
+        return .error($e);
+    }
+    guard $to->write($wire, $body, $by) else ($e) {
+        return .error(wrap($e));
+    }
+    return .ok;
+}
+
+/**
+ * True for a non-empty run of token characters (RFC 9110 5.6.2): what a method and a field name
+ * are made of.
+ */
+public function token(const string& $s) : bool
+{
+    if ($s->empty()) {
+        return false;
+    }
+    foreach (0 .. $s->size() as $i) {
+        uint8 $c = $s->byte($i);
+        bool $alnum = ($c >= 48 && $c <= 57) || ($c >= 65 && $c <= 90) || ($c >= 97 && $c <= 122);
+        // ! # $ % & ' * + - . ^ _ ` | ~
+        bool $mark = $c == 33 || ($c >= 35 && $c <= 39) || $c == 42 || $c == 43 || $c == 45 || $c == 46 || $c == 94 || $c == 95 || $c == 96 || $c == 124 || $c == 126;
+        if (!$alnum && !$mark) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * True for a non-empty run of bytes that are not a space, a control byte or DEL: what a request
+ * target is made of.
+ */
+internal function visible(const string& $s) : bool
+{
+    if ($s->empty()) {
+        return false;
+    }
+    foreach (0 .. $s->size() as $i) {
+        uint8 $c = $s->byte($i);
+        if ($c <= 32 || $c == 127) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * True when there is no CR, LF or NUL: what a field value may not hold. A tab or a byte past
+ * ASCII is fine.
+ */
+internal function plain(const string& $s) : bool
+{
+    foreach (0 .. $s->size() as $i) {
+        uint8 $c = $s->byte($i);
+        if ($c == 13 || $c == 10 || $c == 0) {
+            return false;
+        }
+    }
+    return true;
+}

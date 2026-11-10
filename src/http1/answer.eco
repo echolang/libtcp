@@ -1,0 +1,399 @@
+/**
+ * The answer to a request: its head read off a stream with a `tcp::Reader`, then its body by
+ * the framing the head says. Bytes past the head stay in the reader, so after a `101` its
+ * `rest()` is the start of the protocol switched to.
+ */
+
+namespace tcp::http1;
+
+/**
+ * How the body after a head ends.
+ */
+public enum Framing
+{
+    /**
+     * There is no body: a 1xx, a 204 or a 304.
+     */
+    case none;
+
+    /**
+     * Exactly this many bytes, from `Content-Length`.
+     */
+    case length(uint64 $bytes);
+
+    /**
+     * Chunked transfer coding, up to its last chunk.
+     */
+    case chunked;
+
+    /**
+     * Everything up to the peer's close.
+     */
+    case close;
+}
+
+public struct Answer
+{
+    public int32 $status;
+    public string $reason;
+    public array<Field> $fields;
+
+    /**
+     * The value of the first field called `$name`, any case, or null when there is none.
+     */
+    public const function field(const string& $name) : string?
+    {
+        string? $none = null;
+        foreach ($this->fields as const &$f) {
+            if (str::iequals($f->name, $name)) {
+                string? $found = $f->value;
+                return $found;
+            }
+        }
+        return $none;
+    }
+
+    /**
+     * Whether a field called `$name` lists `$token` among its comma separated values, any case:
+     * `Connection: keep-alive, Upgrade` has `upgrade`.
+     */
+    public const function has(const string& $name, const string& $token) : bool
+    {
+        string $want = str::lower($token);
+        foreach ($this->items($name) as const &$item) {
+            if (str::lower($item) == $want) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * How the body after this head ends (RFC 9112 6.3): none for a 1xx, 204 or 304, chunked when
+     * the last transfer coding is, to the close for any other coding, else `Content-Length`, else
+     * the close. `.malformed` for a length that is not a number, or lengths that disagree. The
+     * answer to a HEAD has no body whatever this says.
+     */
+    public const function framing() : result<Framing, Error>
+    {
+        if (($this->status >= 100 && $this->status < 200) || $this->status == 204 || $this->status == 304) {
+            return .ok(.none);
+        }
+
+        string $coding = $this->lastCoding();
+        if ($coding == 'chunked') {
+            return .ok(.chunked);
+        }
+        if (!$coding->empty()) {
+            return .ok(.close);
+        }
+
+        bool $seen = false;
+        uint64 $bytes = 0;
+        foreach ($this->items('content-length') as const &$digits) {
+            if (!decimal($digits)) {
+                return .error(.malformed("Content-Length '{$digits}' is not a number"));
+            }
+            uint64 $n = guard str::uint($digits) else {
+                return .error(.malformed("Content-Length '{$digits}' is too large"));
+            }
+            if ($seen && $n != $bytes) {
+                return .error(.malformed('two different Content-Length values'));
+            }
+            $seen = true;
+            $bytes = $n;
+        }
+        if ($seen) {
+            return .ok(.length($bytes));
+        }
+        return .ok(.close);
+    }
+
+    /**
+     * The last of the transfer codings, lowercased, or empty when there is no `Transfer-Encoding`.
+     */
+    private const function lastCoding() : string
+    {
+        string $last = '';
+        foreach ($this->items('transfer-encoding') as const &$coding) {
+            if (!$coding->empty()) {
+                $last = str::lower($coding);
+            }
+        }
+        return $last;
+    }
+
+    /**
+     * The comma separated values of every field called `$name`, any case, in order and trimmed.
+     */
+    private const function items(const string& $name) : array<string>
+    {
+        array<string> $out = array<string>();
+        foreach ($this->fields as const &$f) {
+            if (!str::iequals($f->name, $name)) {
+                continue;
+            }
+            foreach (str::split($f->value, ',')->owned() as $piece) {
+                $out[] = str::trim($piece);
+            }
+        }
+        return $out;
+    }
+}
+
+/**
+ * The head of an answer, as the bytes before the blank line: `HTTP/1.1 101 Switching
+ * Protocols`, then a field per line. HTTP/1.0 is read too. A line folded onto the one before,
+ * a field without a name or colon, or a CR or NUL inside a line is `.malformed`.
+ */
+public function parse(const string& $head) : result<Answer, Error>
+{
+    array<string> $lines = str::split($head, "\r\n")->owned();
+    if ($lines->empty()) {
+        return .error(.malformed('no status line'));
+    }
+
+    string $line = $lines[0];
+    if ($line->size() < 12 || !($line->starts('HTTP/1.1 ') || $line->starts('HTTP/1.0 '))) {
+        return .error(.malformed('the status line does not start with HTTP/1.x and a code'));
+    }
+    string $code = $line->sub(9, 3)->clone();
+    if (!decimal($code) || ($line->size() > 12 && $line->byte(12) != 32)) {
+        return .error(.malformed('the status is not three digits'));
+    }
+    if (!plain($line)) {
+        return .error(.malformed('the status line has a CR or a NUL'));
+    }
+    // three digits by now, so the parse cannot fail
+    uint64 $status = str::uint($code) ?? 0;
+    if ($status < 100) {
+        return .error(.malformed("{$code} is not a status"));
+    }
+
+    string $reason = '';
+    if ($line->size() > 13) {
+        $reason = $line->sub(13, $line->size() - 13)->clone();
+    }
+
+    array<Field> $fields = array<Field>();
+    foreach (1 .. $lines->count() as $i) {
+        string $l = $lines[$i];
+        if ($l->empty()) {
+            continue;
+        }
+        uint8 $first = $l->byte(0);
+        if ($first == 32 || $first == 9) {
+            return .error(.malformed('a folded field line'));
+        }
+        if (!plain($l)) {
+            return .error(.malformed('a field line has a CR or a NUL'));
+        }
+        usize $colon = $l->find(':');
+        if ($colon == $l->size()) {
+            return .error(.malformed('a field line without a colon'));
+        }
+        string $name = $l->sub(0, $colon)->clone();
+        if (!token($name)) {
+            return .error(.malformed("'{$name}' is not a field name"));
+        }
+        string $value = str::trim($l->sub($colon + 1, $l->size() - $colon - 1)->clone());
+        $fields[] = Field($name, $value);
+    }
+
+    return .ok(Answer($status as int32, $reason, $fields));
+}
+
+/**
+ * The next answer's head off `$src`, before the deadline. An interim 1xx answer other than a
+ * `101` is read past, so this is the final answer or the switch. The reader's `max` caps the
+ * head; what came after the head stays in it.
+ */
+public function answer<S : tcp::Source>(S $src, tcp::Reader $in, tcp::Deadline $by) : result<Answer, Error>
+{
+    while (true) {
+        string? $got = guard $in->until($src, "\r\n\r\n", $by) else ($e) {
+            return .error(wrap($e));
+        }
+        string $head = guard $got else {
+            return .error(.timeout);
+        }
+        Answer $a = guard parse($head) else ($e) {
+            return .error($e);
+        }
+        if ($a->status >= 200 || $a->status == 101) {
+            return .ok($a);
+        }
+    }
+}
+
+/**
+ * The body after `$a`'s head, whole, read off `$src` past what `$in` holds already, before the
+ * deadline and at most `$max` bytes: `.tooLarge` past it, `.truncated` when the peer closes
+ * short. A chunked body comes out decoded, its trailers dropped. For the answer to a HEAD, do
+ * not call this: it has no body.
+ */
+public function body<S : tcp::Source>(S $src, tcp::Reader $in, const Answer& $a, usize $max, tcp::Deadline $by) : result<string, Error>
+{
+    Framing $framing = guard $a->framing() else ($e) {
+        return .error($e);
+    }
+    string $wire = $in->rest();
+
+    return match ($framing) {
+        Framing::none => .ok(''),
+        Framing::length($bytes) => sized($src, $wire, $bytes, $max, $by),
+        Framing::chunked => chunks($src, $wire, $max, $by),
+        Framing::close => closing($src, $wire, $max, $by),
+    };
+}
+
+/**
+ * A body of exactly `$bytes`, starting with what was read already.
+ */
+internal function sized<S : tcp::Source>(S $src, string $wire, uint64 $bytes, usize $max, tcp::Deadline $by) : result<string, Error>
+{
+    if ($bytes > ($max as uint64)) {
+        return .error(.tooLarge($bytes));
+    }
+    usize $n = $bytes as usize;
+    if ($wire->size() < $n) {
+        guard tcp::readExactly($src, $wire, $n - $wire->size(), $by) else ($e) {
+            return .error(wrap($e));
+        }
+    }
+    // bytes past the body belong to nobody: the connection is not reused
+    if ($wire->size() > $n) {
+        return .ok($wire->sub(0, $n)->clone());
+    }
+    return .ok($wire);
+}
+
+/**
+ * A body that ends with the peer's close.
+ */
+internal function closing<S : tcp::Source>(S $src, string $wire, usize $max, tcp::Deadline $by) : result<string, Error>
+{
+    if ($wire->size() > $max) {
+        return .error(.tooLarge($wire->size() as uint64));
+    }
+    guard tcp::readAll($src, $wire, max: $max - $wire->size(), $by) else ($e) {
+        return .error(wrap($e));
+    }
+    return .ok($wire);
+}
+
+// the longest chunk size or trailer line, extensions included
+internal const usize CHUNK_LINE = 1024;
+
+/**
+ * A chunked body, decoded: each chunk's size in hex (extensions ignored), its bytes and a CRLF,
+ * up to the zero chunk, then trailer lines up to a blank one. Lines come through a reader capped
+ * at `CHUNK_LINE`; a chunk's bytes past what it holds are read straight onto the body.
+ */
+internal function chunks<S : tcp::Source>(S $src, string $wire, usize $max, tcp::Deadline $by) : result<string, Error>
+{
+    string $out = '';
+    tcp::Reader $in = tcp::Reader(max: CHUNK_LINE);
+    $in->feed($wire);
+
+    while (true) {
+        string $line = guard chunkLine($src, $in, $by) else ($e) {
+            return .error($e);
+        }
+        usize $semi = $line->find(';');
+        string $digits = str::trim($line->sub(0, $semi)->clone());
+        uint64 $size = guard hex($digits) else {
+            return .error(.malformed("'{$digits}' is not a chunk size"));
+        }
+
+        if ($size == 0) {
+            // trailers, each a line, up to the blank one
+            while (true) {
+                string $trailer = guard chunkLine($src, $in, $by) else ($e) {
+                    return .error($e);
+                }
+                if ($trailer->empty()) {
+                    return .ok($out);
+                }
+            }
+        }
+
+        if ($size > ($max - $out->size()) as uint64) {
+            return .error(.tooLarge(($out->size() as uint64) + $size));
+        }
+        usize $n = $size as usize;
+        usize $have = $in->buffered();
+        if ($have > $n) {
+            $have = $n;
+        }
+        string $part = guard $in->take($have);
+        $out->append($part);
+        if ($have < $n) {
+            guard tcp::readExactly($src, $out, $n - $have, $by) else ($e) {
+                return .error(wrap($e));
+            }
+        }
+
+        string? $got = guard $in->exactly($src, 2, $by) else ($e) {
+            return .error(wrap($e));
+        }
+        string $end = guard $got else {
+            return .error(.timeout);
+        }
+        if ($end != "\r\n") {
+            return .error(.malformed('a chunk does not end in CRLF'));
+        }
+    }
+}
+
+/**
+ * The next chunk size or trailer line off `$in`, reading more off `$src` until it is there.
+ * `.malformed` for a line over `CHUNK_LINE`.
+ */
+internal function chunkLine<S : tcp::Source>(S $src, tcp::Reader $in, tcp::Deadline $by) : result<string, Error>
+{
+    string? $got = guard $in->until($src, "\r\n", $by) else ($e) {
+        bool $long = match ($e) {
+            tcp::Error::tooLarge($size) => true,
+            else => false,
+        };
+        if ($long) {
+            return .error(.malformed('a chunk line is too long'));
+        }
+        return .error(wrap($e));
+    }
+    string $line = guard $got else {
+        return .error(.timeout);
+    }
+    return .ok($line);
+}
+
+/**
+ * True for a non-empty run of ASCII digits.
+ */
+internal function decimal(const string& $s) : bool
+{
+    if ($s->empty()) {
+        return false;
+    }
+    foreach (0 .. $s->size() as $i) {
+        uint8 $c = $s->byte($i);
+        if ($c < 48 || $c > 57) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * A chunk size: one to fifteen hex digits, any case, or null.
+ */
+internal function hex(const string& $s) : uint64?
+{
+    uint64? $none = null;
+    if ($s->empty() || $s->size() > 15) {
+        return $none;
+    }
+    // str::uint reads hex behind a 0x and refuses a sign, a space or a second prefix
+    return str::uint("0x{$s}");
+}

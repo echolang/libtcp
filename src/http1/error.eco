@@ -1,0 +1,82 @@
+/**
+ * Why an HTTP/1.1 head could not be written, or an answer not read.
+ */
+
+namespace tcp::http1;
+
+public enum Error
+{
+    /**
+     * A head that may not go on the wire: a method or a field name that is not a token, or a
+     * target or value with a line break or a NUL that would start a request of its own.
+     */
+    case invalid(string $why);
+
+    /**
+     * The peer's answer is not HTTP/1.1: a bad status line, a field without a colon, a folded
+     * line, a length that is not a number, or chunk framing that does not add up.
+     */
+    case malformed(string $why);
+
+    /**
+     * A head over the reader's `max`, or a body over the cap it was read with.
+     */
+    case tooLarge(uint64 $size);
+
+    /**
+     * The deadline passed before the whole head or body arrived.
+     */
+    case timeout;
+
+    /**
+     * The peer closed partway through a head or a body.
+     */
+    case truncated;
+
+    /**
+     * The connection under the head or body failed; the cause is kept whole.
+     */
+    case transport(tcp::Error $cause);
+
+    public const function message() : string
+    {
+        return match ($this) {
+            Error::invalid($why) => "not a head to send: {$why}",
+            Error::malformed($why) => "not an HTTP/1.1 answer: {$why}",
+            Error::tooLarge($size) => "{$size} bytes are over the limit",
+            Error::timeout => 'the answer did not arrive in time',
+            Error::truncated => 'the connection closed in the middle of the answer',
+            Error::transport($cause) => $cause->message(),
+        };
+    }
+
+    /**
+     * The case's name (`malformed`, `timeout`, ...); a transport error is `transport:` plus the
+     * cause, `transport:reset`.
+     */
+    public const function name() : string
+    {
+        return match ($this) {
+            Error::invalid($why) => 'invalid',
+            Error::malformed($why) => 'malformed',
+            Error::tooLarge($size) => 'tooLarge',
+            Error::timeout => 'timeout',
+            Error::truncated => 'truncated',
+            Error::transport($cause) => "transport:{$cause->name()}",
+        };
+    }
+}
+
+/**
+ * A failed read or write under a head or body as this module's error: a close is `truncated`, a
+ * passed deadline `timeout`, a cap `tooLarge`, anything else the connection's.
+ */
+internal function wrap(const tcp::Error& $e) : Error
+{
+    return match ($e) {
+        tcp::Error::eof => Error::truncated,
+        tcp::Error::timeout => Error::timeout,
+        tcp::Error::tooLarge($size) => Error::tooLarge($size),
+        else => Error::transport($e),
+    };
+}
