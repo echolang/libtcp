@@ -3,7 +3,8 @@
  *
  * The platform layer is C behind one contract (c/tcp.h): c/posix.c on macOS
  * and Linux (epoll or kqueue), c/win32.c on Windows (Winsock, wepoll).
- * Deadlines, addresses, frames and the rest are Echo. No TLS, no HTTP.
+ * Deadlines, addresses, frames, the client side of an HTTP/1.1 exchange and the rest are Echo.
+ * No TLS, and no HTTP server.
  */
 
 #[module: "libtcp"]
@@ -18,7 +19,7 @@
 #[else]
 #[cc: sources "c/posix.c"]
 #[end]
-#[sources: ["src/*.eco", "src/frame/*.eco"]]
+#[sources: ["src/*.eco", "src/frame/*.eco", "src/http1/*.eco"]]
 
 #[target: test] {
     #[sources: "tests/*.eco"]
