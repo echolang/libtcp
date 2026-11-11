@@ -1,0 +1,456 @@
+/**
+ * The reactor's HTTP/1.1 answer decoder: heads and bodies by length, by chunks, to the close and
+ * none at all, fed whole, a byte at a time, and in pieces, with the bytes after an answer left
+ * for the next one. Then once over a real non-blocking stream driven by a poller.
+ */
+
+/**
+ * What decoding one answer came to.
+ */
+internal struct Decoded
+{
+    public int32 $status = 0;
+    public string $body = '';
+    // 'ok', or the error's case name
+    public string $failure = 'ok';
+    public bool $done = false;
+    public bool $reusable = false;
+    public bool $framed = false;
+    // what is left for the next answer: unread in the reader, then never fed
+    public string $rest = '';
+}
+
+/**
+ * Decodes the answer at the start of `$wire`, fed `$step` bytes at a time (0: all at once),
+ * the body taken at most `$most` bytes a call. `$closed` tells the decoder the peer closed once
+ * every byte is fed.
+ */
+internal function decode(const string& $wire, usize $step, method: const string& $method = 'GET', closed: bool $closed = false, most: usize $most = 65536, max: usize $max = 65536) : Decoded
+{
+    tcp::Reader $in = tcp::Reader(max: $max);
+    tcp::http1::Decoder $dec = tcp::http1::Decoder(method: $method);
+    Decoded $d = Decoded();
+    usize $at = 0;
+    bool $headed = false;
+    while (true) {
+        if ($at < $wire->size()) {
+            usize $n = $step;
+            if ($n == 0 || $at + $n > $wire->size()) {
+                $n = $wire->size() - $at;
+            }
+            $in->feed($wire->sub($at, $n)->clone());
+            $at = $at + $n;
+        }
+
+        if (!$headed) {
+            result<tcp::http1::Answer?, tcp::http1::Error> $h = $dec->head($in);
+            if (!$h->has_value()) {
+                $d->failure = $h->failure()->name();
+                return $d;
+            }
+            tcp::http1::Answer? $got = $h->unwrap();
+            if ($got != null) {
+                tcp::http1::Answer $a = guard $got;
+                $d->status = $a->status;
+                $headed = true;
+            }
+        }
+        if ($headed) {
+            while (true) {
+                result<usize, tcp::http1::Error> $b = $dec->body($in, $d->body, $most);
+                if (!$b->has_value()) {
+                    $d->failure = $b->failure()->name();
+                    return $d;
+                }
+                usize $n = $b->unwrap();
+                expect($n <= $most, "a body call took {$n}, over {$most}");
+                if ($n == 0) {
+                    break;
+                }
+            }
+        }
+
+        if ($dec->done()) {
+            break;
+        }
+        if ($at >= $wire->size()) {
+            if ($closed) {
+                status<tcp::http1::Error> $end = $dec->eof();
+                if (!$end->has_value()) {
+                    $d->failure = $end->failure()->name();
+                    return $d;
+                }
+            }
+            break;
+        }
+    }
+
+    $d->done = $dec->done();
+    $d->reusable = $dec->reusable();
+    $d->framed = $dec->framing() != null;
+    $d->rest = $in->rest();
+    $d->rest->append($wire->sub($at, $wire->size() - $at)->clone());
+    return $d;
+}
+
+/**
+ * The same answer decoded whole, a byte at a time, and three bytes at a time with the body two
+ * bytes a call: all three have to agree, and the whole one is returned.
+ */
+internal function decodeEvery(const string& $wire, method: const string& $method = 'GET', closed: bool $closed = false) : Decoded
+{
+    Decoded $whole = decode($wire, 0, method: $method, closed: $closed);
+    Decoded $bytes = decode($wire, 1, method: $method, closed: $closed);
+    Decoded $small = decode($wire, 3, method: $method, closed: $closed, most: 2);
+    foreach ([$bytes, $small] as const &$d) {
+        expect($d->failure == $whole->failure, "fed in pieces it failed {$d->failure}, whole {$whole->failure}");
+        expect($d->status == $whole->status, "fed in pieces the status is {$d->status}, whole {$whole->status}");
+        expect($d->body == $whole->body, "fed in pieces the body is '{$d->body}', whole '{$whole->body}'");
+        expect($d->done == $whole->done, 'fed in pieces done differs');
+        expect($d->reusable == $whole->reusable, 'fed in pieces reusable differs');
+        expect($d->rest == $whole->rest, "fed in pieces the rest is '{$d->rest}', whole '{$whole->rest}'");
+    }
+    return $whole;
+}
+
+test decode_a_body_by_length_leaves_the_next_answer
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloHTTP/1.1 204 No Content\r\n\r\n");
+    assert($d->failure == 'ok');
+    assert($d->status == 200);
+    assert($d->body == 'hello');
+    assert($d->done);
+    assert($d->reusable);
+    assert($d->rest == "HTTP/1.1 204 No Content\r\n\r\n");
+}
+
+test decode_an_empty_body_by_length_is_done_with_the_head
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nNEXT");
+    assert($d->body == '');
+    assert($d->done && $d->reusable);
+    assert($d->rest == 'NEXT');
+}
+
+test decode_a_chunked_body_drops_extensions_and_trailers
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;name=value\r\nhello\r\nA \r\n, chunked!\r\n0\r\nX-Checksum: abc\r\nX-More: 1\r\n\r\nNEXT");
+    assert($d->failure == 'ok');
+    assert($d->body == 'hello, chunked!');
+    assert($d->done && $d->reusable);
+    assert($d->rest == 'NEXT');
+}
+
+test decode_a_chunked_body_without_trailers
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
+    assert($d->body == 'abc');
+    assert($d->done && $d->reusable);
+    assert($d->rest == '');
+}
+
+test decode_a_body_to_the_close_ends_with_the_peer
+{
+    Decoded $open = decodeEvery("HTTP/1.1 200 OK\r\n\r\nall of it");
+    assert($open->body == 'all of it');
+    assert(!$open->done, 'the body may go on until the peer closes');
+
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\n\r\nall of it", closed: true);
+    assert($d->failure == 'ok');
+    assert($d->body == 'all of it');
+    assert($d->done);
+    assert(!$d->reusable, 'a connection whose close ended the body is gone');
+
+    // another coding than chunked runs to the close too
+    Decoded $coded = decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nzz", closed: true);
+    assert($coded->body == 'zz' && $coded->done && !$coded->reusable);
+}
+
+test decode_the_answer_to_a_head_has_no_body
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nNEXT", method: 'HEAD');
+    assert($d->status == 200);
+    assert($d->body == '');
+    assert($d->done && $d->reusable);
+    assert($d->rest == 'NEXT');
+
+    Decoded $chunked = decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nNEXT", method: 'HEAD');
+    assert($chunked->done && $chunked->reusable && $chunked->rest == 'NEXT');
+}
+
+test decode_a_2xx_to_a_connect_leaves_the_tunnel
+{
+    // no Content-Length: without the method this body would run to the close
+    Decoded $d = decodeEvery("HTTP/1.1 200 Connection established\r\n\r\n\x16\x03\x01hello", method: 'CONNECT');
+    assert($d->failure == 'ok');
+    assert($d->status == 200);
+    assert($d->body == '');
+    assert($d->done);
+    assert(!$d->reusable, 'the connection is the tunnel now');
+    assert($d->rest == "\x16\x03\x01hello");
+}
+
+test decode_a_refused_connect_has_its_body
+{
+    Decoded $d = decodeEvery("HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 4\r\n\r\ndenyNEXT", method: 'CONNECT');
+    assert($d->status == 407);
+    assert($d->body == 'deny');
+    assert($d->done && $d->reusable);
+    assert($d->rest == 'NEXT');
+}
+
+test decode_body_appends_into_the_callers_buffer
+{
+    tcp::Reader $in = tcp::Reader();
+    $in->feed("HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\nhello");
+    tcp::http1::Decoder $dec = tcp::http1::Decoder();
+    tcp::http1::Answer? $a = guard $dec->head($in) else ($e) {
+        die("head: {$e}");
+    }
+    string $out = '';
+    $out->reserve(4096);
+    usize $room = $out->capacity();
+    usize $n = guard $dec->body($in, $out, 65536) else ($e) {
+        die("body: {$e}");
+    }
+    assert($n == 5 && $out == 'hello');
+    expect($out->capacity() == $room, "the buffer was replaced: {$out->capacity()}, was {$room}");
+
+    // the reactor's loop: clear, then decode the next piece into the same room
+    $out->clear();
+    $in->feed(' world!');
+    usize $more = guard $dec->body($in, $out, 65536) else ($e) {
+        die("body: {$e}");
+    }
+    assert($more == 7 && $out == ' world!');
+    expect($out->capacity() == $room, "the buffer was replaced: {$out->capacity()}, was {$room}");
+    assert($dec->done());
+}
+
+test decode_a_chunk_line_of_the_longest_size_is_read
+{
+    // CHUNK_LINE is 1024: a size line of exactly that is fine, one byte more is not
+    string $at = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3";
+    $at->append(str::repeat(';', 1023));
+    $at->append("\r\nabc\r\n0\r\n\r\n");
+    Decoded $ok = decodeEvery($at);
+    assert($ok->failure == 'ok' && $ok->body == 'abc' && $ok->done);
+
+    string $over = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3";
+    $over->append(str::repeat(';', 1024));
+    $over->append("\r\nabc\r\n0\r\n\r\n");
+    assert(decodeEvery($over)->failure == 'malformed');
+}
+
+test decode_204_and_304_have_no_body
+{
+    Decoded $none = decodeEvery("HTTP/1.1 204 No Content\r\nContent-Length: 4\r\n\r\nNEXT");
+    assert($none->status == 204);
+    assert($none->body == '' && $none->done && $none->reusable);
+    assert($none->rest == 'NEXT');
+
+    Decoded $same = decodeEvery("HTTP/1.1 304 Not Modified\r\nETag: \"x\"\r\n\r\nNEXT");
+    assert($same->status == 304);
+    assert($same->done && $same->reusable && $same->rest == 'NEXT');
+}
+
+test decode_interim_answers_are_skipped
+{
+    Decoded $d = decodeEvery("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok");
+    assert($d->status == 201);
+    assert($d->body == 'ok');
+    assert($d->done && $d->reusable);
+}
+
+test decode_a_101_is_the_head_and_leaves_the_new_protocol
+{
+    Decoded $d = decodeEvery("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nContent-Length: 3\r\n\r\nframes");
+    assert($d->status == 101);
+    assert($d->body == '');
+    assert($d->done);
+    assert(!$d->reusable, 'the connection belongs to the new protocol');
+    assert($d->rest == 'frames');
+
+    tcp::Reader $in = tcp::Reader();
+    $in->feed("HTTP/1.1 101 Switching Protocols\r\n\r\n");
+    tcp::http1::Decoder $dec = tcp::http1::Decoder();
+    tcp::http1::Answer? $a = guard $dec->head($in) else ($e) {
+        die("head: {$e}");
+    }
+    assert($a != null);
+    tcp::http1::Framing $f = guard $dec->framing() else {
+        die('no framing after the head');
+    }
+    bool $none = match ($f) {
+        tcp::http1::Framing::none => true,
+        else => false,
+    };
+    assert($none);
+}
+
+test decode_connection_close_is_not_reusable
+{
+    Decoded $d = decodeEvery("HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\nContent-Length: 2\r\n\r\nok");
+    assert($d->body == 'ok' && $d->done);
+    assert(!$d->reusable);
+
+    Decoded $old = decodeEvery("HTTP/1.0 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    assert($old->done && !$old->reusable, 'HTTP/1.0 closes unless it says keep-alive');
+
+    Decoded $kept = decodeEvery("HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 2\r\n\r\nok");
+    assert($kept->done && $kept->reusable);
+}
+
+test decode_conflicting_lengths_are_malformed
+{
+    assert(decode("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!", 0)->failure == 'malformed');
+    assert(decode("HTTP/1.1 200 OK\r\nContent-Length: 5, 6\r\n\r\nhello!", 1)->failure == 'malformed');
+    assert(decode("HTTP/1.1 200 OK\r\nContent-Length: -1\r\n\r\n", 0)->failure == 'malformed');
+    // the same length twice is one length
+    Decoded $same = decode("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\nok", 0);
+    assert($same->body == 'ok' && $same->done);
+}
+
+test decode_a_close_before_the_end_is_truncated
+{
+    assert(decodeEvery("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello", closed: true)->failure == 'truncated');
+    assert(decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel", closed: true)->failure == 'truncated');
+    assert(decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n", closed: true)->failure == 'truncated');
+    assert(decodeEvery("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-T: 1\r\n", closed: true)->failure == 'truncated');
+    assert(decodeEvery("HTTP/1.1 200 OK\r\nContent-Le", closed: true)->failure == 'truncated');
+    assert(decodeEvery('', closed: true)->failure == 'truncated');
+
+    // without the close it is only not there yet
+    Decoded $waiting = decodeEvery("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello");
+    assert($waiting->failure == 'ok' && $waiting->body == 'hello' && !$waiting->done);
+}
+
+test decode_bad_chunk_framing_is_malformed
+{
+    assert(decode("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", 0)->failure == 'malformed');
+    assert(decode("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n", 0)->failure == 'malformed');
+    assert(decode("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n", 1)->failure == 'malformed');
+    // a size line that never ends is refused once it is longer than any could be
+    string $long = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1";
+    $long->append(str::repeat(';', 2000));
+    assert(decode($long, 0)->failure == 'malformed');
+    assert(decode($long, 1)->failure == 'malformed');
+}
+
+test decode_a_head_over_the_readers_max_is_too_large
+{
+    string $wire = "HTTP/1.1 200 OK\r\nX-Big: ";
+    $wire->append(str::repeat('a', 200));
+    $wire->append("\r\n\r\n");
+    assert(decode($wire, 0, max: 64)->failure == 'tooLarge');
+    assert(decode($wire, 1, max: 64)->failure == 'tooLarge');
+    assert(decode("HTTP/2 200\r\n\r\n", 0)->failure == 'malformed');
+}
+
+test decode_a_large_body_comes_through_in_pieces
+{
+    string $body = pattern(1048576 + 17);
+    string $wire = "HTTP/1.1 200 OK\r\nContent-Length: {$body->size()}\r\n\r\n";
+    $wire->append($body);
+    $wire->append('NEXT');
+    Decoded $d = decode($wire, 7001, most: 4096);
+    int64 $diff = firstDiff($d->body, $body);
+    expect($diff == -1, "by length the body differs at {$diff} of {$d->body->size()}");
+    assert($d->done && $d->reusable && $d->rest == 'NEXT');
+
+    // the same body chunked unevenly, fed in pieces that cut through sizes and CRLFs
+    string $chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    usize $at = 0;
+    usize $size = 1;
+    while ($at < $body->size()) {
+        usize $n = $size;
+        if ($at + $n > $body->size()) {
+            $n = $body->size() - $at;
+        }
+        string $hexSize = "{$n:x}";
+        $chunked->append($hexSize);
+        $chunked->append("\r\n");
+        $chunked->append($body->sub($at, $n)->clone());
+        $chunked->append("\r\n");
+        $at = $at + $n;
+        $size = $size * 3 + 1;
+    }
+    $chunked->append("0\r\n\r\nNEXT");
+    Decoded $c = decode($chunked, 4093, most: 65536);
+    int64 $cdiff = firstDiff($c->body, $body);
+    expect($cdiff == -1, "chunked the body differs at {$cdiff} of {$c->body->size()}");
+    assert($c->done && $c->reusable && $c->rest == 'NEXT');
+}
+
+test decode_the_head_is_returned_again_once_read
+{
+    tcp::Reader $in = tcp::Reader();
+    $in->feed("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
+    tcp::http1::Decoder $dec = tcp::http1::Decoder();
+    assert($dec->framing() == null);
+    tcp::http1::Answer? $first = guard $dec->head($in) else ($e) {
+        die("head: {$e}");
+    }
+    tcp::http1::Answer? $again = guard $dec->head($in) else ($e) {
+        die("head: {$e}");
+    }
+    tcp::http1::Answer $a = guard $again else {
+        die('the head was not returned again');
+    }
+    assert($a->status == 200);
+    assert($in->buffered() == 2, 'a second call consumed nothing');
+    assert($dec->framing() != null);
+}
+
+test decode_over_a_nonblocking_stream_driven_by_a_poller
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::Poller $poller = openPoller();
+    guard $poller->add($p->client, 1, .read) else ($e) {
+        die("add: {$e}");
+    }
+    send($p->server, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nwi");
+    send($p->server, "ki\r\n0\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nend");
+    $p->server->close();
+
+    tcp::Reader $in = tcp::Reader();
+    array<string> $bodies = array<string>();
+    tcp::http1::Decoder $dec = tcp::http1::Decoder();
+    string $body = '';
+    bool $ended = false;
+    tcp::Deadline $by = ms(5000);
+    while ($bodies->count() < 2 && !$by->passed()) {
+        tcp::Event? $ev = waitFor($poller, 1, 1000);
+        result<usize?, tcp::Error> $got = $in->tryFill($p->client);
+        if (!$got->has_value()) {
+            expect(kind($got->failure()) == 'eof', "fill: {$got->failure()->name()}");
+            $ended = true;
+        }
+        // one fill may hold both answers: decode until nothing more comes of what is buffered
+        while ($bodies->count() < 2) {
+            tcp::http1::Answer? $a = guard $dec->head($in) else ($e) {
+                die("head: {$e}");
+            }
+            if ($a == null) {
+                break;
+            }
+            usize $n = guard $dec->body($in, $body, 65536) else ($e) {
+                die("body: {$e}");
+            }
+            if (!$dec->done()) {
+                break;
+            }
+            assert($dec->reusable());
+            $bodies[] = $body;
+            $body = '';
+            $dec = tcp::http1::Decoder();
+        }
+        if ($ended) {
+            break;
+        }
+    }
+    assert($bodies->count() == 2);
+    assert($bodies[0] == 'wiki');
+    assert($bodies[1] == 'end');
+    status<tcp::Error> $removed = $poller->remove($p->client);
+}

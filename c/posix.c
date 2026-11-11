@@ -47,6 +47,10 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #define TCP_EPOLL 1
+/* Linux 4.2; a libc older than that leaves it out */
+#ifndef IP_BIND_ADDRESS_NO_PORT
+#define IP_BIND_ADDRESS_NO_PORT 24
+#endif
 #else
 #include <pthread.h>
 #include <sys/event.h>
@@ -216,15 +220,9 @@ static int nonblocking_cloexec(int fd)
     return 0;
 }
 
-/* a new socket made CLOEXEC, non-blocking and SIGPIPE-free, where it was not born so */
-static int prepare(int fd)
+/* a socket made CLOEXEC, non-blocking and SIGPIPE-free, whatever it was born as */
+static int make_ready(int fd)
 {
-#ifdef BORN_READY
-    /* already both, and every send passes MSG_NOSIGNAL: nothing is left to do */
-    (void)fd;
-    (void)nonblocking_cloexec;
-    return 0;
-#else
     int one = 1;
 
     if (nonblocking_cloexec(fd) != 0) {
@@ -239,6 +237,17 @@ static int prepare(int fd)
 
     (void)one;
     return 0;
+}
+
+/* a new socket made CLOEXEC, non-blocking and SIGPIPE-free, where it was not born so */
+static int prepare(int fd)
+{
+#ifdef BORN_READY
+    /* already both, and every send passes MSG_NOSIGNAL: nothing is left to do */
+    (void)fd;
+    return 0;
+#else
+    return make_ready(fd);
 #endif
 }
 
@@ -586,10 +595,34 @@ void tcp_listener_close(int64_t l)
 #endif
 }
 
-int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err)
+/*
+ * Bind a socket about to connect to from: 0, or -1 with errno set. With no port, Linux is told to
+ * pick it at the connect (IP_BIND_ADDRESS_NO_PORT), where the destination is known, so one local
+ * port serves connections to many destinations instead of each bind taking one of its own.
+ */
+static int bind_from(int fd, const struct sockaddr_storage *ss, socklen_t sl, uint16_t port)
+{
+#if defined(__linux__)
+    int one = 1;
+
+    /* best effort: a kernel before 4.2 binds the port at once, as everywhere else */
+    if (port == 0) {
+        (void)setsockopt(fd, IPPROTO_IP, IP_BIND_ADDRESS_NO_PORT, &one, sizeof one);
+    }
+#else
+    (void)port;
+#endif
+
+    return bind(fd, (const struct sockaddr *)ss, sl);
+}
+
+int64_t tcp_connect_start(const tcp_addr *to, const tcp_addr *from, int32_t *done, tcp_err *err)
 {
     struct sockaddr_storage ss;
+    struct sockaddr_storage local;
     socklen_t sl;
+    socklen_t ll = 0;
+    int bound = from != NULL && from->family != 0;
     int fd;
     int code;
 
@@ -598,12 +631,17 @@ int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err)
         return fail_as(err, TCP_K_INVALID, EINVAL);
     }
 
+    /* a local address binds a TCP connect of its own family: a unix one has no use for it */
+    if (bound && (from->family != to->family || from->family == TCP_FAMILY_UNIX || to_sockaddr(from, &local, &ll) != 0)) {
+        return fail_as(err, TCP_K_INVALID, EINVAL);
+    }
+
     fd = open_socket(ss.ss_family);
     if (fd < 0) {
         return fail(err, errno);
     }
 
-    if (prepare(fd) != 0) {
+    if (prepare(fd) != 0 || (bound && bind_from(fd, &local, ll, from->port) != 0)) {
         code = errno;
         close(fd);
         return fail(err, code);
@@ -660,14 +698,14 @@ int32_t tcp_connect_finish(int64_t h, tcp_err *err)
     return connect_result((int)h, err);
 }
 
-int64_t tcp_connect(const tcp_addr *to, int32_t timeout_ms, tcp_err *err)
+int64_t tcp_connect(const tcp_addr *to, const tcp_addr *from, int32_t timeout_ms, tcp_err *err)
 {
     int64_t deadline = deadline_of(timeout_ms);
     int32_t done;
     int64_t fd;
     int ready;
 
-    fd = tcp_connect_start(to, &done, err);
+    fd = tcp_connect_start(to, from, &done, err);
     if (fd < 0 || done) {
         return fd;
     }
@@ -686,16 +724,53 @@ int64_t tcp_connect(const tcp_addr *to, int32_t timeout_ms, tcp_err *err)
     return fd;
 }
 
-int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err)
+/* a handle's own endpoint, or its peer's; 0, or TCP_ERR */
+static int32_t endpoint(int64_t h, int peer, tcp_addr *out, tcp_err *err)
 {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
+    int rc = peer ? getpeername((int)h, (struct sockaddr *)&ss, &sl) : getsockname((int)h, (struct sockaddr *)&ss, &sl);
 
-    if (getsockname((int)h, (struct sockaddr *)&ss, &sl) != 0) {
+    if (rc != 0) {
         return (int32_t)fail_on((int)h, err, errno);
     }
 
     from_sockaddr((struct sockaddr *)&ss, (size_t)sl, out);
+    return 0;
+}
+
+int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err)
+{
+    return endpoint(h, 0, out, err);
+}
+
+int32_t tcp_peer(int64_t h, tcp_addr *out, tcp_err *err)
+{
+    return endpoint(h, 1, out, err);
+}
+
+int32_t tcp_adopt(int64_t h, tcp_addr *peer, tcp_err *err)
+{
+    if (h < 0) {
+        return (int32_t)fail_as(err, TCP_K_INVALID, EBADF);
+    }
+
+    /* born elsewhere: neither Linux's SOCK_ flags nor accept4 made it ready, so prepare() cannot be trusted to */
+    if (make_ready((int)h) != 0) {
+        return (int32_t)fail_on((int)h, err, errno);
+    }
+
+    return tcp_peer(h, peer, err);
+}
+
+int32_t tcp_blocking(int64_t h, int32_t on, tcp_err *err)
+{
+    int nb = on ? 0 : 1;
+
+    if (ioctl((int)h, FIONBIO, &nb) != 0) {
+        return (int32_t)fail_on((int)h, err, errno);
+    }
+
     return 0;
 }
 

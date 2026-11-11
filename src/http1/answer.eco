@@ -72,7 +72,8 @@ public struct Answer
      * How the body after this head ends (RFC 9112 6.3): none for a 1xx, 204 or 304, chunked when
      * the last transfer coding is, to the close for any other coding, else `Content-Length`, else
      * the close. `.malformed` for a length that is not a number, or lengths that disagree. The
-     * answer to a HEAD has no body whatever this says.
+     * answer to a HEAD has no body whatever this says, and neither has a 2xx to a CONNECT: the
+     * tunnel starts after its head.
      */
     public const function framing() : result<Framing, Error>
     {
@@ -220,17 +221,27 @@ public function answer<S : tcp::Source>(S $src, tcp::Reader $in, tcp::Deadline $
         Answer $a = guard parse($head) else ($e) {
             return .error($e);
         }
-        if ($a->status >= 200 || $a->status == 101) {
+        if (!interim($a)) {
             return .ok($a);
         }
     }
 }
 
 /**
+ * True for an interim 1xx answer that a final one follows: every 1xx but a `101`, which switches
+ * the protocol instead.
+ */
+internal function interim(const Answer& $a) : bool
+{
+    return $a->status < 200 && $a->status != 101;
+}
+
+/**
  * The body after `$a`'s head, whole, read off `$src` past what `$in` holds already, before the
  * deadline and at most `$max` bytes: `.tooLarge` past it, `.truncated` when the peer closes
- * short. A chunked body comes out decoded, its trailers dropped. For the answer to a HEAD, do
- * not call this: it has no body.
+ * short. A chunked body comes out decoded, its trailers dropped; trailers over the reader's
+ * `max` are `.tooLarge` too. For the answer to a HEAD, and a 2xx to a CONNECT, do not call
+ * this: they have no body.
  */
 public function body<S : tcp::Source>(S $src, tcp::Reader $in, const Answer& $a, usize $max, tcp::Deadline $by) : result<string, Error>
 {
@@ -242,7 +253,7 @@ public function body<S : tcp::Source>(S $src, tcp::Reader $in, const Answer& $a,
     return match ($framing) {
         Framing::none => .ok(''),
         Framing::length($bytes) => sized($src, $wire, $bytes, $max, $by),
-        Framing::chunked => chunks($src, $wire, $max, $by),
+        Framing::chunked => chunks($src, $wire, $max, $in->max, $by),
         Framing::close => closing($src, $wire, $max, $by),
     };
 }
@@ -287,10 +298,11 @@ internal const usize CHUNK_LINE = 1024;
 
 /**
  * A chunked body, decoded: each chunk's size in hex (extensions ignored), its bytes and a CRLF,
- * up to the zero chunk, then trailer lines up to a blank one. Lines come through a reader capped
- * at `CHUNK_LINE`; a chunk's bytes past what it holds are read straight onto the body.
+ * up to the zero chunk, then trailer lines up to a blank one, at most `$trailers` bytes of them.
+ * Lines are buffered in a reader; a chunk's bytes past what it holds are read straight onto the
+ * body.
  */
-internal function chunks<S : tcp::Source>(S $src, string $wire, usize $max, tcp::Deadline $by) : result<string, Error>
+internal function chunks<S : tcp::Source>(S $src, string $wire, usize $max, usize $trailers, tcp::Deadline $by) : result<string, Error>
 {
     string $out = '';
     tcp::Reader $in = tcp::Reader(max: CHUNK_LINE);
@@ -300,20 +312,23 @@ internal function chunks<S : tcp::Source>(S $src, string $wire, usize $max, tcp:
         string $line = guard chunkLine($src, $in, $by) else ($e) {
             return .error($e);
         }
-        usize $semi = $line->find(';');
-        string $digits = str::trim($line->sub(0, $semi)->clone());
-        uint64 $size = guard hex($digits) else {
-            return .error(.malformed("'{$digits}' is not a chunk size"));
+        uint64 $size = guard chunkSize($line) else ($e) {
+            return .error($e);
         }
 
         if ($size == 0) {
-            // trailers, each a line, up to the blank one
+            // trailers, each a line, up to the blank one: dropped unread, only their size counts
+            usize $seen = 0;
             while (true) {
                 string $trailer = guard chunkLine($src, $in, $by) else ($e) {
                     return .error($e);
                 }
                 if ($trailer->empty()) {
                     return .ok($out);
+                }
+                $seen = $seen + $trailer->size() + 2;
+                if ($seen > $trailers) {
+                    return .error(.tooLarge($seen as uint64));
                 }
             }
         }
@@ -347,25 +362,64 @@ internal function chunks<S : tcp::Source>(S $src, string $wire, usize $max, tcp:
 }
 
 /**
- * The next chunk size or trailer line off `$in`, reading more off `$src` until it is there.
- * `.malformed` for a line over `CHUNK_LINE`.
+ * The size a chunk-size line gives, its extensions ignored. `.malformed` for one that is not hex.
+ */
+internal function chunkSize(const string& $line) : result<uint64, Error>
+{
+    usize $semi = $line->find(';');
+    string $digits = str::trim($line->sub(0, $semi)->clone());
+    uint64 $size = guard hex($digits) else {
+        return .error(.malformed("'{$digits}' is not a chunk size"));
+    }
+    return .ok($size);
+}
+
+/**
+ * The next chunk size or trailer line off `$in`, consumed with its CRLF, reading more off `$src`
+ * until it is there. `.malformed` for a line over `CHUNK_LINE`.
  */
 internal function chunkLine<S : tcp::Source>(S $src, tcp::Reader $in, tcp::Deadline $by) : result<string, Error>
 {
-    string? $got = guard $in->until($src, "\r\n", $by) else ($e) {
-        bool $long = match ($e) {
-            tcp::Error::tooLarge($size) => true,
-            else => false,
-        };
-        if ($long) {
+    while (true) {
+        usize? $end = guard lineEnd($in) else ($e) {
+            return .error($e);
+        }
+        if ($end != null) {
+            usize $len = guard $end;
+            string $line = guard $in->take($len);
+            $in->skip(2);
+            return .ok($line);
+        }
+        usize? $got = guard $in->fill($src, $by) else ($e) {
+            return .error(wrap($e));
+        }
+        if ($got == null) {
+            return .error(.timeout);
+        }
+    }
+}
+
+/**
+ * Where the CRLF ending the next chunk size or trailer line in `$in` starts, or null while it is
+ * not all there; nothing is consumed. `.malformed` for a line over `CHUNK_LINE`, a cap the
+ * reader's `max` (the head's) cannot give. The one rule for both the blocking `body` and the
+ * `Decoder`.
+ */
+internal function lineEnd(tcp::Reader $in) : result<usize?, Error>
+{
+    usize? $none = null;
+    usize? $found = $in->find("\r\n");
+    usize $at = guard $found else {
+        // a CR as the last byte may still be the start of the CRLF
+        if ($in->buffered() > CHUNK_LINE + 1) {
             return .error(.malformed('a chunk line is too long'));
         }
-        return .error(wrap($e));
+        return .ok($none);
     }
-    string $line = guard $got else {
-        return .error(.timeout);
+    if ($at > CHUNK_LINE) {
+        return .error(.malformed('a chunk line is too long'));
     }
-    return .ok($line);
+    return .ok($found);
 }
 
 /**

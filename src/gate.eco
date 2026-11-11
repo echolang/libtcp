@@ -101,6 +101,24 @@ internal struct Gate
         }
     }
 
+    /**
+     * Marks the word closed for an owner that takes the handle back instead of releasing it:
+     * true only when nothing was inside and it was not closed yet. Calls after it are refused as
+     * after a close, and `released` is true, so nobody releases the handle.
+     */
+    public function seize() : bool
+    {
+        while (true) {
+            int32 $w = $this->word->load();
+            if (($w & (GATE_CLOSED | GATE_USERS)) != 0) {
+                return false;
+            }
+            if ($this->word->compare_exchange($w, $w | GATE_CLOSED)) {
+                return true;
+            }
+        }
+    }
+
     public function mark(int32 $flag) : void
     {
         while (true) {

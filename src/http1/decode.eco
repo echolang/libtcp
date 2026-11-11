@@ -1,0 +1,274 @@
+/**
+ * An answer decoded as its bytes arrive, for a reactor: nothing here reads a socket or waits.
+ * The caller fills a `tcp::Reader` (`tryFill` off a non-blocking stream, or `feed`) whenever
+ * the poller says readable, then asks the decoder for what those bytes complete: the head once
+ * it is all there, then the body in pieces of the caller's size. Bytes past the end of the
+ * answer are never consumed, so the next answer on a reused connection, or the protocol after
+ * a `101`, starts with them.
+ */
+
+namespace tcp::http1;
+
+/**
+ * Where a `Decoder` is in an answer.
+ */
+internal enum Stage
+{
+    case head;
+    // bytes of a body by length
+    case length;
+    // bytes of a body that runs to the close: there is no count to keep
+    case toClose;
+    case chunkSize;
+    case chunkData;
+    // the CRLF after a chunk's bytes
+    case chunkEnd;
+    case trailers;
+    case done;
+}
+
+/**
+ * One answer's decoding state: a new decoder per request, made with the request's method, which
+ * reads one head (past interim 1xx answers) and one body. Each time the poller says readable,
+ * `tryFill` the reader, call `head` until it returns the answer, then `body` until it returns 0;
+ * `.eof` from the fill goes to `eof`. Once `done`, `reusable` says whether the next request may go on the connection. Fed a
+ * byte at a time or a megabyte at once, the outcome is the same.
+ */
+public struct Decoder
+{
+    // the request was a HEAD: no body, whatever the head says
+    private const bool $bodiless;
+    // the request was a CONNECT: a 2xx opens a tunnel, and the bytes after its head are the tunnel's
+    private const bool $tunnel;
+    private Stage $stage;
+    private Framing? $framing;
+    private Answer? $answer;
+    // body bytes (by length) or bytes of the current chunk still to come
+    private uint64 $left;
+    // the connection carries nothing after this answer: `Connection: close`, an HTTP/1.0 peer
+    // that did not ask to keep it, a body to the close, a switch of protocols, or a tunnel
+    private bool $last;
+    private usize $trailerBytes;
+
+    /**
+     * A decoder for the answer to one request sent with `$method`. The answer to a HEAD has no
+     * body whatever its fields say, and neither has a 2xx to a CONNECT, which turns the
+     * connection into a tunnel.
+     */
+    public constructor(method: const string& $method = 'GET')
+    {
+        $this->bodiless = $method == 'HEAD';
+        $this->tunnel = $method == 'CONNECT';
+        $this->stage = Stage::head;
+        $this->framing = null;
+        $this->answer = null;
+        $this->left = 0;
+        $this->last = false;
+        $this->trailerBytes = 0;
+    }
+
+    /**
+     * The answer once its whole head is buffered in `$in`, consumed from it; null while more
+     * bytes are needed. Interim 1xx answers are read past, all but a `101`, which is returned
+     * with no body: what follows its head stays in `$in` for the protocol switched to. So does
+     * what follows a 2xx to a CONNECT, for the tunnel. Once the head was read, every call
+     * returns it again. `.tooLarge` for a head over the reader's `max`, `.malformed` for one that
+     * does not parse or whose lengths disagree.
+     */
+    public function head(tcp::Reader $in) : result<Answer?, Error>
+    {
+        Answer? $none = null;
+        if ($this->stage != Stage::head) {
+            return .ok($this->answer);
+        }
+
+        while (true) {
+            string? $got = guard $in->until("\r\n\r\n") else ($e) {
+                return .error(wrap($e));
+            }
+            string $raw = guard $got else {
+                return .ok($none);
+            }
+            Answer $a = guard parse($raw) else ($e) {
+                return .error($e);
+            }
+            if (interim($a)) {
+                continue;
+            }
+
+            // a 101 has none already, like every 1xx
+            Framing $f = guard $a->framing() else ($e) {
+                return .error($e);
+            }
+            // a 2xx to a CONNECT has no body: the tunnel starts right after its head (RFC 9112 6.3)
+            bool $tunneled = $this->tunnel && $a->status >= 200 && $a->status < 300;
+            if ($this->bodiless || $tunneled) {
+                $f = .none;
+            }
+            bool $old = $raw->starts('HTTP/1.0 ');
+            $this->last = $a->has('Connection', 'close') || ($old && !$a->has('Connection', 'keep-alive')) || $a->status == 101 || $tunneled;
+            $this->framing = $f;
+            $this->answer = $a;
+            $this->stage = match ($f) {
+                Framing::none => Stage::done,
+                Framing::length($bytes) => Stage::length,
+                Framing::chunked => Stage::chunkSize,
+                Framing::close => Stage::toClose,
+            };
+            $this->left = match ($f) {
+                Framing::length($bytes) => $bytes,
+                else => 0,
+            };
+            if ($this->stage == Stage::toClose) {
+                $this->last = true;
+            } else if ($this->stage == Stage::length && $this->left == 0) {
+                $this->stage = Stage::done;
+            }
+            Answer? $found = $a;
+            return .ok($found);
+        }
+    }
+
+    /**
+     * The body bytes buffered in `$in`, decoded and appended onto `$out`, at most `$most` of
+     * them: how many. 0 means more bytes are needed, or the body is over (`done`). Chunked
+     * framing is taken off: chunk sizes, extensions and trailers are consumed and dropped.
+     * Nothing past the body is consumed. Call it only after `head` returned the answer.
+     * `.malformed` for chunk framing that does not add up, or a chunk line over `CHUNK_LINE`;
+     * `.tooLarge` for trailers over the reader's `max`.
+     */
+    public function body(tcp::Reader $in, string& $out, usize $most) : result<usize, Error>
+    {
+        if ($this->stage == Stage::head) {
+            die('tcp::http1::Decoder::body before its head was read');
+        }
+
+        usize $put = 0;
+        while (true) {
+            Stage $at = $this->stage;
+            if ($at == Stage::done) {
+                break;
+            }
+
+            if ($at == Stage::length || $at == Stage::toClose || $at == Stage::chunkData) {
+                bool $counted = $at != Stage::toClose;
+                usize $n = $in->buffered();
+                if ($n > $most - $put) {
+                    $n = $most - $put;
+                }
+                if ($counted && ($n as uint64) > $this->left) {
+                    $n = $this->left as usize;
+                }
+                if ($n == 0) {
+                    break;
+                }
+                // copied once, straight out of the buffer: `$out` keeps its room, the reader its own
+                $out->append($in->window($n)->data(), $n);
+                $in->skip($n);
+                $put = $put + $n;
+                if ($counted) {
+                    $this->left = $this->left - ($n as uint64);
+                    if ($this->left == 0) {
+                        if ($at == Stage::length) {
+                            $this->stage = Stage::done;
+                        } else {
+                            $this->stage = Stage::chunkEnd;
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if ($at == Stage::chunkEnd) {
+                if ($in->buffered() < 2) {
+                    break;
+                }
+                if ($in->byte(0) != 13 || $in->byte(1) != 10) {
+                    return .error(.malformed('a chunk does not end in CRLF'));
+                }
+                $in->skip(2);
+                $this->stage = Stage::chunkSize;
+                continue;
+            }
+
+            usize? $end = guard lineEnd($in) else ($e) {
+                return .error($e);
+            }
+            usize $len = guard $end else {
+                break;
+            }
+
+            if ($at == Stage::trailers) {
+                // a trailer is dropped unread: only its size counts
+                $in->skip($len + 2);
+                if ($len == 0) {
+                    $this->stage = Stage::done;
+                    continue;
+                }
+                $this->trailerBytes = $this->trailerBytes + $len + 2;
+                if ($this->trailerBytes > $in->max) {
+                    return .error(.tooLarge($this->trailerBytes as uint64));
+                }
+                continue;
+            }
+
+            string $line = guard $in->take($len);
+            $in->skip(2);
+            uint64 $size = guard chunkSize($line) else ($e) {
+                return .error($e);
+            }
+            if ($size == 0) {
+                $this->stage = Stage::trailers;
+            } else {
+                $this->left = $size;
+                $this->stage = Stage::chunkData;
+            }
+        }
+        return .ok($put);
+    }
+
+    /**
+     * The peer closed. Call it once `head` and `body` have taken what the reader holds. It ends
+     * a body that runs to the close (`done` from here on), and is `.truncated` for a head cut
+     * short (or none at all) and for a body by length or chunks that stopped before its end.
+     */
+    public function eof() : status<Error>
+    {
+        if ($this->stage == Stage::done) {
+            return .ok;
+        }
+        if ($this->stage == Stage::toClose) {
+            $this->stage = Stage::done;
+            return .ok;
+        }
+        return .error(.truncated);
+    }
+
+    /**
+     * True once the whole answer was read: the head and all of its body.
+     */
+    public const function done() : bool
+    {
+        return $this->stage == Stage::done;
+    }
+
+    /**
+     * How the body ends, known once the head was read: `.none` for the answer to a HEAD, for a
+     * `101` and for a 2xx to a CONNECT, whatever their fields say.
+     */
+    public const function framing() : Framing?
+    {
+        return $this->framing;
+    }
+
+    /**
+     * True when the connection can carry the next request: the answer is done, its body did not
+     * run to the close, it was not a `101` or a 2xx to a CONNECT, and the peer did not say
+     * `Connection: close` (an HTTP/1.0 peer has to say `keep-alive`). Bytes still in the reader
+     * belong to the next answer.
+     */
+    public const function reusable() : bool
+    {
+        return $this->stage == Stage::done && !$this->last;
+    }
+}

@@ -26,6 +26,15 @@ public struct StreamOptions
      */
     public usize $sendBuffer = 0;
     public usize $receiveBuffer = 0;
+
+    /**
+     * The local address a connect binds to before it connects: one interface of several, or a
+     * source address the far side expects. Port 0 lets the system pick one, at the connect on
+     * Linux (IP_BIND_ADDRESS_NO_PORT), so connections to different destinations can share a
+     * port. Null leaves both to the system. Of the family connected to, never a unix socket;
+     * an accept or an adopt leaves it unused.
+     */
+    public Address? $local = null;
 }
 
 public struct ListenOptions

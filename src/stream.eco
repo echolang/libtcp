@@ -9,6 +9,9 @@ namespace tcp;
 
 use std::time;
 
+// why a local address and a unix socket do not go together, wherever either side is one
+internal const string LOCAL_NOT_UNIX = 'a local address binds a TCP connect, not a unix socket';
+
 /**
  * Which side of a stream a `shutdown` closes.
  */
@@ -42,6 +45,8 @@ public class Stream : Source, Sink, Pollable
     public const Address $peer;
     private const int64 $fd;
     private Gate $gate;
+    // the pollers watching the descriptor, which `release` takes it out of
+    private const Watchers $watchers;
 
     internal constructor(int64 $fd, Address $local, Address $peer)
     {
@@ -49,6 +54,7 @@ public class Stream : Source, Sink, Pollable
         $this->local = $local;
         $this->peer = $peer;
         $this->gate = Gate();
+        $this->watchers = Watchers();
     }
 
     destructor()
@@ -71,9 +77,12 @@ public class Stream : Source, Sink, Pollable
             return .error(.invalid('a connect needs a port: 1..65535'));
         }
 
+        tcp_addr $from = guard Stream::localFor($to, $options) else ($e) {
+            return .error($e);
+        }
         tcp_addr $raw = $to->raw();
         tcp_err $err = tcp_err();
-        int64 $fd = tcp_connect(&$raw, $by->ms(), &$err);
+        int64 $fd = tcp_connect(&$raw, &$from, $by->ms(), &$err);
         if ($fd == TCP_TIMEOUT) {
             return .error(.timeout);
         }
@@ -98,10 +107,13 @@ public class Stream : Source, Sink, Pollable
             return .error(.invalid('a connect needs a port: 1..65535'));
         }
 
+        tcp_addr $from = guard Stream::localFor($to, $options) else ($e) {
+            return .error($e);
+        }
         tcp_addr $raw = $to->raw();
         tcp_err $err = tcp_err();
         int32 $done = 0;
-        int64 $fd = tcp_connect_start(&$raw, &$done, &$err);
+        int64 $fd = tcp_connect_start(&$raw, &$from, &$done, &$err);
         if ($fd < 0) {
             return .error(failure(.connect, $err));
         }
@@ -113,17 +125,95 @@ public class Stream : Source, Sink, Pollable
      * one deadline. The lookup is bounded by it too. Addresses race Happy Eyeballs (RFC 8305):
      * families take turns, a new attempt every `$stagger` or as soon as the latest fails, so one
      * address that drops packets cannot use up the deadline. A failure is the last attempt's.
+     * With `$options->local` set, only the addresses of its family are tried. A local address
+     * with a port of its own takes them one at a time instead, each once the one before failed:
+     * two attempts cannot bind one port at once. Then an address that drops packets can use up
+     * the deadline.
      */
     public static function connect(host: const string& $host, uint16 $port, Deadline $by, StreamOptions $options = StreamOptions(), stagger: time::duration $stagger = time::duration::millis(250)) : result<Stream, Error>
     {
         if ($port == 0) {
             return .error(.invalid('a connect needs a port: 1..65535'));
         }
+        // checked before the lookup: a unix one fails at once, and with its own reason
+        Address? $bound = guard Stream::boundTcp($options) else ($e) {
+            return .error($e);
+        }
 
         array<Address> $addrs = guard resolve($host, $port, $by) else ($e) {
             return .error($e);
         }
-        return connectAll($addrs, $by, $options, $stagger);
+        Address $local = guard $bound else {
+            return connectAll($addrs, $by, $options, $stagger);
+        }
+        array<Address> $same = array<Address>();
+        foreach ($addrs as const &$a) {
+            if ($a->family == $local->family) {
+                $same[] = $a;
+            }
+        }
+        if ($same->empty()) {
+            return .error(.invalid("{$host} has no address of the local address's family"));
+        }
+        if ($local->port == 0) {
+            return connectAll($same, $by, $options, $stagger);
+        }
+
+        // one port binds one attempt at a time: a second would fail with EADDRINUSE at once
+        Error $last = .timeout;
+        foreach ($same as const &$a) {
+            result<Stream, Error> $one = Stream::connect($a, $by, $options);
+            if ($one->has_value()) {
+                return $one;
+            }
+            $last = $one->failure();
+            if ($by->passed()) {
+                break;
+            }
+        }
+        return .error($last);
+    }
+
+    /**
+     * Take over a connected socket that another library made (its accept, say), whatever state
+     * it is in: it is made non-blocking and kept from child processes like every socket libtcp
+     * opens (and SIGPIPE-free on macOS), both endpoints are read from the OS, and `$options` are
+     * applied. The stream owns the descriptor from here on and closes it, unless `release` hands
+     * it back. On a failure the descriptor is closed.
+     */
+    public static function adopt(fd: int64 $fd, StreamOptions $options = StreamOptions()) : result<Stream, Error>
+    {
+        if ($fd < 0) {
+            return .error(.invalid('adopt needs an open descriptor'));
+        }
+        tcp_addr $raw = tcp_addr();
+        tcp_err $err = tcp_err();
+        if (tcp_adopt($fd, &$raw, &$err) < 0) {
+            tcp_close($fd);
+            return .error(failure(.accept, $err));
+        }
+        Address $peer = Address(raw: $raw);
+        return Stream::adopt($fd, $peer, $options, .accept);
+    }
+
+    /**
+     * Take over a socket its maker already keeps from child processes and from SIGPIPE, as
+     * libhttp's accept does, with both endpoints as the maker knows them: only O_NONBLOCK is
+     * set, one call where `adopt(fd:)` makes five. For a hand-over on every request. The stream
+     * reports `$peer` and `$local` as given; the OS is not asked. On a failure the descriptor is
+     * closed.
+     */
+    public static function adopt(fd: int64 $fd, peer: Address $peer, local: Address $local, StreamOptions $options = StreamOptions()) : result<Stream, Error>
+    {
+        if ($fd < 0) {
+            return .error(.invalid('adopt needs an open descriptor'));
+        }
+        tcp_err $err = tcp_err();
+        if (tcp_blocking($fd, 0, &$err) < 0) {
+            tcp_close($fd);
+            return .error(failure(.accept, $err));
+        }
+        return Stream::adopt($fd, $peer, $options, .accept, $local);
     }
 
     /**
@@ -399,6 +489,40 @@ public class Stream : Source, Sink, Pollable
     }
 
     /**
+     * Give the descriptor back without closing it, to hand the connection to other code (the
+     * library it was adopted from). The stream is closed for every call after, but the
+     * descriptor stays open and is the caller's to close. It is still non-blocking unless
+     * `$blocking` asks for it blocking again. `.closed` when the stream is closed already, and
+     * `.invalid` while another call is inside it: release from the one thread that drives it.
+     * Every `Poller` watching the stream lets go of the descriptor first, so none goes on
+     * reporting it to its new owner. Bytes a `Reader` read ahead stay in the reader.
+     */
+    public function release(blocking: bool $blocking = false) : result<int64, Error>
+    {
+        if (!$this->gate->seize()) {
+            if ($this->gate->has(GATE_CLOSED)) {
+                return .error(.closed);
+            }
+            return .error(.invalid('another call is inside the stream: it cannot be released under it'));
+        }
+
+        // seized: nothing else touches the descriptor, and the destructor leaves it open. A poller
+        // would refuse a `remove` now (the stream is closed), so each forgets the descriptor here
+        foreach ($this->watchers->take() as $p) {
+            $p->forget($this->fd);
+        }
+        if ($blocking) {
+            tcp_err $err = tcp_err();
+            if (tcp_blocking($this->fd, 1, &$err) < 0) {
+                // a descriptor nobody can use is closed, not leaked
+                tcp_close($this->fd);
+                return .error(failure(.option, $err));
+            }
+        }
+        return .ok($this->fd);
+    }
+
+    /**
      * Send small writes at once (TCP_NODELAY). `.invalid` on a unix socket, which has no Nagle
      * delay to turn off.
      */
@@ -461,6 +585,19 @@ public class Stream : Source, Sink, Pollable
     }
 
     /**
+     * Keeps `$by`, so `release` can take the descriptor out of it.
+     */
+    public const function watched(const Poller& $by) : void
+    {
+        $this->watchers->add($by);
+    }
+
+    public const function unwatched(const Poller& $by) : void
+    {
+        $this->watchers->remove($by);
+    }
+
+    /**
      * Counts a call out of the gate, and releases the descriptor when it was the last one in after
      * a close. True when the stream was closed by the time the call left.
      */
@@ -469,6 +606,8 @@ public class Stream : Source, Sink, Pollable
         Exit $exit = $this->gate->leave();
         if ($exit->last) {
             tcp_close($this->fd);
+            // the OS dropped the descriptor from every poller with it
+            $this->watchers->clear();
         }
         return $exit->closed;
     }
@@ -651,6 +790,43 @@ public class Stream : Source, Sink, Pollable
             return .ok($none);
         }
         return .error(outcome(.read, $got, $err, $closed));
+    }
+
+    /**
+     * The local endpoint a connect to `$to` binds first, as C takes it: `$options->local`, or the
+     * empty one (family 0) for none. `.invalid` for a unix one, or one of another family than
+     * `$to`.
+     */
+    private static function localFor(const Address& $to, const StreamOptions& $options) : result<tcp_addr, Error>
+    {
+        Address? $bound = guard Stream::boundTcp($options) else ($e) {
+            return .error($e);
+        }
+        Address $local = guard $bound else {
+            return .ok(tcp_addr());
+        }
+        if ($to->family == Family::unix) {
+            return .error(.invalid(LOCAL_NOT_UNIX));
+        }
+        if ($local->family != $to->family) {
+            return .error(.invalid('the local address is not of the family connected to'));
+        }
+        return .ok($local->raw());
+    }
+
+    /**
+     * `$options->local`, or null for none. `.invalid` for a unix one: it binds a TCP connect.
+     */
+    private static function boundTcp(const StreamOptions& $options) : result<Address?, Error>
+    {
+        Address? $bound = $options->local;
+        if ($bound != null) {
+            Address $local = guard $bound;
+            if ($local->family == Family::unix) {
+                return .error(.invalid(LOCAL_NOT_UNIX));
+            }
+        }
+        return .ok($bound);
     }
 
     /**

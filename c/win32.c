@@ -303,6 +303,18 @@ static int blocking(SOCKET s, int on)
     return 0;
 }
 
+/* a socket made what every handle here is: not inherited, non-blocking; 0, or the code that failed */
+static int make_ready(SOCKET s)
+{
+    int code = no_inherit(s);
+
+    if (code == 0) {
+        code = blocking(s, 0);
+    }
+
+    return code;
+}
+
 /* a stream socket no child process inherits from its first instant, able to do overlapped I/O */
 static SOCKET open_socket(int family)
 {
@@ -520,10 +532,7 @@ int64_t tcp_listen(const tcp_addr *at, int32_t backlog, int32_t flags, tcp_err *
     }
 
     /* accept runs non-blocking: it waits in select, then takes what is there */
-    code = no_inherit(s);
-    if (code == 0) {
-        code = blocking(s, 0);
-    }
+    code = make_ready(s);
 
     if (code != 0) {
         closesocket(s);
@@ -693,15 +702,23 @@ void tcp_listener_close(int64_t l)
     free(it);
 }
 
-int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err)
+int64_t tcp_connect_start(const tcp_addr *to, const tcp_addr *from, int32_t *done, tcp_err *err)
 {
     SOCKADDR_STORAGE ss;
+    SOCKADDR_STORAGE local;
     int sl;
+    int ll = 0;
+    int bound = from != NULL && from->family != 0;
     SOCKET s;
     int code;
 
     *done = 0;
     if (to == NULL || to_sockaddr(to, &ss, &sl) != 0 || (to->family != TCP_FAMILY_UNIX && to->port == 0)) {
+        return fail_as(err, TCP_K_INVALID, WSAEINVAL);
+    }
+
+    /* a local address binds a TCP connect of its own family: a unix one has no use for it */
+    if (bound && (from->family != to->family || from->family == TCP_FAMILY_UNIX || to_sockaddr(from, &local, &ll) != 0)) {
         return fail_as(err, TCP_K_INVALID, WSAEINVAL);
     }
 
@@ -714,10 +731,7 @@ int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err)
         return fail(err, WSAGetLastError());
     }
 
-    code = no_inherit(s);
-    if (code == 0) {
-        code = blocking(s, 0);
-    }
+    code = make_ready(s);
 
     if (code != 0) {
         closesocket(s);
@@ -733,6 +747,13 @@ int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err)
         DWORD off = 0;
 
         (void)setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&off, sizeof off);
+    }
+
+    /* Windows has no IP_BIND_ADDRESS_NO_PORT: a bind to port 0 takes a port at once */
+    if (bound && bind(s, (struct sockaddr *)&local, ll) != 0) {
+        code = WSAGetLastError();
+        closesocket(s);
+        return fail(err, code);
     }
 
     if (connect(s, (struct sockaddr *)&ss, sl) == 0) {
@@ -783,14 +804,14 @@ int32_t tcp_connect_finish(int64_t h, tcp_err *err)
     return connect_result((SOCKET)h, err);
 }
 
-int64_t tcp_connect(const tcp_addr *to, int32_t timeout_ms, tcp_err *err)
+int64_t tcp_connect(const tcp_addr *to, const tcp_addr *from, int32_t timeout_ms, tcp_err *err)
 {
     int64_t deadline = deadline_of(timeout_ms);
     int32_t done;
     int64_t h;
     int ready_now;
 
-    h = tcp_connect_start(to, &done, err);
+    h = tcp_connect_start(to, from, &done, err);
     if (h < 0 || done) {
         return h;
     }
@@ -809,18 +830,63 @@ int64_t tcp_connect(const tcp_addr *to, int32_t timeout_ms, tcp_err *err)
     return h;
 }
 
-int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err)
+/* a handle's own endpoint, or its peer's; 0, or TCP_ERR */
+static int32_t endpoint(int64_t h, int peer, tcp_addr *out, tcp_err *err)
 {
     SOCKADDR_STORAGE ss;
     int sl = (int)sizeof ss;
+    int rc;
 
     memset(&ss, 0, sizeof ss);
 
-    if (getsockname((SOCKET)h, (struct sockaddr *)&ss, &sl) != 0) {
+    rc = peer ? getpeername((SOCKET)h, (struct sockaddr *)&ss, &sl) : getsockname((SOCKET)h, (struct sockaddr *)&ss, &sl);
+    if (rc != 0) {
         return (int32_t)fail(err, WSAGetLastError());
     }
 
     from_sockaddr((struct sockaddr *)&ss, (size_t)sl, out);
+    return 0;
+}
+
+int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err)
+{
+    return endpoint(h, 0, out, err);
+}
+
+int32_t tcp_peer(int64_t h, tcp_addr *out, tcp_err *err)
+{
+    return endpoint(h, 1, out, err);
+}
+
+int32_t tcp_adopt(int64_t h, tcp_addr *peer, tcp_err *err)
+{
+    int code;
+
+    if (h < 0 || (SOCKET)h == INVALID_SOCKET) {
+        return (int32_t)fail_as(err, TCP_K_INVALID, WSAENOTSOCK);
+    }
+
+    if (ready(err) != 0) {
+        return TCP_ERR;
+    }
+
+    /* a send never raises a signal on Windows: inheritance and blocking are all there is */
+    code = make_ready((SOCKET)h);
+    if (code != 0) {
+        return (int32_t)fail(err, code);
+    }
+
+    return tcp_peer(h, peer, err);
+}
+
+int32_t tcp_blocking(int64_t h, int32_t on, tcp_err *err)
+{
+    int code = blocking((SOCKET)h, on);
+
+    if (code != 0) {
+        return (int32_t)fail(err, code);
+    }
+
     return 0;
 }
 
@@ -950,7 +1016,7 @@ int32_t tcp_unlink_stale(const char *path)
     memcpy(at.path, path, n);
 
     /* only a refusal says nothing listens: a connect, a timeout or any other failure leaves the file be */
-    h = tcp_connect(&at, 500, &err);
+    h = tcp_connect(&at, NULL, 500, &err);
     if (h >= 0) {
         tcp_close(h);
         return -1;

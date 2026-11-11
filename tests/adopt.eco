@@ -1,0 +1,343 @@
+/**
+ * Descriptors that cross into and out of libtcp: a connected socket adopted from other code,
+ * a stream released back to it (blocking again when asked), and connects bound to a local
+ * address first.
+ */
+
+use std::thread;
+
+#[if: os != windows]
+internal extern {
+    function fcntl(int32 $fd, int32 $cmd) : int32;
+}
+
+// F_GETFL is 3 on both; O_NONBLOCK differs
+internal const int32 F_GETFL = 3;
+#[if: os == linux]
+internal const int32 O_NONBLOCK = 0x800;
+#[else]
+internal const int32 O_NONBLOCK = 0x4;
+#[end]
+#[end]
+
+/**
+ * `$s`'s descriptor, released.
+ */
+internal function releaseOf(tcp::Stream $s, blocking: bool $blocking = false) : int64
+{
+    int64 $fd = guard $s->release(blocking: $blocking) else ($e) {
+        die("release: {$e}");
+    }
+    return $fd;
+}
+
+internal function adoptOf(int64 $fd) : tcp::Stream
+{
+    tcp::Stream $s = guard tcp::Stream::adopt(fd: $fd) else ($e) {
+        die("adopt: {$e}");
+    }
+    return $s;
+}
+
+test adopt_takes_over_a_released_descriptor
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::Address $local = $p->client->local;
+    tcp::Address $peer = $p->client->peer;
+    int64 $fd = releaseOf($p->client);
+    assert($p->client->closed(), 'a released stream is closed');
+    string $after = '';
+    assert(failed($p->client->tryRead($after, 1)) == 'closed', 'and refuses every call');
+
+    tcp::Stream $back = adoptOf($fd);
+    assert($back->handle() == $fd, 'the same descriptor');
+    assert($back->local == $local, 'the local endpoint read from the OS');
+    assert($back->peer == $peer, 'the peer read from the OS');
+
+    send($back, 'ping');
+    string $got = '';
+    usize? $n = guard $p->server->read($got, 16, ms(2000)) else ($e) {
+        die("server read: {$e}");
+    }
+    assert($got == 'ping');
+    send($p->server, 'pong');
+    string $answer = '';
+    usize? $m = guard $back->read($answer, 16, ms(2000)) else ($e) {
+        die("adopted read: {$e}");
+    }
+    assert($answer == 'pong');
+
+    // non-blocking again: a try read with nothing there answers null instead of waiting
+    string $none = '';
+    usize? $quiet = guard $back->tryRead($none, 16) else ($e) {
+        die("try read: {$e}");
+    }
+    assert($quiet == null);
+
+    // the adopted stream owns it now: a close reaches the peer
+    $back->close();
+    assert(readToEnd($p->server, 2000) == '');
+}
+
+test adopt_refuses_a_descriptor_that_is_not_one
+{
+    assert(failed(tcp::Stream::adopt(fd: -1)) == 'invalid');
+}
+
+test adopt_of_a_prepared_socket_takes_its_endpoints_as_given
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::Address $local = $p->client->local;
+    tcp::Address $peer = $p->client->peer;
+    int64 $fd = releaseOf($p->client, blocking: true);
+
+    tcp::Stream $back = guard tcp::Stream::adopt(fd: $fd, peer: $peer, local: $local) else ($e) {
+        die("adopt prepared: {$e}");
+    }
+    assert($back->local == $local && $back->peer == $peer);
+
+    // non-blocking, though it came back blocking
+    string $none = '';
+    usize? $quiet = guard $back->tryRead($none, 16) else ($e) {
+        die("try read: {$e}");
+    }
+    assert($quiet == null);
+
+    send($back, 'ping');
+    string $got = '';
+    usize? $n = guard $p->server->read($got, 16, ms(2000)) else ($e) {
+        die("server read: {$e}");
+    }
+    assert($got == 'ping');
+    $back->close();
+    assert(readToEnd($p->server, 2000) == '');
+    assert(failed(tcp::Stream::adopt(fd: -1, peer: $peer, local: $local)) == 'invalid');
+}
+
+test adopt_applies_its_options
+{
+    tcp::StreamPair $p = connectedPair();
+    int64 $fd = releaseOf($p->server);
+    tcp::StreamOptions $o = tcp::StreamOptions();
+    $o->keepAlive = std::time::duration::millis(30000);
+    $o->sendBuffer = 65536;
+    tcp::Stream $s = guard tcp::Stream::adopt(fd: $fd, $o) else ($e) {
+        die("adopt with options: {$e}");
+    }
+    send($p->client, 'tuned');
+    string $got = '';
+    usize? $n = guard $s->read($got, 16, ms(2000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'tuned');
+}
+
+test release_refuses_a_closed_stream
+{
+    tcp::StreamPair $p = connectedPair();
+    $p->client->close();
+    assert(failed($p->client->release()) == 'closed');
+
+    int64 $fd = releaseOf($p->server);
+    assert(failed($p->server->release()) == 'closed', 'a second release has nothing to give');
+    string $buf = '';
+    assert(failed($p->server->read($buf, 1, ms(10))) == 'closed');
+    assert(failedStatus($p->server->write('x', ms(10))) == 'closed');
+    // a close after a release leaves the descriptor alone: it is the caller's
+    $p->server->close();
+    tcp::Stream $s = adoptOf($fd);
+    assert(!$s->closed());
+}
+
+test release_refuses_while_a_call_is_inside
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::Stream $c = $p->client;
+    thread::task<string> $reader = guard thread::spawn(function() : string {
+        string $buf = '';
+        return failed($c->read($buf, 16, ms(5000)));
+    }) else ($e) {
+        die('spawn failed');
+    }
+    thread::sleep(150);
+    string $why = failed($c->release());
+    expect($why == 'invalid', "a release under a blocked read: {$why}");
+    assert(!$c->closed(), 'and the stream is left as it was');
+
+    send($p->server, 'x');
+    string $read = $reader->wait();
+    expect($read == 'ok', "the read went on: {$read}");
+    int64 $fd = releaseOf($c);
+    assert($fd >= 0, 'once it left, the release goes through');
+    tcp::Stream $again = adoptOf($fd);
+}
+
+#[if: os != windows]
+test release_blocking_clears_nonblocking
+{
+    tcp::StreamPair $p = connectedPair();
+    int64 $plain = releaseOf($p->client);
+    expect((fcntl($plain as int32, F_GETFL) & O_NONBLOCK) != 0, 'released as it was, non-blocking');
+
+    int64 $fd = releaseOf($p->server, blocking: true);
+    expect((fcntl($fd as int32, F_GETFL) & O_NONBLOCK) == 0, 'released blocking');
+
+    // adopting a blocking descriptor makes it non-blocking again
+    tcp::Stream $s = adoptOf($fd);
+    expect((fcntl($fd as int32, F_GETFL) & O_NONBLOCK) != 0, 'adopted non-blocking');
+    tcp::Stream $c = adoptOf($plain);
+    send($c, 'after');
+    string $got = '';
+    usize? $n = guard $s->read($got, 16, ms(2000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'after');
+}
+#[end]
+
+test connect_binds_a_local_address_first
+{
+    tcp::Listener $l = listenLocal();
+    tcp::StreamOptions $o = tcp::StreamOptions();
+    $o->local = tcp::Address(loopback: 0);
+    tcp::Stream $c = guard tcp::Stream::connect($l->local, ms(5000), $o) else ($e) {
+        die("connect from loopback: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    assert($c->local->host() == '127.0.0.1');
+    assert($c->local->port != 0, 'the system picked a port');
+    assert($s->peer == $c->local, 'the server sees the bound address');
+    send($c, 'bound');
+    string $got = '';
+    usize? $n = guard $s->read($got, 16, ms(2000)) else ($e) {
+        die("read: {$e}");
+    }
+    assert($got == 'bound');
+}
+
+test start_binds_a_local_address_first
+{
+    tcp::Listener $l = listenLocal();
+    tcp::StreamOptions $o = tcp::StreamOptions();
+    $o->local = tcp::Address(loopback: 0);
+    tcp::Connecting $pending = guard tcp::Stream::start($l->local, $o) else ($e) {
+        die("start: {$e}");
+    }
+    tcp::Poller $poller = openPoller();
+    guard $poller->add($pending, 1, .write, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    tcp::Stream $c = guard finish($poller, $pending, 1) else ($e) {
+        die("finish: {$e}");
+    }
+    status<tcp::Error> $removed = $poller->remove($c);
+    tcp::Stream $s = acceptOne($l);
+    assert($s->peer == $c->local);
+    assert($c->local->host() == '127.0.0.1');
+}
+
+test connect_by_name_tries_the_local_addresss_family_alone
+{
+    tcp::Listener $l = listenLocal();
+    tcp::StreamOptions $o = tcp::StreamOptions();
+    $o->local = tcp::Address(loopback: 0);
+    tcp::Stream $c = guard tcp::Stream::connect(host: 'localhost', $l->local->port, ms(5000), $o) else ($e) {
+        die("connect localhost from v4: {$e}");
+    }
+    assert($c->local->family == tcp::Family::v4);
+}
+
+test a_local_address_has_to_fit_the_connect
+{
+    tcp::Listener $l = listenLocal();
+    tcp::StreamOptions $v6 = tcp::StreamOptions();
+    $v6->local = tcp::Address(loopback: 0, .v6);
+    assert(failed(tcp::Stream::connect($l->local, ms(2000), $v6)) == 'invalid');
+    assert(failed(tcp::Stream::start($l->local, $v6)) == 'invalid');
+
+    tcp::StreamOptions $unix = tcp::StreamOptions();
+    $unix->local = tcp::Address(unix: '/tmp/libtcp-never-bound.sock');
+    assert(failed(tcp::Stream::connect($l->local, ms(2000), $unix)) == 'invalid');
+
+    tcp::StreamOptions $v4 = tcp::StreamOptions();
+    $v4->local = tcp::Address(loopback: 0);
+    assert(failed(tcp::Stream::connect(tcp::Address(unix: '/tmp/libtcp-never-bound.sock'), ms(2000), $v4)) == 'invalid');
+}
+
+test connect_by_name_with_a_unix_local_says_why
+{
+    tcp::StreamOptions $unix = tcp::StreamOptions();
+    $unix->local = tcp::Address(unix: '/tmp/libtcp-never-bound.sock');
+    result<tcp::Stream, tcp::Error> $r = tcp::Stream::connect(host: 'localhost', 80, ms(2000), $unix);
+    assert(failed($r) == 'invalid');
+    string $why = $r->failure()->message();
+    expect($why == 'a local address binds a TCP connect, not a unix socket', "the reason: {$why}");
+}
+
+test connect_by_name_from_a_fixed_port_binds_it
+{
+    // a port nothing holds: bound by a listener, then freed
+    tcp::Listener $spare = listenLocal();
+    uint16 $port = $spare->local->port;
+    $spare->close();
+
+    // with a port of its own the addresses go one at a time, so none is refused for the port
+    tcp::Listener $l = listenLocal();
+    tcp::StreamOptions $o = tcp::StreamOptions();
+    $o->local = tcp::Address(loopback: $port);
+    tcp::Stream $c = guard tcp::Stream::connect(host: 'localhost', $l->local->port, ms(5000), $o) else ($e) {
+        die("connect from port {$port}: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    assert($c->local->port == $port, 'bound to the port asked for');
+    assert($s->peer == $c->local);
+}
+
+test release_takes_the_descriptor_out_of_its_pollers
+{
+    tcp::StreamPair $p = connectedPair();
+    tcp::Poller $poller = openPoller();
+    guard $poller->add($p->client, 1, .read) else ($e) {
+        die("add: {$e}");
+    }
+    // released while registered: the poller lets go, though `remove` would refuse a closed stream
+    int64 $fd = releaseOf($p->client);
+    assert(failedStatus($poller->remove($p->client)) == 'closed');
+
+    send($p->server, 'for the new owner');
+    assert(waitFor($poller, 1, 200) == null, 'the old registration is gone');
+
+    // the new owner registers the same descriptor again: on epoll a stale one would be EEXIST
+    tcp::Stream $back = adoptOf($fd);
+    guard $poller->add($back, 2, .read) else ($e) {
+        die("add the adopted stream: {$e}");
+    }
+    assert(waitFor($poller, 2, 2000) != null, 'reported under its new token');
+    guard $poller->remove($back) else ($e) {
+        die("remove: {$e}");
+    }
+}
+
+test release_after_a_started_connect_leaves_its_poller
+{
+    tcp::Listener $l = listenLocal();
+    tcp::Connecting $pending = guard tcp::Stream::start($l->local) else ($e) {
+        die("start: {$e}");
+    }
+    tcp::Poller $poller = openPoller();
+    guard $poller->add($pending, 1, .write, .oneshot) else ($e) {
+        die("add: {$e}");
+    }
+    // the registration carries over to the stream, and so does the poller it has to leave
+    tcp::Stream $c = guard finish($poller, $pending, 1) else ($e) {
+        die("finish: {$e}");
+    }
+    tcp::Stream $s = acceptOne($l);
+    int64 $fd = releaseOf($c);
+    tcp::Stream $back = adoptOf($fd);
+    guard $poller->add($back, 2, .write) else ($e) {
+        die("add the adopted stream: {$e}");
+    }
+    assert(waitFor($poller, 2, 2000) != null);
+    assert(waitFor($poller, 1, 100) == null, 'nothing under the old token');
+}

@@ -48,10 +48,13 @@ internal extern {
     function tcp_try_accept(int64 $l, ptr<tcp_addr> $peer, ptr<tcp_err> $err) : int64;
     function tcp_listener_cancel(int64 $l) : void;
     function tcp_listener_close(int64 $l) : void;
-    function tcp_connect(ptr<const tcp_addr> $to, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
-    function tcp_connect_start(ptr<const tcp_addr> $to, ptr<int32> $done, ptr<tcp_err> $err) : int64;
+    function tcp_connect(ptr<const tcp_addr> $to, ptr<const tcp_addr> $from, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
+    function tcp_connect_start(ptr<const tcp_addr> $to, ptr<const tcp_addr> $from, ptr<int32> $done, ptr<tcp_err> $err) : int64;
     function tcp_connect_finish(int64 $h, ptr<tcp_err> $err) : int32;
     function tcp_local(int64 $h, ptr<tcp_addr> $out, ptr<tcp_err> $err) : int32;
+    function tcp_peer(int64 $h, ptr<tcp_addr> $out, ptr<tcp_err> $err) : int32;
+    function tcp_adopt(int64 $h, ptr<tcp_addr> $peer, ptr<tcp_err> $err) : int32;
+    function tcp_blocking(int64 $h, int32 $on, ptr<tcp_err> $err) : int32;
     function tcp_recv(int64 $h, ptr<uint8> $buf, int64 $len, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
     function tcp_sendv(int64 $h, ptr<const uint8> $a, int64 $alen, ptr<const uint8> $b, int64 $blen, int32 $timeoutMs, ptr<tcp_err> $err) : int64;
     function tcp_try_recv(int64 $h, ptr<uint8> $buf, int64 $len, ptr<tcp_err> $err) : int64;

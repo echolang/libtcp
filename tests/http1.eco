@@ -179,6 +179,36 @@ test http1_a_chunked_body_is_decoded
     assert(httpKind(bodyOf("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n800\r\n", 1024)) == 'tooLarge');
 }
 
+test http1_trailers_past_the_readers_max_are_too_large
+{
+    // the head reader's max caps the trailers too, so a peer cannot send them without end
+    tcp::StreamPair $p = connectedPair();
+    string $wire = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n";
+    $wire->append(str::repeat("X: y\r\n", 200));
+    $wire->append("\r\n");
+    send($p->server, $wire);
+    $p->server->close();
+    tcp::Reader $in = tcp::Reader(max: 256);
+    tcp::http1::Answer $a = guard tcp::http1::answer($p->client, $in, ms(2000)) else ($e) {
+        die("answer: {$e}");
+    }
+    assert(httpKind(tcp::http1::body($p->client, $in, $a, 1024, ms(2000))) == 'tooLarge');
+}
+
+test http1_a_chunk_line_of_the_longest_size_is_read
+{
+    // CHUNK_LINE is 1024, the same cap the decoder has: exactly that is fine, one byte more is not
+    string $at = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3";
+    $at->append(str::repeat(';', 1023));
+    $at->append("\r\nabc\r\n0\r\n\r\n");
+    assert(bodyOf($at, 1024)->or('') == 'abc');
+
+    string $over = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3";
+    $over->append(str::repeat(';', 1024));
+    $over->append("\r\nabc\r\n0\r\n\r\n");
+    assert(httpKind(bodyOf($over, 1024)) == 'malformed');
+}
+
 test http1_a_large_chunked_body_comes_through_whole
 {
     tcp::StreamPair $p = connectedPair();

@@ -159,16 +159,22 @@ void tcp_listener_cancel(int64_t l);
 /* release the listener and its socket; safe on a negative one */
 void tcp_listener_close(int64_t l);
 
-/* connect to one address: a handle, TCP_TIMEOUT, or TCP_ERR */
-int64_t tcp_connect(const tcp_addr *to, int32_t timeout_ms, tcp_err *err);
+/*
+ * connect to one address: a handle, TCP_TIMEOUT, or TCP_ERR. from, when
+ * not NULL and its family not 0, is the local address bound first: the
+ * family of to, never a unix one (TCP_K_INVALID). Port 0 in it leaves the
+ * port to the system, picked at the connect where the OS can
+ * (IP_BIND_ADDRESS_NO_PORT on Linux).
+ */
+int64_t tcp_connect(const tcp_addr *to, const tcp_addr *from, int32_t timeout_ms, tcp_err *err);
 
 /*
  * A connect that does not wait: the handle, with *done 1 when it connected
  * at once (loopback, a unix socket) and 0 while it is in progress, or
  * TCP_ERR. An in-progress handle turns writable when the connect is over,
- * either way; tcp_connect_finish says which.
+ * either way; tcp_connect_finish says which. from as for tcp_connect.
  */
-int64_t tcp_connect_start(const tcp_addr *to, int32_t *done, tcp_err *err);
+int64_t tcp_connect_start(const tcp_addr *to, const tcp_addr *from, int32_t *done, tcp_err *err);
 
 /*
  * Where a started connect is: 0 connected, TCP_AGAIN still in progress, or
@@ -178,6 +184,23 @@ int32_t tcp_connect_finish(int64_t h, tcp_err *err);
 
 /* the local endpoint of a handle; 0, or TCP_ERR */
 int32_t tcp_local(int64_t h, tcp_addr *out, tcp_err *err);
+
+/* the remote endpoint of a connected handle; 0, or TCP_ERR */
+int32_t tcp_peer(int64_t h, tcp_addr *out, tcp_err *err);
+
+/*
+ * Take over a connected socket something else made (another library's
+ * accept): make it what every handle here is (non-blocking, not inherited
+ * by a child, no SIGPIPE) and read its peer into *peer. 0, or TCP_ERR. It
+ * never closes h, failed or not: the caller does.
+ */
+int32_t tcp_adopt(int64_t h, tcp_addr *peer, tcp_err *err);
+
+/*
+ * Turn a handle blocking (on 1) or back to non-blocking (0), for one that
+ * leaves libtcp for code that expects a blocking socket; 0, or TCP_ERR.
+ */
+int32_t tcp_blocking(int64_t h, int32_t on, tcp_err *err);
 
 /* > 0 bytes read, TCP_EOF, TCP_TIMEOUT, or TCP_ERR; never 0 */
 int64_t tcp_recv(int64_t h, uint8_t *buf, int64_t len, int32_t timeout_ms, tcp_err *err);

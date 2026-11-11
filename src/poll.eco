@@ -7,6 +7,8 @@
 
 namespace tcp;
 
+use std::thread;
+
 /**
  * Something a `Poller` can watch.
  */
@@ -31,6 +33,22 @@ public interface Pollable
      * a handshake before it can write.
      */
     const function needs(Interest? $want) : Interest?;
+
+    /**
+     * Told by `$by` once it watches the handle. An owner that can give the handle away without
+     * closing it (`Stream::release`) keeps the pollers, to take the handle out of each first; the
+     * rest have nothing to do.
+     */
+    const function watched(const Poller& $by) : void
+    {
+    }
+
+    /**
+     * Told by `$by` once it stopped watching the handle.
+     */
+    const function unwatched(const Poller& $by) : void
+    {
+    }
 }
 
 public enum Interest
@@ -98,6 +116,58 @@ public struct Event
     }
 }
 
+/**
+ * The pollers watching one handle, kept by an owner that can give the handle away open: it takes
+ * them out and has each forget the handle first, so no poller goes on reporting a socket that is
+ * not its owner's any more. Each is held, so its own handle stays open while it watches.
+ */
+internal struct Watchers
+{
+    private thread::mutex<array<Poller>> $pollers;
+
+    public constructor()
+    {
+        $this->pollers = thread::mutex<array<Poller>>(array<Poller>());
+    }
+
+    public const function add(const Poller& $p) : void
+    {
+        thread::locked<array<Poller>> $held = $this->pollers->lock();
+        $held->value[] = $p;
+    }
+
+    public const function remove(const Poller& $p) : void
+    {
+        thread::locked<array<Poller>> $held = $this->pollers->lock();
+        foreach (0 .. $held->value->count() as $i) {
+            if ($held->value[$i]->handle() == $p->handle()) {
+                Poller $gone = $held->value->pluck($i);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Lets go of every poller: the handle was closed, and the OS dropped it from each.
+     */
+    public const function clear() : void
+    {
+        thread::locked<array<Poller>> $held = $this->pollers->lock();
+        $held->value->clear();
+    }
+
+    /**
+     * Every poller watching, and none from here on.
+     */
+    public const function take() : array<Poller>
+    {
+        thread::locked<array<Poller>> $held = $this->pollers->lock();
+        array<Poller> $all = $held->value;
+        $held->value = array<Poller>();
+        return $all;
+    }
+}
+
 // the token the poller's own waker is registered with; `add` refuses it
 internal const uint64 POLL_WAKE = 0xFFFFFFFFFFFFFFFF;
 
@@ -152,7 +222,11 @@ public class Poller
         if ($source->closed()) {
             return .error(.closed);
         }
-        return $this->control(TCP_POLL_ADD, $source->handle(), $token, $interest, $trigger);
+        guard $this->control(TCP_POLL_ADD, $source->handle(), $token, $interest, $trigger) else ($e) {
+            return .error($e);
+        }
+        $source->watched($this);
+        return .ok;
     }
 
     /**
@@ -188,7 +262,29 @@ public class Poller
         if ($source->closed()) {
             return .error(.closed);
         }
-        return $this->control(TCP_POLL_REMOVE, $source->handle(), 0, .read, .level);
+        guard $this->control(TCP_POLL_REMOVE, $source->handle(), 0, .read, .level) else ($e) {
+            return .error($e);
+        }
+        $source->unwatched($this);
+        return .ok;
+    }
+
+    /**
+     * The poller's own OS handle: which poller it is, for a source that keeps the ones watching
+     * it.
+     */
+    internal const function handle() : int64
+    {
+        return $this->fd;
+    }
+
+    /**
+     * Stop watching `$handle` for an owner giving it away: it is still open, but no longer a
+     * `Pollable` this could ask. A handle that was not watched is no error.
+     */
+    internal function forget(int64 $handle) : void
+    {
+        status<Error> $removed = $this->control(TCP_POLL_REMOVE, $handle, 0, .read, .level);
     }
 
     /**

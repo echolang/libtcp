@@ -16,6 +16,8 @@ public class Connecting : Pollable
     private const StreamOptions $options;
     // the connect finished in the call that started it (loopback, a unix socket)
     private bool $done;
+    // the pollers watching the socket, handed to the stream with it
+    private const Watchers $watchers;
 
     internal constructor(int64 $fd, Address $to, StreamOptions $options, bool $done)
     {
@@ -23,6 +25,7 @@ public class Connecting : Pollable
         $this->to = $to;
         $this->options = $options;
         $this->done = $done;
+        $this->watchers = Watchers();
     }
 
     destructor()
@@ -58,8 +61,13 @@ public class Connecting : Pollable
 
         int64 $fd = $this->fd;
         $this->fd = -1;
+        array<Poller> $pollers = $this->watchers->take();
         Stream $s = guard Stream::adopt($fd, $this->to, $this->options, .connect) else ($e) {
             return .error($e);
+        }
+        // the registration carried over with the socket: the stream keeps who watches it now
+        foreach ($pollers as const &$p) {
+            $s->watched($p);
         }
         Stream? $made = $s;
         return .ok($made);
@@ -73,6 +81,7 @@ public class Connecting : Pollable
         if ($this->fd >= 0) {
             tcp_close($this->fd);
             $this->fd = -1;
+            $this->watchers->clear();
         }
     }
 
@@ -95,6 +104,19 @@ public class Connecting : Pollable
     public const function needs(Interest? $want) : Interest?
     {
         return $want;
+    }
+
+    /**
+     * Keeps `$by`, for the stream the connect becomes.
+     */
+    public const function watched(const Poller& $by) : void
+    {
+        $this->watchers->add($by);
+    }
+
+    public const function unwatched(const Poller& $by) : void
+    {
+        $this->watchers->remove($by);
     }
 }
 
